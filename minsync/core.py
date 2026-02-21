@@ -249,13 +249,6 @@ class VerifyResult:
         return "\n".join(lines)
 
 
-@dataclass(frozen=True)
-class _BasicChunk:
-    chunk_type: str
-    text: str
-    heading_path: str = ""
-
-
 class _DefaultChunker:
     """Fallback chunker used when no custom chunker is injected."""
 
@@ -265,11 +258,13 @@ class _DefaultChunker:
     def schema_id(self) -> str:
         return self._chunker_id
 
-    def chunk(self, text: str, path: str) -> list[_BasicChunk]:
+    def chunk(self, text: str, path: str) -> list[Any]:
+        from minsync.protocols import Chunk
+
         stripped = text.strip()
         if not stripped:
             return []
-        return [_BasicChunk(chunk_type="parent", text=stripped, heading_path="")]
+        return [Chunk(chunk_type="parent", text=stripped, heading_path="")]
 
 
 class _DefaultEmbedder:
@@ -446,8 +441,8 @@ class MinSync:
         config_chunker_id = str(config.get("chunker", {}).get("id", DEFAULT_CHUNKER_ID))
         config_embedder_id = str(config.get("embedder", {}).get("id", DEFAULT_EMBEDDER_ID))
 
-        chunker = self.chunker if self.chunker is not None else _DefaultChunker(config_chunker_id)
-        embedder = self.embedder if self.embedder is not None else _DefaultEmbedder(config_embedder_id)
+        chunker = self.chunker if self.chunker is not None else self._create_chunker_from_config(config)
+        embedder = self.embedder if self.embedder is not None else self._create_embedder_from_config(config)
         vector_store = self.vector_store
 
         chunk_schema_id = self._chunk_schema_id(chunker, config_chunker_id)
@@ -570,6 +565,7 @@ class MinSync:
                     path=path,
                     commit=to_commit,
                     sync_token=sync_token,
+                    chunk_schema_id=chunk_schema_id,
                 )
 
                 doc_ids = [doc["id"] for doc in docs]
@@ -669,8 +665,7 @@ class MinSync:
         if limit == 0:
             return []
 
-        config_embedder_id = str(config.get("embedder", {}).get("id", DEFAULT_EMBEDDER_ID))
-        embedder = self.embedder if self.embedder is not None else _DefaultEmbedder(config_embedder_id)
+        embedder = self.embedder if self.embedder is not None else self._create_embedder_from_config(config)
 
         repo_id = str(config.get("repo_id") or cursor.get("repo_id") or self._resolve_repo_id(repo_root))
         ref_name = str(ref or cursor.get("ref") or config.get("ref") or DEFAULT_REF)
@@ -791,7 +786,7 @@ class MinSync:
             git_details["error"] = str(exc)
 
         embedder_id = str((config.get("embedder") or {}).get("id") or DEFAULT_EMBEDDER_ID)
-        embedder = self.embedder if self.embedder is not None else _DefaultEmbedder(embedder_id)
+        embedder = self.embedder if self.embedder is not None else self._create_embedder_from_config(config)
         embedder_details: dict[str, Any] = {"id": embedder_id}
         try:
             started = time.perf_counter()
@@ -885,8 +880,8 @@ class MinSync:
         config_embedder_id = str((config.get("embedder") or {}).get("id") or DEFAULT_EMBEDDER_ID)
         normalize = config.get("normalize") or {}
 
-        chunker = self.chunker if self.chunker is not None else _DefaultChunker(config_chunker_id)
-        embedder = self.embedder if self.embedder is not None else _DefaultEmbedder(config_embedder_id)
+        chunker = self.chunker if self.chunker is not None else self._create_chunker_from_config(config)
+        embedder = self.embedder if self.embedder is not None else self._create_embedder_from_config(config)
         chunk_schema_id = self._chunk_schema_id(chunker, config_chunker_id)
         embedder_id = self._embedder_id(embedder, config_embedder_id)
 
@@ -964,6 +959,7 @@ class MinSync:
                 path=path,
                 commit=last_synced_commit,
                 sync_token="verify",
+                chunk_schema_id=chunk_schema_id,
             )
             expected_ids = {str(doc["id"]) for doc in expected_docs}
             fetched = self.vector_store.fetch(sorted(expected_ids)) if expected_ids else []
@@ -1002,6 +998,7 @@ class MinSync:
                     path=path,
                     chunker=chunker,
                     embedder=embedder,
+                    chunk_schema_id=chunk_schema_id,
                 )
                 fixed_any = True
                 check_row["status"] = "FIXED"
@@ -1055,6 +1052,7 @@ class MinSync:
         path: str,
         chunker: Any,
         embedder: Any,
+        chunk_schema_id: str = "",
     ) -> None:
         text = self._read_file_at_commit(repo_root, commit, path)
         normalized = self._normalize_text(text, config.get("normalize") or {})
@@ -1066,6 +1064,7 @@ class MinSync:
             path=path,
             commit=commit,
             sync_token="verify-fix",
+            chunk_schema_id=chunk_schema_id,
         )
 
         self.vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
@@ -1436,23 +1435,32 @@ class MinSync:
         path: str,
         commit: str,
         sync_token: str,
+        chunk_schema_id: str = "",
     ) -> list[dict[str, Any]]:
         docs: list[dict[str, Any]] = []
-        for index, chunk in enumerate(chunks):
+        dup_counter: dict[tuple[str, str], int] = {}
+
+        for chunk in chunks:
             chunk_text = str(getattr(chunk, "text", ""))
             if not chunk_text.strip():
                 continue
             chunk_type = str(getattr(chunk, "chunk_type", "child"))
             heading_path = str(getattr(chunk, "heading_path", ""))
+            content_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+
+            dup_key = (content_hash, heading_path)
+            dup_index = dup_counter.get(dup_key, 0)
+            dup_counter[dup_key] = dup_index + 1
 
             doc_id = self._doc_id(
                 repo_id=repo_id,
                 ref_name=ref_name,
                 path=path,
-                chunk_index=index,
+                schema_id=chunk_schema_id,
                 chunk_type=chunk_type,
                 heading_path=heading_path,
-                text=chunk_text,
+                content_hash=content_hash,
+                dup_index=dup_index,
             )
             docs.append({
                 "id": doc_id,
@@ -1464,6 +1472,8 @@ class MinSync:
                 "text": chunk_text,
                 "content_commit": commit,
                 "seen_token": sync_token,
+                "chunk_schema_id": chunk_schema_id,
+                "content_hash": content_hash,
             })
         return docs
 
@@ -1473,13 +1483,43 @@ class MinSync:
         repo_id: str,
         ref_name: str,
         path: str,
-        chunk_index: int,
+        schema_id: str,
         chunk_type: str,
         heading_path: str,
-        text: str,
+        content_hash: str,
+        dup_index: int,
     ) -> str:
-        payload = "\n".join([repo_id, ref_name, path, str(chunk_index), chunk_type, heading_path, text])
+        payload = "\0".join([
+            repo_id,
+            ref_name,
+            path,
+            schema_id,
+            chunk_type,
+            heading_path,
+            content_hash,
+            str(dup_index),
+        ])
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _create_chunker_from_config(self, config: dict[str, Any]) -> Any:
+        """Create a chunker from config, falling back to _DefaultChunker on error."""
+        try:
+            from minsync.factory import create_chunker
+
+            return create_chunker(config)
+        except (MinSyncError, Exception):
+            config_chunker_id = str((config.get("chunker") or {}).get("id") or DEFAULT_CHUNKER_ID)
+            return _DefaultChunker(config_chunker_id)
+
+    def _create_embedder_from_config(self, config: dict[str, Any]) -> Any:
+        """Create an embedder from config, falling back to _DefaultEmbedder on error."""
+        try:
+            from minsync.factory import create_embedder
+
+            return create_embedder(config)
+        except (MinSyncError, Exception):
+            config_embedder_id = str((config.get("embedder") or {}).get("id") or DEFAULT_EMBEDDER_ID)
+            return _DefaultEmbedder(config_embedder_id)
 
     def _chunk_schema_id(self, chunker: Any, fallback: str) -> str:
         schema_fn = getattr(chunker, "schema_id", None)
