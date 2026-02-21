@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -114,20 +115,30 @@ A git-native vector index sync engine.
 # ---------------------------------------------------------------------------
 
 
-def _run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _run_git(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    merged_env = None
+    if env:
+        merged_env = os.environ.copy()
+        merged_env.update(env)
     return subprocess.run(
         ["git", *args],
         cwd=repo,
         capture_output=True,
         text=True,
         check=check,
+        env=merged_env,
     )
 
 
 def create_test_repo(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
     """Create a git repository with an initial commit containing *files*."""
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True, exist_ok=False)
     _run_git(repo, "init", "-b", "main")
     _run_git(repo, "config", "user.email", "test@minsync.dev")
     _run_git(repo, "config", "user.name", "Test")
@@ -141,7 +152,16 @@ def create_test_repo(tmp_path: Path, files: dict[str, str] | None = None) -> Pat
         fpath.write_text(content, encoding="utf-8")
 
     _run_git(repo, "add", "-A")
-    _run_git(repo, "commit", "-m", "initial commit")
+    _run_git(
+        repo,
+        "commit",
+        "-m",
+        "initial commit",
+        env={
+            "GIT_AUTHOR_DATE": "2026-02-20T00:00:00+0000",
+            "GIT_COMMITTER_DATE": "2026-02-20T00:00:00+0000",
+        },
+    )
     return repo
 
 

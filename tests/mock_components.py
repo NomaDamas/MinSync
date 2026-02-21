@@ -313,6 +313,10 @@ class CrashAfterNUpserts(MockVectorStore):
         self._upsert_call_count = 0
         self._crash_after = crash_after
 
+    def seed_docs(self, docs: list[dict]) -> None:
+        """Preload documents without consuming crash budget."""
+        super().upsert(docs)
+
     def upsert(self, docs: list[dict]) -> None:
         self._upsert_call_count += 1
         if self._upsert_call_count > self._crash_after:

@@ -23,6 +23,9 @@ Homepage = "https://vkehfdl1.github.io/MinSync/"
 Repository = "https://github.com/vkehfdl1/MinSync"
 Documentation = "https://vkehfdl1.github.io/MinSync/"
 
+[project.scripts]
+minsync = "minsync.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
@@ -94,10 +97,30 @@ ignore = [
     "E501",
     # DoNotAssignLambda
     "E731",
+    # Avoid specifying long messages outside the exception class
+    "TRY003",
+    # `subprocess` call: check for execution of untrusted input (we only run git)
+    "S603",
+    # Starting a process with a partial executable path (git)
+    "S607",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S603", "S607", "TRY003", "RUF002"]
+"minsync/core.py" = [
+    # McCabe complexity — these methods are inherently multi-step
+    "C90",
+    # try-except-pass with explanatory comment
+    "S110",
+    # Nested if / ternary suggestions — clarity over brevity
+    "SIM102", "SIM108",
+    # Abstract raise to inner function — too pedantic
+    "TRY301",
+    # Shadowing builtins (all) — matches CLI arg naming
+    "A002",
+    # False positive hardcoded password — sync_token is not a secret
+    "S106",
+]
 
 [tool.ruff.format]
 preview = true

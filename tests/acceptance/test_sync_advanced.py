@@ -514,7 +514,7 @@ class TestT29LargeIncrementalPerformance:
 class TestT30MinsyncignoreBasicFiltering:
     """T30: .minsyncignore filters files from indexing."""
 
-    def _setup(self, tmp_path: Path):
+    def _setup(self, tmp_path: Path, ignore_rules: str = "src/**/*.py\nnotes/\n"):
         from minsync import MinSync
 
         store = MockVectorStore()
@@ -523,7 +523,7 @@ class TestT30MinsyncignoreBasicFiltering:
 
         # Start with SAMPLE_FILES and add .minsyncignore
         files = dict(SAMPLE_FILES)
-        files[".minsyncignore"] = "src/**/*.py\nnotes/\n"
+        files[".minsyncignore"] = ignore_rules
 
         repo = create_test_repo(tmp_path, files)
         ms = MinSync(repo_path=repo, chunker=chunker, embedder=embedder, vector_store=store)
@@ -566,6 +566,12 @@ class TestT30MinsyncignoreBasicFiltering:
         _ms, _repo, store = self._setup(tmp_path)
         docs = store.get_docs_by_path("README.md")
         assert len(docs) > 0, "README.md should be indexed"
+
+    def test_t30_7_bare_directory_pattern_excludes_children(self, tmp_path: Path):
+        """A bare `src` rule excludes files beneath src/ like .gitignore semantics."""
+        _ms, _repo, store = self._setup(tmp_path, ignore_rules="src\n")
+        assert len(store.get_docs_by_path("src/main.py")) == 0
+        assert len(store.get_docs_by_path("src/utils.py")) == 0
 
 
 # ============================================================================

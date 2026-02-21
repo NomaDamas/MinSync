@@ -497,8 +497,7 @@ class TestT42CICDCrashRecovery:
         # Create a crashing vector store that wraps the existing data
         crash_vs = CrashAfterNUpserts(crash_after=1)
         # Copy existing docs into crash_vs so it has state from initial sync
-        for doc in vs_normal.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_normal.get_all_docs())
         crash_vs._upsert_call_count = 0  # reset counter
 
         ms_crash = MinSync(
@@ -521,8 +520,7 @@ class TestT42CICDCrashRecovery:
         repo, _ms_normal, vs_normal, _new_commit = crash_env
 
         crash_vs = CrashAfterNUpserts(crash_after=1)
-        for doc in vs_normal.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_normal.get_all_docs())
         crash_vs._upsert_call_count = 0
 
         ms_crash = MinSync(
@@ -546,8 +544,7 @@ class TestT42CICDCrashRecovery:
         repo, _ms_normal, vs_normal, _new_commit = crash_env
 
         crash_vs = CrashAfterNUpserts(crash_after=1)
-        for doc in vs_normal.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_normal.get_all_docs())
         crash_vs._upsert_call_count = 0
 
         ms_crash = MinSync(
@@ -582,8 +579,7 @@ class TestT42CICDCrashRecovery:
         repo, _ms_normal, vs_normal, _new_commit = crash_env
 
         crash_vs = CrashAfterNUpserts(crash_after=1)
-        for doc in vs_normal.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_normal.get_all_docs())
         crash_vs._upsert_call_count = 0
 
         ms_crash = MinSync(
@@ -625,8 +621,7 @@ class TestT42CICDCrashRecovery:
         repo, _ms_normal, vs_normal, _new_commit = crash_env
 
         crash_vs = CrashAfterNUpserts(crash_after=1)
-        for doc in vs_normal.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_normal.get_all_docs())
         crash_vs._upsert_call_count = 0
 
         ms_crash = MinSync(
@@ -659,8 +654,7 @@ class TestT42CICDCrashRecovery:
         repo, _ms_normal, vs_normal, _new_commit = crash_env
 
         crash_vs = CrashAfterNUpserts(crash_after=1)
-        for doc in vs_normal.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_normal.get_all_docs())
         crash_vs._upsert_call_count = 0
 
         ms_crash = MinSync(
@@ -726,8 +720,7 @@ class TestT42CICDCrashRecovery:
         add_commit(repo_crash, new_files, "add new docs")
 
         crash_vs = CrashAfterNUpserts(crash_after=1)
-        for doc in vs_crash_initial.get_all_docs():
-            crash_vs.upsert([doc])
+        crash_vs.seed_docs(vs_crash_initial.get_all_docs())
         crash_vs._upsert_call_count = 0
 
         ms_crash = MinSync(

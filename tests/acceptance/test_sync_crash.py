@@ -746,3 +746,23 @@ class TestT17ConcurrentLock:
 
         lock_path = repo / ".minsync" / "lock"
         assert not lock_path.exists(), "Lock file must be cleaned up after all sync operations finish"
+
+    # -- Additional lock-safety regression: stale lock reclamation ------------
+    def test_t17_stale_lock_is_reclaimed(self, tmp_path):
+        """A stale lock artifact should be reclaimed so recovery sync can proceed."""
+        store = MockVectorStore()
+        repo = create_test_repo(tmp_path)
+        ms = MinSync(
+            repo_path=repo,
+            chunker=MockChunker(),
+            embedder=MockEmbedder(),
+            vector_store=store,
+        )
+        ms.init()
+
+        lock_path = repo / ".minsync" / "lock"
+        lock_path.write_text("invalid-pid\n", encoding="utf-8")
+
+        result = ms.sync()
+        assert result.files_processed > 0
+        assert not lock_path.exists(), "Stale lock should be removed during acquisition"
