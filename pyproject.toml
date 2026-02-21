@@ -5,6 +5,10 @@ description = "Sync your git repository to searchable index. Fully based on git 
 authors = [{ name = "NomaDamas", email = "vkehfdl1@gmail.com" }]
 readme = "README.md"
 keywords = ['python']
+dependencies = [
+    "pygit2>=1.14.0",
+    "pyyaml>=6.0",
+]
 requires-python = ">=3.10,<4.0"
 classifiers = [
     "Intended Audience :: Developers",
@@ -99,10 +103,6 @@ ignore = [
     "E731",
     # Avoid specifying long messages outside the exception class
     "TRY003",
-    # `subprocess` call: check for execution of untrusted input (we only run git)
-    "S603",
-    # Starting a process with a partial executable path (git)
-    "S607",
 ]
 
 [tool.ruff.lint.per-file-ignores]

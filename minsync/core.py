@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 import uuid
@@ -18,7 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pygit2
 import yaml
+
+from minsync.gitbackend import GitRepo
 
 DEFAULT_REF = "main"
 DEFAULT_EMBEDDER_ID = "openai:text-embedding-3-small"
@@ -379,6 +381,16 @@ class MinSync:
         self.chunker = chunker
         self.embedder = embedder
         self.vector_store = vector_store if vector_store is not None else _InMemoryVectorStore()
+        self._git: GitRepo | None = None
+
+    def _git_repo(self) -> GitRepo:
+        """Lazy-discover the git repository on first access."""
+        if self._git is None:
+            try:
+                self._git = GitRepo.discover(self.repo_path)
+            except (KeyError, pygit2.GitError) as exc:
+                raise MinSyncGitError("not a git repository") from exc
+        return self._git
 
     def init(
         self,
@@ -1077,26 +1089,16 @@ class MinSync:
         self.vector_store.upsert(docs)
 
     def _git_commit_exists(self, repo_root: Path, commit: str) -> bool:
-        result = self._run_git("cat-file", "-e", f"{commit}^{{commit}}", cwd=repo_root)
-        return result.returncode == 0
+        return self._git_repo().commit_exists(commit)
 
     def _count_commits_between(self, repo_root: Path, from_commit: str, to_commit: str) -> int:
-        result = self._run_git("rev-list", "--count", f"{from_commit}..{to_commit}", cwd=repo_root)
-        if result.returncode != 0:
-            return 0
-        raw_count = self._coerce_optional_str(result.stdout)
-        if raw_count is None:
-            return 0
-        try:
-            return max(int(raw_count), 0)
-        except ValueError:
-            return 0
+        return self._git_repo().count_commits_between(from_commit, to_commit)
 
     def _tracked_paths_at_commit(self, repo_root: Path, commit: str) -> list[str]:
-        result = self._run_git("ls-tree", "-r", "--name-only", commit, cwd=repo_root)
-        if result.returncode != 0:
-            raise MinSyncGitError("failed to list tracked files for verification")
-        return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+        try:
+            return self._git_repo().list_tree_paths(commit)
+        except (KeyError, pygit2.GitError) as exc:
+            raise MinSyncGitError("failed to list tracked files for verification") from exc
 
     def _load_worktree_ignore_matcher(self, repo_root: Path) -> _IgnoreMatcher:
         ignore_path = repo_root / ".minsyncignore"
@@ -1179,26 +1181,19 @@ class MinSync:
         return 0
 
     def _resolve_git_root(self) -> Path:
-        result = self._run_git("rev-parse", "--show-toplevel")
-        if result.returncode != 0 or not result.stdout.strip():
-            raise MinSyncGitError("not a git repository")
-        return Path(result.stdout.strip()).resolve()
+        return self._git_repo().workdir
 
     def _resolve_repo_id(self, repo_root: Path) -> str:
-        result = self._run_git("rev-list", "--max-parents=0", "HEAD", cwd=repo_root)
-        if result.returncode != 0:
-            raise MinSyncGitError("repository has no commits. Create at least one commit first.")
-
-        lines = result.stdout.strip().splitlines()
-        if not lines:
-            raise MinSyncGitError("repository has no commits. Create at least one commit first.")
-        return lines[-1].strip()
+        try:
+            return self._git_repo().resolve_repo_id()
+        except (KeyError, pygit2.GitError) as exc:
+            raise MinSyncGitError("repository has no commits. Create at least one commit first.") from exc
 
     def _resolve_commit(self, repo_root: Path, ref_name: str) -> str:
-        result = self._run_git("rev-parse", ref_name, cwd=repo_root)
-        if result.returncode != 0 or not result.stdout.strip():
-            raise MinSyncGitError(f"unable to resolve git ref: {ref_name}")
-        return result.stdout.strip()
+        try:
+            return self._git_repo().resolve_commit(ref_name)
+        except (KeyError, pygit2.GitError) as exc:
+            raise MinSyncGitError(f"unable to resolve git ref: {ref_name}") from exc
 
     def _load_config(self, repo_root: Path) -> dict[str, Any]:
         config_path = repo_root / ".minsync" / "config.yaml"
@@ -1295,54 +1290,27 @@ class MinSync:
         to_commit: str,
         full_scan: bool,
     ) -> list[tuple[str, str]]:
+        git = self._git_repo()
         if full_scan:
-            result = self._run_git("ls-tree", "-r", "--name-only", to_commit, cwd=repo_root)
-            if result.returncode != 0:
-                raise MinSyncGitError("failed to list tracked files for sync target")
-            return [("A", line.strip()) for line in result.stdout.splitlines() if line.strip()]
+            try:
+                paths = git.list_tree_paths(to_commit)
+            except (KeyError, pygit2.GitError) as exc:
+                raise MinSyncGitError("failed to list tracked files for sync target") from exc
+            return [("A", p) for p in paths]
 
         if not from_commit:
             return []
 
-        result = self._run_git("diff", "--name-status", "--find-renames", f"{from_commit}..{to_commit}", cwd=repo_root)
-        if result.returncode != 0:
-            raise MinSyncGitError("failed to compute git diff for sync")
-
-        changes: list[tuple[str, str]] = []
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            status = parts[0]
-            if status.startswith("R") and len(parts) >= 3:
-                old_path = parts[1].strip()
-                new_path = parts[2].strip()
-                if old_path:
-                    changes.append(("D", old_path))
-                if new_path:
-                    changes.append(("A", new_path))
-                continue
-
-            if len(parts) < 2:
-                continue
-
-            path = parts[1].strip()
-            if not path:
-                continue
-            if status.startswith("D"):
-                changes.append(("D", path))
-            elif status.startswith("A"):
-                changes.append(("A", path))
-            else:
-                changes.append(("M", path))
-        return changes
+        try:
+            return git.diff_name_status(from_commit, to_commit)
+        except (KeyError, pygit2.GitError) as exc:
+            raise MinSyncGitError("failed to compute git diff for sync") from exc
 
     def _load_ignore_matcher(self, *, repo_root: Path, to_commit: str) -> _IgnoreMatcher:
-        result = self._run_git("show", f"{to_commit}:.minsyncignore", cwd=repo_root)
-        if result.returncode != 0:
+        text = self._git_repo().read_file_at_commit_or_none(to_commit, ".minsyncignore")
+        if text is None:
             return _IgnoreMatcher.empty()
-        return _IgnoreMatcher.from_text(result.stdout)
+        return _IgnoreMatcher.from_text(text)
 
     def _did_ignore_rules_change(self, changes: list[tuple[str, str]]) -> bool:
         return any(path == ".minsyncignore" for _status, path in changes)
@@ -1398,16 +1366,10 @@ class MinSync:
         return filtered
 
     def _read_file_at_commit(self, repo_root: Path, commit: str, path: str) -> str:
-        result = subprocess.run(
-            ["git", "show", f"{commit}:{path}"],
-            cwd=repo_root,
-            capture_output=True,
-            text=False,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise MinSyncGitError(f"failed to read file content from git: {path}")
-        return result.stdout.decode("utf-8", errors="replace")
+        try:
+            return self._git_repo().read_file_at_commit(commit, path)
+        except (KeyError, pygit2.GitError) as exc:
+            raise MinSyncGitError(f"failed to read file content from git: {path}") from exc
 
     def _normalize_text(self, text: str, normalize: dict[str, Any]) -> str:
         normalized = text
@@ -1561,15 +1523,6 @@ class MinSync:
             return None
         text = str(value).strip()
         return text or None
-
-    def _run_git(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *args],
-            cwd=cwd or self.repo_path,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
 
     def _build_config(self, *, repo_id: str, collection: str, embedder: str, chunker: str) -> dict[str, Any]:
         return {
