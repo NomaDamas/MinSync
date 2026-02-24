@@ -442,7 +442,7 @@ class MinSync:
 
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
         minsync_dir = repo_root / ".minsync"
         cursor_path = minsync_dir / "cursor.json"
         txn_path = minsync_dir / "txn.json"
@@ -667,7 +667,7 @@ class MinSync:
 
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
         cursor = self._read_json(repo_root / ".minsync" / "cursor.json") or {}
         if not self._coerce_optional_str(cursor.get("last_synced_commit")):
             warnings.warn("index is empty. Run minsync sync first.", RuntimeWarning, stacklevel=2)
@@ -782,7 +782,7 @@ class MinSync:
     def check(self) -> CheckResult:
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
         errors: list[str] = []
 
         ref_name = str(config.get("ref") or DEFAULT_REF)
@@ -877,7 +877,7 @@ class MinSync:
     ) -> VerifyResult:
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
 
         minsync_dir = repo_root / ".minsync"
         cursor = self._read_json(minsync_dir / "cursor.json") or {}
@@ -1121,6 +1121,11 @@ class MinSync:
                 for item in raw_store.values():
                     if isinstance(item, dict):
                         docs.append(dict(item))
+
+        if not docs:
+            fetch_by_filter = getattr(self.vector_store, "fetch_by_filter", None)
+            if callable(fetch_by_filter):
+                return fetch_by_filter(_repo_filter(repo_id, ref_name))
 
         filtered: list[dict[str, Any]] = []
         for doc in docs:
@@ -1482,6 +1487,28 @@ class MinSync:
         except (MinSyncError, Exception):
             config_embedder_id = str((config.get("embedder") or {}).get("id") or DEFAULT_EMBEDDER_ID)
             return _DefaultEmbedder(config_embedder_id)
+
+    def _create_vectorstore_from_config(self, config: dict[str, Any], repo_root: Path) -> Any:
+        """Create a vector store from config, resolving relative paths."""
+        try:
+            from minsync.factory import create_vectorstore
+
+            resolved = dict(config)
+            vs = dict(resolved.get("vectorstore") or {})
+            coll = vs.get("collection") or {}
+            rel = coll.get("path", "")
+            if rel and not Path(rel).is_absolute():
+                vs["collection"] = {**coll, "path": str(repo_root / rel)}
+                resolved["vectorstore"] = vs
+            return create_vectorstore(resolved)
+        except (MinSyncError, ImportError, Exception):
+            return _InMemoryVectorStore()
+
+    def _ensure_vectorstore(self, config: dict[str, Any], repo_root: Path) -> None:
+        """Upgrade to a real vectorstore if available, then load persistence."""
+        if not self._vector_store_injected and isinstance(self.vector_store, _InMemoryVectorStore):
+            self.vector_store = self._create_vectorstore_from_config(config, repo_root)
+        self._load_default_vector_store(repo_root)
 
     def _chunk_schema_id(self, chunker: Any, fallback: str) -> str:
         schema_fn = getattr(chunker, "schema_id", None)

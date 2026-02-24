@@ -30,6 +30,11 @@ Documentation = "https://vkehfdl1.github.io/MinSync/"
 [project.scripts]
 minsync = "minsync.cli:main"
 
+[project.optional-dependencies]
+zvec = [
+    "zvec>=0.2.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
