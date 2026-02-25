@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -436,6 +437,7 @@ class MinSync:
         full: bool = False,
         dry_run: bool = False,
         batch_size: int | None = None,
+        max_concurrent: int | None = None,
         wait: bool = False,
         verbose: bool = False,
         quiet: bool = False,
@@ -444,6 +446,7 @@ class MinSync:
         config = self._load_config(repo_root)
         self._ensure_vectorstore(config, repo_root)
         embed_batch_size = batch_size or int((config.get("embedder") or {}).get("batch_size", 64))
+        effective_max_concurrent = max_concurrent or int((config.get("embedder") or {}).get("max_concurrent", 1))
         minsync_dir = repo_root / ".minsync"
         cursor_path = minsync_dir / "cursor.json"
         txn_path = minsync_dir / "txn.json"
@@ -576,7 +579,12 @@ class MinSync:
             def _flush_pending() -> None:
                 nonlocal chunks_added, chunks_updated, chunks_deleted
                 if pending_texts:
-                    vectors = embedder.embed(pending_texts)
+                    if effective_max_concurrent > 1 and hasattr(embedder, "async_embed"):
+                        vectors = _parallel_embed_async(
+                            embedder, pending_texts, embed_batch_size, effective_max_concurrent
+                        )
+                    else:
+                        vectors = embedder.embed(pending_texts)
                     for doc, vector in zip(pending_docs, vectors, strict=False):
                         doc["embedding"] = vector
                 for file_upserts, file_updates, file_path in pending_file_ops:
@@ -1611,6 +1619,7 @@ class MinSync:
             "embedder": {
                 "id": embedder,
                 "batch_size": 64,
+                "max_concurrent": 1,
             },
             "vectorstore": {
                 "id": DEFAULT_VECTORSTORE_ID,
@@ -1629,6 +1638,32 @@ class MinSync:
             shutil.rmtree(path)
             return
         path.unlink(missing_ok=True)
+
+
+def _parallel_embed_async(
+    embedder: Any,
+    texts: list[str],
+    sub_batch_size: int,
+    max_concurrent: int,
+) -> list[list[float]]:
+    """Run sub-batches of ``embedder.async_embed()`` in parallel via asyncio.
+
+    Uses ``asyncio.Semaphore(max_concurrent)`` to cap the number of
+    concurrent API calls.
+    """
+
+    async def _run() -> list[list[float]]:
+        sem = asyncio.Semaphore(max_concurrent)
+        sub_batches = [texts[i : i + sub_batch_size] for i in range(0, len(texts), sub_batch_size)]
+
+        async def _embed_batch(batch: list[str]) -> list[list[float]]:
+            async with sem:
+                return await embedder.async_embed(batch)
+
+        results = await asyncio.gather(*[_embed_batch(b) for b in sub_batches])
+        return [vec for batch_result in results for vec in batch_result]
+
+    return asyncio.run(_run())
 
 
 def _status_text(state: str) -> str:
