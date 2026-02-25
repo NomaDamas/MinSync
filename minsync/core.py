@@ -440,11 +440,10 @@ class MinSync:
         verbose: bool = False,
         quiet: bool = False,
     ) -> SyncResult:
-        del batch_size  # Reserved for a future batching implementation.
-
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
         self._ensure_vectorstore(config, repo_root)
+        embed_batch_size = batch_size or int((config.get("embedder") or {}).get("batch_size", 64))
         minsync_dir = repo_root / ".minsync"
         cursor_path = minsync_dir / "cursor.json"
         txn_path = minsync_dir / "txn.json"
@@ -568,6 +567,33 @@ class MinSync:
                 removed = vector_store.delete_by_filter(_repo_filter(repo_id, ref_name))
                 chunks_deleted += int(removed or 0)
 
+            # Pending embed buffer: accumulate across files, flush when batch is full
+            pending_texts: list[str] = []
+            pending_docs: list[dict[str, Any]] = []
+            # Per-file ops deferred until embed flush
+            pending_file_ops: list[tuple[list[dict[str, Any]], list[dict[str, Any]], str]] = []
+
+            def _flush_pending() -> None:
+                nonlocal chunks_added, chunks_updated, chunks_deleted
+                if pending_texts:
+                    vectors = embedder.embed(pending_texts)
+                    for doc, vector in zip(pending_docs, vectors, strict=False):
+                        doc["embedding"] = vector
+                for file_upserts, file_updates, file_path in pending_file_ops:
+                    if file_upserts:
+                        vector_store.upsert(file_upserts)
+                        chunks_added += len(file_upserts)
+                    if file_updates:
+                        vector_store.update(file_updates)
+                        chunks_updated += len(file_updates)
+                    removed = vector_store.delete_by_filter(
+                        _stale_path_filter(repo_id, ref_name, file_path, sync_token)
+                    )
+                    chunks_deleted += int(removed or 0)
+                pending_texts.clear()
+                pending_docs.clear()
+                pending_file_ops.clear()
+
             for file_idx, (status, path) in enumerate(planned_changes, 1):
                 if show_progress:
                     if verbose:
@@ -576,6 +602,7 @@ class MinSync:
                         print(f"\r  [{file_idx}/{total_files}] {path}", end="", file=sys.stderr)
 
                 if status == "D":
+                    _flush_pending()
                     removed = vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
                     chunks_deleted += int(removed or 0)
                     continue
@@ -597,13 +624,12 @@ class MinSync:
                 existing = vector_store.fetch(doc_ids) if doc_ids else []
                 existing_ids = {str(doc["id"]) for doc in existing}
 
-                docs_to_upsert: list[dict[str, Any]] = []
-                texts_to_embed: list[str] = []
-                docs_to_update: list[dict[str, Any]] = []
+                file_upserts: list[dict[str, Any]] = []
+                file_updates: list[dict[str, Any]] = []
 
                 for doc in docs:
                     if doc["id"] in existing_ids:
-                        docs_to_update.append({
+                        file_updates.append({
                             "id": doc["id"],
                             "repo_id": doc["repo_id"],
                             "ref": doc["ref"],
@@ -615,22 +641,16 @@ class MinSync:
                             "content_commit": doc["content_commit"],
                         })
                     else:
-                        docs_to_upsert.append(doc)
-                        texts_to_embed.append(doc["text"])
+                        file_upserts.append(doc)
+                        pending_docs.append(doc)
+                        pending_texts.append(doc["text"])
 
-                if docs_to_upsert:
-                    vectors = embedder.embed(texts_to_embed)
-                    for doc, vector in zip(docs_to_upsert, vectors, strict=False):
-                        doc["embedding"] = vector
-                    vector_store.upsert(docs_to_upsert)
-                    chunks_added += len(docs_to_upsert)
+                pending_file_ops.append((file_upserts, file_updates, path))
 
-                if docs_to_update:
-                    vector_store.update(docs_to_update)
-                    chunks_updated += len(docs_to_update)
+                if len(pending_texts) >= embed_batch_size:
+                    _flush_pending()
 
-                removed = vector_store.delete_by_filter(_stale_path_filter(repo_id, ref_name, path, sync_token))
-                chunks_deleted += int(removed or 0)
+            _flush_pending()
 
             if show_progress and not verbose:
                 print(file=sys.stderr)  # newline after \r progress
