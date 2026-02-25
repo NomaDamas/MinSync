@@ -52,7 +52,7 @@ def create_embedder(config: dict[str, Any]) -> Any:
     if embedder_id.startswith("openai:"):
         model_name = embedder_id.split(":", 1)[1]
         try:
-            from langchain_openai import OpenAIEmbeddings  # type: ignore[import-untyped]
+            from langchain_openai import OpenAIEmbeddings
         except ImportError as exc:
             raise MinSyncError(
                 f"langchain-openai package not found for embedder '{embedder_id}'. "
@@ -65,7 +65,7 @@ def create_embedder(config: dict[str, Any]) -> Any:
     if embedder_id.startswith("huggingface:"):
         model_name = embedder_id.split(":", 1)[1]
         try:
-            from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore[import-untyped]
+            from langchain_huggingface import HuggingFaceEmbeddings
         except ImportError as exc:
             raise MinSyncError(
                 f"langchain-huggingface package not found for embedder '{embedder_id}'. "
@@ -110,7 +110,7 @@ def create_vectorstore(config: dict[str, Any], embedder: Any = None) -> Any:
 
     if vs_id == "weaviate":
         try:
-            from langchain_weaviate import WeaviateVectorStore  # type: ignore[import-untyped]
+            from langchain_weaviate import WeaviateVectorStore
         except ImportError as exc:
             raise MinSyncError(
                 "'weaviate-client' package not found for configured vectorstore 'weaviate'. "
@@ -122,7 +122,7 @@ def create_vectorstore(config: dict[str, Any], embedder: Any = None) -> Any:
 
     if vs_id == "chroma":
         try:
-            from langchain_chroma import Chroma  # type: ignore[import-untyped]
+            from langchain_chroma import Chroma
         except ImportError as exc:
             raise MinSyncError(
                 "'chromadb' package not found for configured vectorstore 'chroma'. "
@@ -134,7 +134,7 @@ def create_vectorstore(config: dict[str, Any], embedder: Any = None) -> Any:
 
     if vs_id == "qdrant":
         try:
-            from langchain_qdrant import QdrantVectorStore  # type: ignore[import-untyped]
+            from langchain_qdrant import QdrantVectorStore
         except ImportError as exc:
             raise MinSyncError(
                 "'qdrant-client' package not found for configured vectorstore 'qdrant'. "
