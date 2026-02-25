@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -437,6 +438,7 @@ class MinSync:
         batch_size: int | None = None,
         wait: bool = False,
         verbose: bool = False,
+        quiet: bool = False,
     ) -> SyncResult:
         del batch_size  # Reserved for a future batching implementation.
 
@@ -556,12 +558,23 @@ class MinSync:
             chunks_added = 0
             chunks_updated = 0
             chunks_deleted = 0
+            total_files = len(planned_changes)
+            show_progress = not quiet and total_files > 0
+
+            if show_progress:
+                print(f"Syncing {total_files} file(s)...", file=sys.stderr)
 
             if full and planned_changes:
                 removed = vector_store.delete_by_filter(_repo_filter(repo_id, ref_name))
                 chunks_deleted += int(removed or 0)
 
-            for status, path in planned_changes:
+            for file_idx, (status, path) in enumerate(planned_changes, 1):
+                if show_progress:
+                    if verbose:
+                        print(f"  [{file_idx}/{total_files}] {status} {path}", file=sys.stderr)
+                    else:
+                        print(f"\r  [{file_idx}/{total_files}] {path}", end="", file=sys.stderr)
+
                 if status == "D":
                     removed = vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
                     chunks_deleted += int(removed or 0)
@@ -618,6 +631,14 @@ class MinSync:
 
                 removed = vector_store.delete_by_filter(_stale_path_filter(repo_id, ref_name, path, sync_token))
                 chunks_deleted += int(removed or 0)
+
+            if show_progress and not verbose:
+                print(file=sys.stderr)  # newline after \r progress
+            if show_progress:
+                print(
+                    f"Done: +{chunks_added} added, ~{chunks_updated} updated, -{chunks_deleted} deleted",
+                    file=sys.stderr,
+                )
 
             if hasattr(vector_store, "flush"):
                 vector_store.flush()

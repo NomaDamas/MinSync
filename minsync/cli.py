@@ -118,6 +118,7 @@ def _handle_sync(ms: MinSync, args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         wait=args.wait,
         verbose=args.verbose,
+        quiet=args.quiet,
     )
     _emit_result(args, result)
     return 0
