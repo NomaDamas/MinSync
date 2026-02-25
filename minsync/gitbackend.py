@@ -46,7 +46,7 @@ class GitRepo:
         When there are multiple roots the *last* one (sorted chronologically
         by the walker, same as ``git rev-list --max-parents=0 HEAD``) is returned.
         """
-        walker = self._repo.walk(self._repo.head.target, pygit2.GIT_SORT_TOPOLOGICAL)
+        walker = self._repo.walk(self._repo.head.target, pygit2.enums.SortMode.TOPOLOGICAL)
         root_oid: str | None = None
         for commit in walker:
             if not commit.parents:
@@ -101,7 +101,7 @@ class GitRepo:
                 full = f"{prefix}{entry.name}" if not prefix else f"{prefix}/{entry.name}"
                 if entry.type_str == "tree":
                     subtree = self._repo.get(entry.id)
-                    if subtree is not None:
+                    if subtree is not None and isinstance(subtree, pygit2.Tree):
                         stack.append((full, subtree))
                 else:
                     paths.append(full)
@@ -112,9 +112,10 @@ class GitRepo:
         commit = self._repo.revparse_single(sha).peel(pygit2.Commit)
         tree = commit.tree
         entry = tree[path]
-        blob = self._repo.get(entry.id)
-        if blob is None or blob.type != pygit2.GIT_OBJECT_BLOB:
+        obj = self._repo.get(entry.id)
+        if obj is None or obj.type != pygit2.GIT_OBJECT_BLOB:
             raise KeyError(path)
+        blob: pygit2.Blob = obj.peel(pygit2.Blob)
         return blob.data.decode("utf-8", errors="replace")
 
     def read_file_at_commit_or_none(self, sha: str, path: str) -> str | None:
@@ -133,8 +134,8 @@ class GitRepo:
         """Return ``[(status, path), ...]`` matching ``git diff --name-status --find-renames``."""
         from_commit = self._repo.revparse_single(from_sha).peel(pygit2.Commit)
         to_commit = self._repo.revparse_single(to_sha).peel(pygit2.Commit)
-        diff = self._repo.diff(from_commit.tree, to_commit.tree)
-        diff.find_similar(flags=pygit2.GIT_DIFF_FIND_RENAMES)
+        diff = self._repo.diff(a=from_commit, b=to_commit)
+        diff.find_similar(flags=pygit2.enums.DiffFind.FIND_RENAMES)
 
         changes: list[tuple[str, str]] = []
         for delta in diff.deltas:

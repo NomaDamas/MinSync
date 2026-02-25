@@ -476,7 +476,7 @@ class MinSync:
                 ):
                     raise MinSyncError("schema/embedder mismatch detected. Run sync with --full.", exit_code=1)
 
-            if recovered:
+            if recovered and isinstance(txn, dict):
                 from_commit = self._coerce_optional_str(txn.get("from_commit"))
                 to_commit = self._coerce_optional_str(txn.get("to_commit"))
                 sync_token = str(txn.get("sync_token") or uuid.uuid4().hex)

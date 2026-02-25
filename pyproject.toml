@@ -129,3 +129,16 @@ ignore = [
 
 [tool.ruff.format]
 preview = true
+
+[tool.deptry]
+ignore = ["DEP001"]
+
+[tool.deptry.per_rule_ignores]
+DEP001 = [
+    "langchain_openai",
+    "langchain_huggingface",
+    "langchain_weaviate",
+    "langchain_chroma",
+    "langchain_qdrant",
+    "langchain_core",
+]

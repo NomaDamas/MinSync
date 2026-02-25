@@ -24,7 +24,7 @@ class LangChainVectorStoreAdapter:
     def upsert(self, docs: list[dict[str, Any]]) -> None:
         """Insert or update documents via LangChain's add_documents."""
         try:
-            from langchain_core.documents import Document
+            from langchain_core.documents import Document  # type: ignore[import-untyped]
         except ImportError as exc:
             raise ImportError(
                 "langchain-core is required for LangChainVectorStoreAdapter. Install with: pip install langchain-core"
