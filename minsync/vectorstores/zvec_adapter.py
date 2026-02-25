@@ -25,6 +25,10 @@ def _translate_filter(filter_expr: str) -> str:
     return " AND ".join(translated)
 
 
+_WRITE_BATCH_SIZE = 512
+_FETCH_BATCH_SIZE = 512
+
+
 class ZvecVectorStore:
     """Zvec-backed vector store with file-based persistence and HNSW indexing."""
 
@@ -131,7 +135,8 @@ class ZvecVectorStore:
             coll = self._create_collection(len(first_embedding))
 
         zvec_docs = [self._to_zvec_doc(d) for d in docs]
-        coll.upsert(zvec_docs)
+        for i in range(0, len(zvec_docs), _WRITE_BATCH_SIZE):
+            coll.upsert(zvec_docs[i : i + _WRITE_BATCH_SIZE])
 
     def update(self, docs: list[dict[str, Any]]) -> None:
         if not docs:
@@ -141,7 +146,8 @@ class ZvecVectorStore:
             return
 
         zvec_docs = [self._to_zvec_doc(d) for d in docs]
-        coll.update(zvec_docs)
+        for i in range(0, len(zvec_docs), _WRITE_BATCH_SIZE):
+            coll.update(zvec_docs[i : i + _WRITE_BATCH_SIZE])
 
     def fetch(self, ids: list[str]) -> list[dict[str, Any]]:
         coll = self._ensure_collection()
@@ -150,11 +156,13 @@ class ZvecVectorStore:
         if not ids:
             return []
 
-        result_map = coll.fetch(ids)
         results: list[dict[str, Any]] = []
-        for doc_id in ids:
-            if doc_id in result_map:
-                results.append(self._from_zvec_doc(result_map[doc_id], include_vector=True))
+        for i in range(0, len(ids), _FETCH_BATCH_SIZE):
+            batch_ids = ids[i : i + _FETCH_BATCH_SIZE]
+            result_map = coll.fetch(batch_ids)
+            for doc_id in batch_ids:
+                if doc_id in result_map:
+                    results.append(self._from_zvec_doc(result_map[doc_id], include_vector=True))
         return results
 
     def delete_by_filter(self, filter_expr: str) -> int:
