@@ -20,6 +20,7 @@ from unittest.mock import patch
 import pytest
 
 from minsync import MinSync
+from minsync.core import MinSyncVectorStoreError
 from tests.conftest import (
     add_commit,
     create_test_repo,
@@ -96,7 +97,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         current_cursor = get_cursor(repo)
@@ -119,7 +120,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         txn_path = repo / ".minsync" / "txn.json"
@@ -142,7 +143,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         # Restore normal upsert
@@ -168,7 +169,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         store.upsert = original_upsert
@@ -195,7 +196,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         store.upsert = original_upsert
@@ -221,7 +222,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         store.upsert = original_upsert
@@ -260,7 +261,7 @@ class TestT14CrashMidSync:
 
         store.upsert = crashing_upsert
 
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         store.upsert = original_upsert
@@ -328,7 +329,7 @@ class TestT15CrashOnFlush:
 
         store.flush = crashing_flush
 
-        with pytest.raises(RuntimeError, match="Simulated crash during flush"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         # Restore normal flush
@@ -370,7 +371,7 @@ class TestT15CrashOnFlush:
 
         store.flush = crashing_flush
 
-        with pytest.raises(RuntimeError, match="Simulated crash during flush"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms.sync()
 
         store.flush = original_flush
