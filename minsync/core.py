@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -437,12 +438,12 @@ class MinSync:
         batch_size: int | None = None,
         wait: bool = False,
         verbose: bool = False,
+        quiet: bool = False,
     ) -> SyncResult:
-        del batch_size  # Reserved for a future batching implementation.
-
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
+        embed_batch_size = batch_size or int((config.get("embedder") or {}).get("batch_size", 64))
         minsync_dir = repo_root / ".minsync"
         cursor_path = minsync_dir / "cursor.json"
         txn_path = minsync_dir / "txn.json"
@@ -475,7 +476,7 @@ class MinSync:
                 ):
                     raise MinSyncError("schema/embedder mismatch detected. Run sync with --full.", exit_code=1)
 
-            if recovered:
+            if recovered and isinstance(txn, dict):
                 from_commit = self._coerce_optional_str(txn.get("from_commit"))
                 to_commit = self._coerce_optional_str(txn.get("to_commit"))
                 sync_token = str(txn.get("sync_token") or uuid.uuid4().hex)
@@ -556,13 +557,52 @@ class MinSync:
             chunks_added = 0
             chunks_updated = 0
             chunks_deleted = 0
+            total_files = len(planned_changes)
+            show_progress = not quiet and total_files > 0
+
+            if show_progress:
+                print(f"Syncing {total_files} file(s)...", file=sys.stderr)
 
             if full and planned_changes:
                 removed = vector_store.delete_by_filter(_repo_filter(repo_id, ref_name))
                 chunks_deleted += int(removed or 0)
 
-            for status, path in planned_changes:
+            # Pending embed buffer: accumulate across files, flush when batch is full
+            pending_texts: list[str] = []
+            pending_docs: list[dict[str, Any]] = []
+            # Per-file ops deferred until embed flush
+            pending_file_ops: list[tuple[list[dict[str, Any]], list[dict[str, Any]], str]] = []
+
+            def _flush_pending() -> None:
+                nonlocal chunks_added, chunks_updated, chunks_deleted
+                if pending_texts:
+                    vectors = embedder.embed(pending_texts)
+                    for doc, vector in zip(pending_docs, vectors, strict=False):
+                        doc["embedding"] = vector
+                for file_upserts, file_updates, file_path in pending_file_ops:
+                    if file_upserts:
+                        vector_store.upsert(file_upserts)
+                        chunks_added += len(file_upserts)
+                    if file_updates:
+                        vector_store.update(file_updates)
+                        chunks_updated += len(file_updates)
+                    removed = vector_store.delete_by_filter(
+                        _stale_path_filter(repo_id, ref_name, file_path, sync_token)
+                    )
+                    chunks_deleted += int(removed or 0)
+                pending_texts.clear()
+                pending_docs.clear()
+                pending_file_ops.clear()
+
+            for file_idx, (status, path) in enumerate(planned_changes, 1):
+                if show_progress:
+                    if verbose:
+                        print(f"  [{file_idx}/{total_files}] {status} {path}", file=sys.stderr)
+                    else:
+                        print(f"\r  [{file_idx}/{total_files}] {path}", end="", file=sys.stderr)
+
                 if status == "D":
+                    _flush_pending()
                     removed = vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
                     chunks_deleted += int(removed or 0)
                     continue
@@ -584,13 +624,12 @@ class MinSync:
                 existing = vector_store.fetch(doc_ids) if doc_ids else []
                 existing_ids = {str(doc["id"]) for doc in existing}
 
-                docs_to_upsert: list[dict[str, Any]] = []
-                texts_to_embed: list[str] = []
-                docs_to_update: list[dict[str, Any]] = []
+                file_upserts: list[dict[str, Any]] = []
+                file_updates: list[dict[str, Any]] = []
 
                 for doc in docs:
                     if doc["id"] in existing_ids:
-                        docs_to_update.append({
+                        file_updates.append({
                             "id": doc["id"],
                             "repo_id": doc["repo_id"],
                             "ref": doc["ref"],
@@ -602,22 +641,24 @@ class MinSync:
                             "content_commit": doc["content_commit"],
                         })
                     else:
-                        docs_to_upsert.append(doc)
-                        texts_to_embed.append(doc["text"])
+                        file_upserts.append(doc)
+                        pending_docs.append(doc)
+                        pending_texts.append(doc["text"])
 
-                if docs_to_upsert:
-                    vectors = embedder.embed(texts_to_embed)
-                    for doc, vector in zip(docs_to_upsert, vectors, strict=False):
-                        doc["embedding"] = vector
-                    vector_store.upsert(docs_to_upsert)
-                    chunks_added += len(docs_to_upsert)
+                pending_file_ops.append((file_upserts, file_updates, path))
 
-                if docs_to_update:
-                    vector_store.update(docs_to_update)
-                    chunks_updated += len(docs_to_update)
+                if len(pending_texts) >= embed_batch_size:
+                    _flush_pending()
 
-                removed = vector_store.delete_by_filter(_stale_path_filter(repo_id, ref_name, path, sync_token))
-                chunks_deleted += int(removed or 0)
+            _flush_pending()
+
+            if show_progress and not verbose:
+                print(file=sys.stderr)  # newline after \r progress
+            if show_progress:
+                print(
+                    f"Done: +{chunks_added} added, ~{chunks_updated} updated, -{chunks_deleted} deleted",
+                    file=sys.stderr,
+                )
 
             if hasattr(vector_store, "flush"):
                 vector_store.flush()
@@ -667,7 +708,7 @@ class MinSync:
 
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
         cursor = self._read_json(repo_root / ".minsync" / "cursor.json") or {}
         if not self._coerce_optional_str(cursor.get("last_synced_commit")):
             warnings.warn("index is empty. Run minsync sync first.", RuntimeWarning, stacklevel=2)
@@ -782,7 +823,7 @@ class MinSync:
     def check(self) -> CheckResult:
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
         errors: list[str] = []
 
         ref_name = str(config.get("ref") or DEFAULT_REF)
@@ -877,7 +918,7 @@ class MinSync:
     ) -> VerifyResult:
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
-        self._load_default_vector_store(repo_root)
+        self._ensure_vectorstore(config, repo_root)
 
         minsync_dir = repo_root / ".minsync"
         cursor = self._read_json(minsync_dir / "cursor.json") or {}
@@ -1121,6 +1162,11 @@ class MinSync:
                 for item in raw_store.values():
                     if isinstance(item, dict):
                         docs.append(dict(item))
+
+        if not docs:
+            fetch_by_filter = getattr(self.vector_store, "fetch_by_filter", None)
+            if callable(fetch_by_filter):
+                return fetch_by_filter(_repo_filter(repo_id, ref_name))
 
         filtered: list[dict[str, Any]] = []
         for doc in docs:
@@ -1482,6 +1528,28 @@ class MinSync:
         except (MinSyncError, Exception):
             config_embedder_id = str((config.get("embedder") or {}).get("id") or DEFAULT_EMBEDDER_ID)
             return _DefaultEmbedder(config_embedder_id)
+
+    def _create_vectorstore_from_config(self, config: dict[str, Any], repo_root: Path) -> Any:
+        """Create a vector store from config, resolving relative paths."""
+        try:
+            from minsync.factory import create_vectorstore
+
+            resolved = dict(config)
+            vs = dict(resolved.get("vectorstore") or {})
+            coll = vs.get("collection") or {}
+            rel = coll.get("path", "")
+            if rel and not Path(rel).is_absolute():
+                vs["collection"] = {**coll, "path": str(repo_root / rel)}
+                resolved["vectorstore"] = vs
+            return create_vectorstore(resolved)
+        except (MinSyncError, ImportError, Exception):
+            return _InMemoryVectorStore()
+
+    def _ensure_vectorstore(self, config: dict[str, Any], repo_root: Path) -> None:
+        """Upgrade to a real vectorstore if available, then load persistence."""
+        if not self._vector_store_injected and isinstance(self.vector_store, _InMemoryVectorStore):
+            self.vector_store = self._create_vectorstore_from_config(config, repo_root)
+        self._load_default_vector_store(repo_root)
 
     def _chunk_schema_id(self, chunker: Any, fallback: str) -> str:
         schema_fn = getattr(chunker, "schema_id", None)

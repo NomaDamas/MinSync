@@ -28,43 +28,45 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize MinSync in the current git repository.")
-    init_parser.add_argument("--collection")
-    init_parser.add_argument("--embedder", default=DEFAULT_EMBEDDER_ID)
-    init_parser.add_argument("--chunker", default=DEFAULT_CHUNKER_ID)
-    init_parser.add_argument("--force", action="store_true")
+    init_parser.add_argument("--collection", help="Collection name (default: auto-generated from repo ID).")
+    init_parser.add_argument("--embedder", default=DEFAULT_EMBEDDER_ID, help="Embedder ID (default: %(default)s).")
+    init_parser.add_argument("--chunker", default=DEFAULT_CHUNKER_ID, help="Chunker ID (default: %(default)s).")
+    init_parser.add_argument("--force", action="store_true", help="Overwrite existing .minsync/ config.")
     init_parser.set_defaults(handler=_handle_init)
 
     sync_parser = subparsers.add_parser("sync", help="Synchronize git changes into the index.")
-    sync_parser.add_argument("--ref")
-    sync_parser.add_argument("--full", action="store_true")
-    sync_parser.add_argument("--dry-run", action="store_true")
-    sync_parser.add_argument("--batch-size", type=int)
-    sync_parser.add_argument("--wait", action="store_true")
+    sync_parser.add_argument("--ref", help="Git ref to sync (default: config ref or 'main').")
+    sync_parser.add_argument("--full", action="store_true", help="Re-index all files from scratch.")
+    sync_parser.add_argument("--dry-run", action="store_true", help="Show planned changes without applying them.")
+    sync_parser.add_argument("--batch-size", type=int, help="Number of texts to embed per API call.")
+    sync_parser.add_argument(
+        "--wait", action="store_true", help="Wait for lock instead of failing if another sync is running."
+    )
     sync_parser.set_defaults(handler=_handle_sync)
 
     query_parser = subparsers.add_parser("query", help="Query indexed content.")
-    query_parser.add_argument("query_text")
-    query_parser.add_argument("--k", type=int, default=10)
-    query_parser.add_argument("--ref")
-    query_parser.add_argument("--filter", dest="filter_expr")
-    query_parser.add_argument("--format", choices=("text", "json", "jsonl"))
-    query_parser.add_argument("--show-score", action="store_true")
+    query_parser.add_argument("query_text", help="Search query text.")
+    query_parser.add_argument("--k", type=int, default=10, help="Number of results to return (default: %(default)s).")
+    query_parser.add_argument("--ref", help="Filter results by git ref.")
+    query_parser.add_argument("--filter", dest="filter_expr", help="Filter expression (e.g. 'path==\"docs/foo.md\"').")
+    query_parser.add_argument("--format", choices=("text", "json", "jsonl"), help="Output format.")
+    query_parser.add_argument("--show-score", action="store_true", help="Display similarity scores.")
     query_parser.set_defaults(handler=_handle_query)
 
     status_parser = subparsers.add_parser("status", help="Show repository sync status.")
-    status_parser.add_argument("--format", choices=("text", "json"))
+    status_parser.add_argument("--format", choices=("text", "json"), help="Output format.")
     status_parser.set_defaults(handler=_handle_status)
 
     check_parser = subparsers.add_parser("check", help="Run dependency and environment checks.")
-    check_parser.add_argument("--format", choices=("text", "json"))
+    check_parser.add_argument("--format", choices=("text", "json"), help="Output format.")
     check_parser.set_defaults(handler=_handle_check)
 
     verify_parser = subparsers.add_parser("verify", help="Verify and optionally repair index consistency.")
-    verify_parser.add_argument("--ref")
-    verify_parser.add_argument("--all", action="store_true")
-    verify_parser.add_argument("--fix", action="store_true")
-    verify_parser.add_argument("--sample", type=int)
-    verify_parser.add_argument("--format", choices=("text", "json"))
+    verify_parser.add_argument("--ref", help="Git ref to verify against.")
+    verify_parser.add_argument("--all", action="store_true", help="Verify all indexed files, not just changed ones.")
+    verify_parser.add_argument("--fix", action="store_true", help="Automatically repair inconsistencies.")
+    verify_parser.add_argument("--sample", type=int, help="Verify a random sample of N files.")
+    verify_parser.add_argument("--format", choices=("text", "json"), help="Output format.")
     verify_parser.set_defaults(handler=_handle_verify)
 
     return parser
@@ -118,6 +120,7 @@ def _handle_sync(ms: MinSync, args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         wait=args.wait,
         verbose=args.verbose,
+        quiet=args.quiet,
     )
     _emit_result(args, result)
     return 0

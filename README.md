@@ -2,73 +2,148 @@
 
 [![Release](https://img.shields.io/github/v/release/vkehfdl1/MinSync)](https://img.shields.io/github/v/release/vkehfdl1/MinSync)
 [![Build status](https://img.shields.io/github/actions/workflow/status/vkehfdl1/MinSync/main.yml?branch=main)](https://github.com/vkehfdl1/MinSync/actions/workflows/main.yml?query=branch%3Amain)
-[![codecov](https://codecov.io/gh/vkehfdl1/MinSync/branch/main/graph/badge.svg)](https://codecov.io/gh/vkehfdl1/MinSync)
-[![Commit activity](https://img.shields.io/github/commit-activity/m/vkehfdl1/MinSync)](https://img.shields.io/github/commit-activity/m/vkehfdl1/MinSync)
 [![License](https://img.shields.io/github/license/vkehfdl1/MinSync)](https://img.shields.io/github/license/vkehfdl1/MinSync)
 
-Sync your git repository to searchable index. Fully based on git diff. No need extra DB.
+Git diff-based incremental vector index for any repository. No external DB required.
 
-- **Github repository**: <https://github.com/vkehfdl1/MinSync/>
-- **Documentation** <https://vkehfdl1.github.io/MinSync/>
+- **Github repository**: <https://github.com/NomaDamas/MinSync/>
+- **Documentation**: <https://vkehfdl1.github.io/MinSync/>
 
-## Getting started with your project
+## What it does
 
-### 1. Create a New Repository
+MinSync watches your git repository and keeps a local vector index in sync. It uses `git diff` to detect changes and only re-embeds what actually changed — no full re-indexing needed.
 
-First, create a repository on GitHub with the same name as this project, and then run the following commands:
+- Indexes all git-tracked files (respects `.gitignore` automatically)
+- Incremental sync via `git diff` — only changed chunks get re-embedded
+- Deterministic chunk IDs — same content always produces the same ID
+- Crash-safe — interrupted syncs recover automatically
+- Embedded vector DB (zvec) — no server, just a local file in `.minsync/`
+- `.minsyncignore` for excluding files you don't want indexed
+
+## Install
 
 ```bash
-git init -b main
-git add .
-git commit -m "init commit"
-git remote add origin git@github.com:vkehfdl1/MinSync.git
-git push -u origin main
+pip install minsync[zvec]
 ```
 
-### 2. Set Up Your Development Environment
-
-Then, install the environment and the pre-commit hooks with
+Or with uv:
 
 ```bash
+uv add "minsync[zvec]"
+```
+
+For development (editable install):
+
+```bash
+uv add --editable "/path/to/MinSync[zvec]"
+```
+
+### Embedding model setup
+
+OpenAI (default):
+
+```bash
+pip install langchain-openai
+export OPENAI_API_KEY="sk-..."
+```
+
+HuggingFace (local, no API key):
+
+```bash
+pip install langchain-huggingface sentence-transformers
+```
+
+## Quick start
+
+```bash
+cd your-repo
+
+# Initialize
+minsync init
+# or with HuggingFace:
+minsync init --embedder "huggingface:sentence-transformers/all-MiniLM-L6-v2"
+
+# Build initial index
+minsync sync
+
+# Search
+minsync query "authentication flow" --k 5
+
+# After pulling new changes
+git pull
+minsync sync          # only re-embeds changed files
+
+# Check index health
+minsync verify
+```
+
+## CLI commands
+
+| Command | Description |
+|---|---|
+| `minsync init` | Initialize `.minsync/` in current git repo |
+| `minsync sync` | Incremental sync (or `--full` for rebuild) |
+| `minsync query "text"` | Semantic search over indexed content |
+| `minsync status` | Show sync status (up-to-date / behind / interrupted) |
+| `minsync check` | Verify environment and dependencies |
+| `minsync verify` | Check index consistency (with `--fix` to repair) |
+
+Use `minsync <command> --help` for full option details.
+
+## Python API
+
+```python
+from minsync import MinSync
+from pathlib import Path
+
+ms = MinSync(repo_path=Path("/path/to/repo"))
+ms.init()
+ms.sync()
+results = ms.query("search text", k=10)
+
+# Custom components
+ms = MinSync(
+    repo_path=Path("/path/to/repo"),
+    chunker=MyChunker(),        # implements Chunker protocol
+    embedder=MyEmbedder(),      # implements Embedder protocol
+    vector_store=MyStore(),     # implements VectorStore protocol
+)
+```
+
+## .minsyncignore
+
+Works like `.gitignore`. Add patterns for git-tracked files you don't want indexed:
+
+```gitignore
+# Build artifacts
+dist/
+blog/
+
+# Attachments
+attachments/
+*.png
+*.pdf
+
+# Config files
+pyproject.toml
+uv.lock
+```
+
+## How it works
+
+1. `git diff` detects changed files since last sync
+2. Changed files are re-chunked (markdown heading-based by default)
+3. Each chunk gets a deterministic ID from `sha256(repo_id + path + content_hash + ...)`
+4. Only chunks with new IDs get embedded — unchanged chunks skip the API call
+5. Stale chunks (old content) are automatically swept
+
+All state lives in `.minsync/` — delete it to start fresh.
+
+## Development
+
+```bash
+git clone https://github.com/NomaDamas/MinSync.git
+cd MinSync
 make install
+uv run pytest
 ```
-
-This will also generate your `uv.lock` file
-
-### 3. Run the pre-commit hooks
-
-Initially, the CI/CD pipeline might be failing due to formatting issues. To resolve those run:
-
-```bash
-uv run pre-commit run -a
-```
-
-### 4. Commit the changes
-
-Lastly, commit the changes made by the two steps above to your repository.
-
-```bash
-git add .
-git commit -m 'Fix formatting issues'
-git push origin main
-```
-
-You are now ready to start development on your project!
-The CI/CD pipeline will be triggered when you open a pull request, merge to main, or when you create a new release.
-
-To finalize the set-up for publishing to PyPI, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/publishing/#set-up-for-pypi).
-For activating the automatic documentation with MkDocs, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/mkdocs/#enabling-the-documentation-on-github).
-To enable the code coverage reports, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/codecov/).
-
-## Releasing a new version
-
-- Create an API Token on [PyPI](https://pypi.org/).
-- Add the API Token to your projects secrets with the name `PYPI_TOKEN` by visiting [this page](https://github.com/vkehfdl1/MinSync/settings/secrets/actions/new).
-- Create a [new release](https://github.com/vkehfdl1/MinSync/releases/new) on Github.
-- Create a new tag in the form `*.*.*`.
-
-For more details, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/cicd/#how-to-trigger-a-release).
-
----
-
-Repository initiated with [fpgmaas/cookiecutter-uv](https://github.com/fpgmaas/cookiecutter-uv).

@@ -97,7 +97,16 @@ def create_vectorstore(config: dict[str, Any], embedder: Any = None) -> Any:
     options = vs_config.get("options") or {}
 
     if vs_id == "zvec":
-        return _InMemoryVectorStore()
+        try:
+            import zvec as _zvec_check  # noqa: F401
+
+            from minsync.vectorstores.zvec_adapter import ZvecVectorStore
+        except ImportError:
+            return _InMemoryVectorStore()
+        coll = vs_config.get("collection") or {}
+        db_path = str(coll.get("path", ".minsync/zvec_data"))
+        collection_name = str(coll.get("name", "minsync"))
+        return ZvecVectorStore(db_path=db_path, collection_name=collection_name)
 
     if vs_id == "weaviate":
         try:

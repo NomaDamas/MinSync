@@ -30,6 +30,11 @@ Documentation = "https://vkehfdl1.github.io/MinSync/"
 [project.scripts]
 minsync = "minsync.cli:main"
 
+[project.optional-dependencies]
+zvec = [
+    "zvec>=0.2.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
@@ -54,6 +59,11 @@ packages = ["minsync"]
 [tool.ty.environment]
 python = "./.venv"
 python-version = "3.10"
+
+[tool.ty.rules]
+# Optional deps (zvec, langchain_*) are guarded by try/except ImportError.
+# In CI without these packages, ty would report unresolved-import errors.
+unresolved-import = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -124,3 +134,16 @@ ignore = [
 
 [tool.ruff.format]
 preview = true
+
+[tool.deptry]
+ignore = ["DEP001"]
+
+[tool.deptry.per_rule_ignores]
+DEP001 = [
+    "langchain_openai",
+    "langchain_huggingface",
+    "langchain_weaviate",
+    "langchain_chroma",
+    "langchain_qdrant",
+    "langchain_core",
+]
