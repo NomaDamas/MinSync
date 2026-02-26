@@ -256,6 +256,16 @@ class MockVectorStore:
 # ---------------------------------------------------------------------------
 
 
+class FailingMockChunker:
+    """Chunker that always raises on chunk()."""
+
+    def schema_id(self) -> str:
+        return "failing-mock-chunker"
+
+    def chunk(self, text: str, path: str) -> list[Chunk]:
+        raise RuntimeError("Chunker processing failed")
+
+
 class FailingMockEmbedder:
     """Embedder that always raises on every method call."""
 

@@ -45,6 +45,20 @@ class MinSyncGitError(MinSyncError):
         super().__init__(message, exit_code=2)
 
 
+class MinSyncEmbeddingError(MinSyncError):
+    """Raised when embedding operations fail."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, exit_code=5)
+
+
+class MinSyncVectorStoreError(MinSyncError):
+    """Raised when vector store operations fail."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, exit_code=4)
+
+
 class MinSyncNotImplementedError(MinSyncError):
     """Raised for API methods not yet implemented in this story."""
 
@@ -579,24 +593,54 @@ class MinSync:
             def _flush_pending() -> None:
                 nonlocal chunks_added, chunks_updated, chunks_deleted
                 if pending_texts:
-                    if effective_max_concurrent > 1 and hasattr(embedder, "async_embed"):
-                        vectors = _parallel_embed_async(
-                            embedder, pending_texts, embed_batch_size, effective_max_concurrent
-                        )
-                    else:
-                        vectors = embedder.embed(pending_texts)
+                    try:
+                        if effective_max_concurrent > 1 and hasattr(embedder, "async_embed"):
+                            vectors = _parallel_embed_async(
+                                embedder, pending_texts, embed_batch_size, effective_max_concurrent
+                            )
+                        else:
+                            vectors = embedder.embed(pending_texts)
+                    except MinSyncError:
+                        raise
+                    except Exception as exc:
+                        paths = sorted({p for _, _, p in pending_file_ops})
+                        raise MinSyncEmbeddingError(
+                            f"embedding failed while processing {len(pending_texts)} texts "
+                            f"from {len(paths)} file(s) ({', '.join(paths[:3])}"
+                            f"{'...' if len(paths) > 3 else ''}): {exc}"
+                        ) from exc
+
                     for doc, vector in zip(pending_docs, vectors, strict=False):
                         doc["embedding"] = vector
                 for file_upserts, file_updates, file_path in pending_file_ops:
                     if file_upserts:
-                        vector_store.upsert(file_upserts)
+                        try:
+                            vector_store.upsert(file_upserts)
+                        except MinSyncError:
+                            raise
+                        except Exception as exc:
+                            raise MinSyncVectorStoreError(
+                                f"upsert failed for {file_path} ({len(file_upserts)} chunks): {exc}"
+                            ) from exc
                         chunks_added += len(file_upserts)
                     if file_updates:
-                        vector_store.update(file_updates)
+                        try:
+                            vector_store.update(file_updates)
+                        except MinSyncError:
+                            raise
+                        except Exception as exc:
+                            raise MinSyncVectorStoreError(
+                                f"update failed for {file_path} ({len(file_updates)} chunks): {exc}"
+                            ) from exc
                         chunks_updated += len(file_updates)
-                    removed = vector_store.delete_by_filter(
-                        _stale_path_filter(repo_id, ref_name, file_path, sync_token)
-                    )
+                    try:
+                        removed = vector_store.delete_by_filter(
+                            _stale_path_filter(repo_id, ref_name, file_path, sync_token)
+                        )
+                    except MinSyncError:
+                        raise
+                    except Exception as exc:
+                        raise MinSyncVectorStoreError(f"stale chunk cleanup failed for {file_path}: {exc}") from exc
                     chunks_deleted += int(removed or 0)
                 pending_texts.clear()
                 pending_docs.clear()
@@ -611,13 +655,23 @@ class MinSync:
 
                 if status == "D":
                     _flush_pending()
-                    removed = vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
+                    try:
+                        removed = vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
+                    except MinSyncError:
+                        raise
+                    except Exception as exc:
+                        raise MinSyncVectorStoreError(f"delete failed for {path}: {exc}") from exc
                     chunks_deleted += int(removed or 0)
                     continue
 
                 file_text = self._read_file_at_commit(repo_root, to_commit, path)
                 normalized = self._normalize_text(file_text, config.get("normalize") or {})
-                chunks = chunker.chunk(normalized, path)
+                try:
+                    chunks = chunker.chunk(normalized, path)
+                except MinSyncError:
+                    raise
+                except Exception as exc:
+                    raise MinSyncError(f"chunking failed for {path}: {exc}") from exc
                 docs = self._build_docs(
                     chunks=chunks,
                     repo_id=repo_id,
@@ -629,7 +683,12 @@ class MinSync:
                 )
 
                 doc_ids = [doc["id"] for doc in docs]
-                existing = vector_store.fetch(doc_ids) if doc_ids else []
+                try:
+                    existing = vector_store.fetch(doc_ids) if doc_ids else []
+                except MinSyncError:
+                    raise
+                except Exception as exc:
+                    raise MinSyncVectorStoreError(f"fetch failed for {path} ({len(doc_ids)} doc IDs): {exc}") from exc
                 existing_ids = {str(doc["id"]) for doc in existing}
 
                 file_upserts: list[dict[str, Any]] = []
@@ -668,8 +727,16 @@ class MinSync:
                     file=sys.stderr,
                 )
 
-            if hasattr(vector_store, "flush"):
-                vector_store.flush()
+            try:
+                if hasattr(vector_store, "flush"):
+                    vector_store.flush()
+            except MinSyncError:
+                raise
+            except Exception as exc:
+                raise MinSyncVectorStoreError(
+                    f"flush failed after processing {chunks_added} added, "
+                    f"{chunks_updated} updated, {chunks_deleted} deleted: {exc}"
+                ) from exc
             self._persist_default_vector_store(repo_root)
 
             cursor_payload = {
@@ -1128,14 +1195,33 @@ class MinSync:
             chunk_schema_id=chunk_schema_id,
         )
 
-        self.vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
+        try:
+            self.vector_store.delete_by_filter(_path_filter(repo_id, ref_name, path))
+        except MinSyncError:
+            raise
+        except Exception as exc:
+            raise MinSyncVectorStoreError(f"delete failed during verify --fix for {path}: {exc}") from exc
         if not docs:
             return
 
-        vectors = embedder.embed([doc["text"] for doc in docs])
+        try:
+            vectors = embedder.embed([doc["text"] for doc in docs])
+        except MinSyncError:
+            raise
+        except Exception as exc:
+            raise MinSyncEmbeddingError(
+                f"embedding failed during verify --fix for {path} ({len(docs)} chunks): {exc}"
+            ) from exc
         for doc, vector in zip(docs, vectors, strict=False):
             doc["embedding"] = vector
-        self.vector_store.upsert(docs)
+        try:
+            self.vector_store.upsert(docs)
+        except MinSyncError:
+            raise
+        except Exception as exc:
+            raise MinSyncVectorStoreError(
+                f"upsert failed during verify --fix for {path} ({len(docs)} chunks): {exc}"
+            ) from exc
 
     def _git_commit_exists(self, repo_root: Path, commit: str) -> bool:
         return self._git_repo().commit_exists(commit)

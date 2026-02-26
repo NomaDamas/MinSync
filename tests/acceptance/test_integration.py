@@ -14,6 +14,7 @@ import subprocess
 import pytest
 
 from minsync import MinSync
+from minsync.core import MinSyncVectorStoreError
 from tests.conftest import (
     SAMPLE_FILES,
     _run_git,
@@ -508,7 +509,7 @@ class TestT42CICDCrashRecovery:
         )
 
         # Attempt sync — should crash
-        with pytest.raises(RuntimeError, match="Simulated crash"):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         # Status should show INTERRUPTED (txn.json exists)
@@ -530,7 +531,7 @@ class TestT42CICDCrashRecovery:
             vector_store=crash_vs,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         # check should still pass (components are healthy)
@@ -554,7 +555,7 @@ class TestT42CICDCrashRecovery:
             vector_store=crash_vs,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         # Now use a healthy vector store for recovery
@@ -589,7 +590,7 @@ class TestT42CICDCrashRecovery:
             vector_store=crash_vs,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         recovery_vs = MockVectorStore()
@@ -631,7 +632,7 @@ class TestT42CICDCrashRecovery:
             vector_store=crash_vs,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         recovery_vs = MockVectorStore()
@@ -664,7 +665,7 @@ class TestT42CICDCrashRecovery:
             vector_store=crash_vs,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         recovery_vs = MockVectorStore()
@@ -730,7 +731,7 @@ class TestT42CICDCrashRecovery:
             vector_store=crash_vs,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MinSyncVectorStoreError):
             ms_crash.sync()
 
         recovery_vs = MockVectorStore()
