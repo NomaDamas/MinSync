@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from minsync.core import MinSyncEmbeddingError
 from tests.mock_components import MockChunker, MockEmbedder, MockVectorStore
 
 # ---------------------------------------------------------------------------
@@ -186,5 +187,5 @@ class TestErrorPropagates:
         ms, _store = _make_minsync(test_repo, embedder=embedder)
         ms.init()
 
-        with pytest.raises(RuntimeError, match="Embedding API error"):
+        with pytest.raises(MinSyncEmbeddingError, match="Embedding API error"):
             ms.sync(max_concurrent=4, batch_size=2)
