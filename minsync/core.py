@@ -594,12 +594,12 @@ class MinSync:
                 nonlocal chunks_added, chunks_updated, chunks_deleted
                 if pending_texts:
                     try:
-                      if effective_max_concurrent > 1 and hasattr(embedder, "async_embed"):
-                          vectors = _parallel_embed_async(
-                              embedder, pending_texts, embed_batch_size, effective_max_concurrent
-                          )
-                      else:
-                          vectors = embedder.embed(pending_texts)
+                        if effective_max_concurrent > 1 and hasattr(embedder, "async_embed"):
+                            vectors = _parallel_embed_async(
+                                embedder, pending_texts, embed_batch_size, effective_max_concurrent
+                            )
+                        else:
+                            vectors = embedder.embed(pending_texts)
                     except MinSyncError:
                         raise
                     except Exception as exc:
