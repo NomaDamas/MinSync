@@ -40,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--dry-run", action="store_true", help="Show planned changes without applying them.")
     sync_parser.add_argument("--batch-size", type=int, help="Number of texts to embed per API call.")
     sync_parser.add_argument(
+        "--max-concurrent", type=int, default=None, help="Max parallel embedding API calls (default: from config or 1)."
+    )
+    sync_parser.add_argument(
         "--wait", action="store_true", help="Wait for lock instead of failing if another sync is running."
     )
     sync_parser.set_defaults(handler=_handle_sync)
@@ -118,6 +121,7 @@ def _handle_sync(ms: MinSync, args: argparse.Namespace) -> int:
         full=args.full,
         dry_run=args.dry_run,
         batch_size=args.batch_size,
+        max_concurrent=args.max_concurrent,
         wait=args.wait,
         verbose=args.verbose,
         quiet=args.quiet,

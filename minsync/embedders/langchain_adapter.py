@@ -26,3 +26,6 @@ class LangChainEmbeddingsAdapter:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embeddings.embed_documents(texts)
+
+    async def async_embed(self, texts: list[str]) -> list[list[float]]:
+        return await self._embeddings.aembed_documents(texts)
