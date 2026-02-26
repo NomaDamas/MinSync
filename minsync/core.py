@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -452,6 +453,7 @@ class MinSync:
         dry_run: bool = False,
         batch_size: int | None = None,
         max_concurrent: int | None = None,
+        max_retries: int | None = None,
         wait: bool = False,
         verbose: bool = False,
         quiet: bool = False,
@@ -461,6 +463,9 @@ class MinSync:
         self._ensure_vectorstore(config, repo_root)
         embed_batch_size = batch_size or int((config.get("embedder") or {}).get("batch_size", 64))
         effective_max_concurrent = max_concurrent or int((config.get("embedder") or {}).get("max_concurrent", 1))
+        effective_max_retries = (
+            max_retries if max_retries is not None else int((config.get("embedder") or {}).get("max_retries", 3))
+        )
         minsync_dir = repo_root / ".minsync"
         cursor_path = minsync_dir / "cursor.json"
         txn_path = minsync_dir / "txn.json"
@@ -596,10 +601,20 @@ class MinSync:
                     try:
                         if effective_max_concurrent > 1 and hasattr(embedder, "async_embed"):
                             vectors = _parallel_embed_async(
-                                embedder, pending_texts, embed_batch_size, effective_max_concurrent
+                                embedder,
+                                pending_texts,
+                                embed_batch_size,
+                                effective_max_concurrent,
+                                max_retries=effective_max_retries,
+                                quiet=quiet,
                             )
                         else:
-                            vectors = embedder.embed(pending_texts)
+                            vectors = _embed_with_retry(
+                                embedder.embed,
+                                pending_texts,
+                                max_retries=effective_max_retries,
+                                quiet=quiet,
+                            )
                     except MinSyncError:
                         raise
                     except Exception as exc:
@@ -802,9 +817,9 @@ class MinSync:
         effective_filter = f"{base_filter} AND {normalized_filter}" if normalized_filter else base_filter
 
         try:
-            vectors = embedder.embed([query])
+            vectors = _embed_with_retry(embedder.embed, [query], max_retries=3, quiet=True)
         except Exception as exc:
-            raise MinSyncError(f"embedding failed: {exc}", exit_code=5) from exc
+            raise MinSyncEmbeddingError(f"embedding failed: {exc}") from exc
 
         if not vectors:
             return []
@@ -1205,7 +1220,7 @@ class MinSync:
             return
 
         try:
-            vectors = embedder.embed([doc["text"] for doc in docs])
+            vectors = _embed_with_retry(embedder.embed, [doc["text"] for doc in docs], max_retries=3, quiet=False)
         except MinSyncError:
             raise
         except Exception as exc:
@@ -1706,6 +1721,7 @@ class MinSync:
                 "id": embedder,
                 "batch_size": 64,
                 "max_concurrent": 1,
+                "max_retries": 3,
             },
             "vectorstore": {
                 "id": DEFAULT_VECTORSTORE_ID,
@@ -1726,11 +1742,117 @@ class MinSync:
         path.unlink(missing_ok=True)
 
 
+def _is_transient_error(exc: BaseException) -> bool:
+    """Determine whether *exc* is a transient (retriable) error.
+
+    Uses duck-typing and string matching so we never need to import HTTP
+    libraries directly.
+
+    Returns ``True`` for transient, ``False`` for permanent, and ``True``
+    for unknown errors (retry is the safe default).
+    """
+    # Permanent by exception message -----------------------------------------
+    msg = str(exc).lower()
+    for permanent_phrase in ("invalid api key", "unauthorized", "authentication"):
+        if permanent_phrase in msg:
+            return False
+
+    # Check HTTP status code via duck-typing ----------------------------------
+    status_code: int | None = None
+    raw_code: Any = getattr(exc, "status_code", None)
+    if raw_code is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            status_code = int(raw_code)
+    if status_code is None:
+        resp: Any = getattr(exc, "response", None)
+        if resp is not None:
+            raw_code = getattr(resp, "status_code", None)
+            if raw_code is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    status_code = int(raw_code)
+
+    if status_code is not None:
+        if status_code in (400, 401, 403, 404, 422):
+            return False
+        if status_code == 429 or status_code >= 500:
+            return True
+
+    # Known transient exception types -----------------------------------------
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+
+    # Transient by exception message ------------------------------------------
+    for transient_phrase in ("rate limit", "timeout", "service unavailable", "429", "503", "502"):
+        if transient_phrase in msg:
+            return True
+
+    # Unknown → treat as transient (retry is safe) ----------------------------
+    return True
+
+
+def _embed_with_retry(
+    embed_fn: Any,
+    texts: list[str],
+    *,
+    max_retries: int = 3,
+    quiet: bool = False,
+) -> list[list[float]]:
+    """Call *embed_fn(texts)* with exponential-backoff retries on transient errors."""
+    last_exc: BaseException | None = None
+    total_attempts = max_retries + 1
+    for attempt in range(1, total_attempts + 1):
+        try:
+            return embed_fn(texts)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_error(exc) or attempt == total_attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 30)
+            if not quiet:
+                print(
+                    f"  embedding failed (attempt {attempt}/{total_attempts}), retrying in {delay:.1f}s: {exc}",
+                    file=sys.stderr,
+                )
+            time.sleep(delay)
+    # Should never reach here, but satisfy type checker
+    raise last_exc  # type: ignore[misc]
+
+
+async def _async_embed_with_retry(
+    async_embed_fn: Any,
+    texts: list[str],
+    *,
+    max_retries: int = 3,
+    quiet: bool = False,
+) -> list[list[float]]:
+    """Async version of :func:`_embed_with_retry`."""
+    last_exc: BaseException | None = None
+    total_attempts = max_retries + 1
+    for attempt in range(1, total_attempts + 1):
+        try:
+            return await async_embed_fn(texts)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_error(exc) or attempt == total_attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 30)
+            if not quiet:
+                print(
+                    f"  embedding failed (attempt {attempt}/{total_attempts}), retrying in {delay:.1f}s: {exc}",
+                    file=sys.stderr,
+                )
+            await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
 def _parallel_embed_async(
     embedder: Any,
     texts: list[str],
     sub_batch_size: int,
     max_concurrent: int,
+    *,
+    max_retries: int = 3,
+    quiet: bool = False,
 ) -> list[list[float]]:
     """Run sub-batches of ``embedder.async_embed()`` in parallel via asyncio.
 
@@ -1744,7 +1866,7 @@ def _parallel_embed_async(
 
         async def _embed_batch(batch: list[str]) -> list[list[float]]:
             async with sem:
-                return await embedder.async_embed(batch)
+                return await _async_embed_with_retry(embedder.async_embed, batch, max_retries=max_retries, quiet=quiet)
 
         results = await asyncio.gather(*[_embed_batch(b) for b in sub_batches])
         return [vec for batch_result in results for vec in batch_result]

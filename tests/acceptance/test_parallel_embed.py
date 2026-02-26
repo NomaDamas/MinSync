@@ -188,4 +188,4 @@ class TestErrorPropagates:
         ms.init()
 
         with pytest.raises(MinSyncEmbeddingError, match="Embedding API error"):
-            ms.sync(max_concurrent=4, batch_size=2)
+            ms.sync(max_concurrent=4, batch_size=2, max_retries=0)
