@@ -6,8 +6,12 @@ branding:
 
 inputs:
   embedding-api-key:
-    description: API key for the embedding provider (mapped to OPENAI_API_KEY).
+    description: API key for the embedding provider.
     required: true
+  embedding-api-key-name:
+    description: Environment variable name for the embedding API key.
+    required: false
+    default: "OPENAI_API_KEY"
   embedder:
     description: Embedder ID for minsync init.
     required: false
@@ -105,21 +109,21 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
+        export "${{ inputs.embedding-api-key-name }}=${{ inputs.embedding-api-key }}"
         if [ ! -d ".minsync" ]; then
           minsync init \
             --embedder "${{ inputs.embedder }}" \
             --chunker "${{ inputs.chunker }}"
         fi
-      env:
-        OPENAI_API_KEY: ${{ inputs.embedding-api-key }}
 
     - name: Run MinSync sync and verify
       id: run
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: python "${{ github.action_path }}/action/entrypoint.py"
+      run: |
+        export "${{ inputs.embedding-api-key-name }}=${{ inputs.embedding-api-key }}"
+        python "${{ github.action_path }}/action/entrypoint.py"
       env:
-        OPENAI_API_KEY: ${{ inputs.embedding-api-key }}
         INPUT_REF: ${{ inputs.ref }}
         INPUT_SYNC_ARGS: ${{ inputs.sync-args }}
         INPUT_VERIFY: ${{ inputs.verify }}

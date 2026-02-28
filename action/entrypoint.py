@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import uuid
 from typing import Any
 
 
@@ -28,8 +30,9 @@ def _write_output(name: str, value: str) -> None:
 def _write_multiline_output(name: str, value: str) -> None:
     output_file = os.environ.get("GITHUB_OUTPUT", "")
     if output_file:
+        delimiter = uuid.uuid4().hex
         with open(output_file, "a") as fh:
-            fh.write(f"{name}<<EOF\n{value}\nEOF\n")
+            fh.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
 
 
 def _run_sync() -> tuple[dict[str, Any] | None, str | None]:
@@ -40,7 +43,7 @@ def _run_sync() -> tuple[dict[str, Any] | None, str | None]:
     if ref:
         sync_cmd += ["--ref", ref]
     if sync_args:
-        sync_cmd += sync_args.split()
+        sync_cmd += shlex.split(sync_args)
 
     proc = _run(sync_cmd, check=False)
 
@@ -75,7 +78,7 @@ def _run_verify() -> dict[str, Any] | None:
     if ref:
         verify_cmd += ["--ref", ref]
     if verify_args:
-        verify_cmd += verify_args.split()
+        verify_cmd += shlex.split(verify_args)
 
     proc = _run(verify_cmd, check=False)
     try:
