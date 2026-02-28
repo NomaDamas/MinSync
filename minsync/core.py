@@ -1832,15 +1832,14 @@ async def _async_embed_with_retry(
     quiet: bool = False,
 ) -> list[list[float]]:
     """Async version of :func:`_embed_with_retry`."""
-    async for attempt in AsyncRetrying(
+    retrying = AsyncRetrying(
         retry=retry_if_exception(_is_transient_error),
         stop=stop_after_attempt(max_retries + 1),
         wait=wait_exponential(min=1, max=30),
         reraise=True,
         before_sleep=None if quiet else _make_log_retry(max_retries),
-    ):
-        with attempt:
-            return await async_embed_fn(texts)
+    )
+    return await retrying(async_embed_fn, texts)
 
 
 def _parallel_embed_async(
