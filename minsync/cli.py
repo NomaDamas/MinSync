@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-concurrent", type=int, default=None, help="Max parallel embedding API calls (default: from config or 1)."
     )
     sync_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Max retries on transient embedding errors (default: from config or 3).",
+    )
+    sync_parser.add_argument(
         "--wait", action="store_true", help="Wait for lock instead of failing if another sync is running."
     )
     sync_parser.set_defaults(handler=_handle_sync)
@@ -122,6 +128,7 @@ def _handle_sync(ms: MinSync, args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         batch_size=args.batch_size,
         max_concurrent=args.max_concurrent,
+        max_retries=args.max_retries,
         wait=args.wait,
         verbose=args.verbose,
         quiet=args.quiet,

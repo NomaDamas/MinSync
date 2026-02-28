@@ -334,6 +334,58 @@ class CrashAfterNUpserts(MockVectorStore):
         super().upsert(docs)
 
 
+# ---------------------------------------------------------------------------
+# Transient / Permanent fail embedders (for retry tests)
+# ---------------------------------------------------------------------------
+
+
+class _HttpLikeError(Exception):
+    """Exception with a status_code attribute for duck-typing."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TransientFailEmbedder(MockEmbedder):
+    """Embedder that fails with a transient 429 error for the first *fail_count* calls."""
+
+    def __init__(self, fail_count: int = 2):
+        super().__init__()
+        self._fail_count = fail_count
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.call_count += 1
+        if self.call_count <= self._fail_count:
+            raise _HttpLikeError("rate limit exceeded", status_code=429)
+        self.total_texts_embedded += len(texts)
+        return [self._text_to_vector(t) for t in texts]
+
+
+class PermanentFailEmbedder(MockEmbedder):
+    """Embedder that always fails with a permanent 401 error."""
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.call_count += 1
+        raise _HttpLikeError("invalid api key", status_code=401)
+
+
+class TransientFailAsyncEmbedder(MockEmbedder):
+    """Embedder whose async_embed fails with transient 503 for the first *fail_count* calls."""
+
+    def __init__(self, fail_count: int = 2):
+        super().__init__()
+        self._fail_count = fail_count
+        self._async_call_count = 0
+
+    async def async_embed(self, texts: list[str]) -> list[list[float]]:
+        self._async_call_count += 1
+        if self._async_call_count <= self._fail_count:
+            raise _HttpLikeError("service unavailable", status_code=503)
+        self.total_texts_embedded += len(texts)
+        return [self._text_to_vector(t) for t in texts]
+
+
 class CrashOnFlush(MockVectorStore):
     """MockVectorStore that raises on the first flush() call (for T15)."""
 
