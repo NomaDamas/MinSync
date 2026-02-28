@@ -22,6 +22,7 @@ from typing import Any
 
 import pygit2
 import yaml
+from tenacity import AsyncRetrying, Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from minsync.gitbackend import GitRepo
 
@@ -1790,6 +1791,21 @@ def _is_transient_error(exc: BaseException) -> bool:
     return True
 
 
+def _make_log_retry(max_retries: int):
+    """Create a *before_sleep* callback that logs retry attempts to stderr."""
+    total = max_retries + 1
+
+    def _log(retry_state):
+        print(
+            f"  embedding failed (attempt {retry_state.attempt_number}/{total}), "
+            f"retrying in {retry_state.next_action.sleep:.1f}s: "
+            f"{retry_state.outcome.exception()}",
+            file=sys.stderr,
+        )
+
+    return _log
+
+
 def _embed_with_retry(
     embed_fn: Any,
     texts: list[str],
@@ -1798,24 +1814,14 @@ def _embed_with_retry(
     quiet: bool = False,
 ) -> list[list[float]]:
     """Call *embed_fn(texts)* with exponential-backoff retries on transient errors."""
-    last_exc: BaseException | None = None
-    total_attempts = max_retries + 1
-    for attempt in range(1, total_attempts + 1):
-        try:
-            return embed_fn(texts)
-        except Exception as exc:
-            last_exc = exc
-            if not _is_transient_error(exc) or attempt == total_attempts:
-                raise
-            delay = min(2 ** (attempt - 1), 30)
-            if not quiet:
-                print(
-                    f"  embedding failed (attempt {attempt}/{total_attempts}), retrying in {delay:.1f}s: {exc}",
-                    file=sys.stderr,
-                )
-            time.sleep(delay)
-    # Should never reach here, but satisfy type checker
-    raise last_exc  # type: ignore[misc]
+    retryer = Retrying(
+        retry=retry_if_exception(_is_transient_error),
+        stop=stop_after_attempt(max_retries + 1),
+        wait=wait_exponential(min=1, max=30),
+        reraise=True,
+        before_sleep=None if quiet else _make_log_retry(max_retries),
+    )
+    return retryer(embed_fn, texts)
 
 
 async def _async_embed_with_retry(
@@ -1826,23 +1832,15 @@ async def _async_embed_with_retry(
     quiet: bool = False,
 ) -> list[list[float]]:
     """Async version of :func:`_embed_with_retry`."""
-    last_exc: BaseException | None = None
-    total_attempts = max_retries + 1
-    for attempt in range(1, total_attempts + 1):
-        try:
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception(_is_transient_error),
+        stop=stop_after_attempt(max_retries + 1),
+        wait=wait_exponential(min=1, max=30),
+        reraise=True,
+        before_sleep=None if quiet else _make_log_retry(max_retries),
+    ):
+        with attempt:
             return await async_embed_fn(texts)
-        except Exception as exc:
-            last_exc = exc
-            if not _is_transient_error(exc) or attempt == total_attempts:
-                raise
-            delay = min(2 ** (attempt - 1), 30)
-            if not quiet:
-                print(
-                    f"  embedding failed (attempt {attempt}/{total_attempts}), retrying in {delay:.1f}s: {exc}",
-                    file=sys.stderr,
-                )
-            await asyncio.sleep(delay)
-    raise last_exc  # type: ignore[misc]
 
 
 def _parallel_embed_async(
