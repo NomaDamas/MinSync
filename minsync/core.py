@@ -68,6 +68,27 @@ class MinSyncNotImplementedError(MinSyncError):
         super().__init__(message, exit_code=1)
 
 
+@dataclass
+class _SyncStatsTracker:
+    embedder_id: str
+    embedding_api_calls: int = 0
+    embedded_texts: int = 0
+    estimated_tokens: int = 0
+
+    def record_batch(self, texts: list[str]) -> None:
+        self.embedding_api_calls += 1
+        self.embedded_texts += len(texts)
+        self.estimated_tokens += _estimate_token_count(texts, embedder_id=self.embedder_id)
+
+    def snapshot(self, *, elapsed_seconds: float) -> SyncStats:
+        return SyncStats(
+            elapsed_seconds=elapsed_seconds,
+            embedding_api_calls=self.embedding_api_calls,
+            embedded_texts=self.embedded_texts,
+            estimated_tokens=self.estimated_tokens,
+        )
+
+
 @dataclass(frozen=True)
 class InitResult:
     repo_id: str
@@ -76,6 +97,14 @@ class InitResult:
     embedder: str
     vectorstore: str
     path: str
+
+
+@dataclass(frozen=True)
+class SyncStats:
+    elapsed_seconds: float = 0.0
+    embedding_api_calls: int = 0
+    embedded_texts: int = 0
+    estimated_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +121,40 @@ class SyncResult:
     planned_files: list[str] = field(default_factory=list)
     files_planned: int = 0
     recovered: bool = False
+    stats: SyncStats = field(default_factory=SyncStats)
+
+    def __str__(self) -> str:
+        if self.already_up_to_date:
+            headline = "MinSync Sync (already up to date)"
+        elif self.dry_run:
+            headline = "MinSync Sync (dry run)"
+        else:
+            headline = "MinSync Sync"
+
+        lines = [
+            headline,
+            f"  from commit:        {_short_commit(self.from_commit) if self.from_commit else '(initial)'}",
+            f"  to commit:          {_short_commit(self.to_commit)}",
+            f"  files processed:    {self.files_processed}",
+            f"  chunks added:       {self.chunks_added}",
+            f"  chunks updated:     {self.chunks_updated}",
+            f"  chunks deleted:     {self.chunks_deleted}",
+        ]
+
+        if self.dry_run:
+            lines.append(f"  files planned:      {self.files_planned}")
+        if self.recovered:
+            lines.append("  recovered:          yes")
+
+        lines.extend([
+            "",
+            "Sync Stats",
+            f"  Elapsed time:       {self.stats.elapsed_seconds:.2f}s",
+            f"  Embedding API calls: {self.stats.embedding_api_calls}",
+            f"  Embedded texts:     {self.stats.embedded_texts}",
+            f"  Estimated tokens:    {self.stats.estimated_tokens}",
+        ])
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -459,6 +522,7 @@ class MinSync:
         verbose: bool = False,
         quiet: bool = False,
     ) -> SyncResult:
+        sync_started = time.perf_counter()
         repo_root = self._resolve_git_root()
         config = self._load_config(repo_root)
         self._ensure_vectorstore(config, repo_root)
@@ -483,6 +547,7 @@ class MinSync:
 
         chunk_schema_id = self._chunk_schema_id(chunker, config_chunker_id)
         embedder_id = self._embedder_id(embedder, config_embedder_id)
+        stats_tracker = _SyncStatsTracker(embedder_id=embedder_id)
 
         with self._acquire_lock(lock_path, wait=wait):
             cursor = self._read_json(cursor_path) or {}
@@ -530,6 +595,7 @@ class MinSync:
                     planned_files=[],
                     files_planned=0,
                     recovered=False,
+                    stats=stats_tracker.snapshot(elapsed_seconds=time.perf_counter() - sync_started),
                 )
 
             planned_changes = self._collect_changes(
@@ -566,6 +632,7 @@ class MinSync:
                     planned_files=planned_paths,
                     files_planned=len(planned_paths),
                     recovered=recovered,
+                    stats=stats_tracker.snapshot(elapsed_seconds=time.perf_counter() - sync_started),
                 )
 
             txn_payload = {
@@ -608,6 +675,7 @@ class MinSync:
                                 effective_max_concurrent,
                                 max_retries=effective_max_retries,
                                 quiet=quiet,
+                                stats_tracker=stats_tracker,
                             )
                         else:
                             vectors = _embed_with_retry(
@@ -615,6 +683,7 @@ class MinSync:
                                 pending_texts,
                                 max_retries=effective_max_retries,
                                 quiet=quiet,
+                                stats_tracker=stats_tracker,
                             )
                     except MinSyncError:
                         raise
@@ -780,6 +849,7 @@ class MinSync:
                 planned_files=planned_paths,
                 files_planned=len(planned_paths),
                 recovered=recovered,
+                stats=stats_tracker.snapshot(elapsed_seconds=time.perf_counter() - sync_started),
             )
 
     def query(
@@ -1812,6 +1882,7 @@ def _embed_with_retry(
     *,
     max_retries: int = 3,
     quiet: bool = False,
+    stats_tracker: _SyncStatsTracker | None = None,
 ) -> list[list[float]]:
     """Call *embed_fn(texts)* with exponential-backoff retries on transient errors."""
     retryer = Retrying(
@@ -1821,7 +1892,14 @@ def _embed_with_retry(
         reraise=True,
         before_sleep=None if quiet else _make_log_retry(max_retries),
     )
-    return retryer(embed_fn, texts)
+    if stats_tracker is None:
+        return retryer(embed_fn, texts)
+
+    def _tracked_embed(batch: list[str]) -> list[list[float]]:
+        stats_tracker.record_batch(batch)
+        return embed_fn(batch)
+
+    return retryer(_tracked_embed, texts)
 
 
 async def _async_embed_with_retry(
@@ -1830,6 +1908,7 @@ async def _async_embed_with_retry(
     *,
     max_retries: int = 3,
     quiet: bool = False,
+    stats_tracker: _SyncStatsTracker | None = None,
 ) -> list[list[float]]:
     """Async version of :func:`_embed_with_retry`."""
     retrying = AsyncRetrying(
@@ -1839,7 +1918,14 @@ async def _async_embed_with_retry(
         reraise=True,
         before_sleep=None if quiet else _make_log_retry(max_retries),
     )
-    return await retrying(async_embed_fn, texts)
+    if stats_tracker is None:
+        return await retrying(async_embed_fn, texts)
+
+    async def _tracked_embed(batch: list[str]) -> list[list[float]]:
+        stats_tracker.record_batch(batch)
+        return await async_embed_fn(batch)
+
+    return await retrying(_tracked_embed, texts)
 
 
 def _parallel_embed_async(
@@ -1850,6 +1936,7 @@ def _parallel_embed_async(
     *,
     max_retries: int = 3,
     quiet: bool = False,
+    stats_tracker: _SyncStatsTracker | None = None,
 ) -> list[list[float]]:
     """Run sub-batches of ``embedder.async_embed()`` in parallel via asyncio.
 
@@ -1863,12 +1950,43 @@ def _parallel_embed_async(
 
         async def _embed_batch(batch: list[str]) -> list[list[float]]:
             async with sem:
-                return await _async_embed_with_retry(embedder.async_embed, batch, max_retries=max_retries, quiet=quiet)
+                return await _async_embed_with_retry(
+                    embedder.async_embed,
+                    batch,
+                    max_retries=max_retries,
+                    quiet=quiet,
+                    stats_tracker=stats_tracker,
+                )
 
         results = await asyncio.gather(*[_embed_batch(b) for b in sub_batches])
         return [vec for batch_result in results for vec in batch_result]
 
     return asyncio.run(_run())
+
+
+def _estimate_token_count(texts: list[str], *, embedder_id: str) -> int:
+    if not texts:
+        return 0
+
+    model_name = embedder_id.split(":", 1)[1] if ":" in embedder_id else ""
+    encoding = None
+    with contextlib.suppress(ImportError, KeyError, ValueError, AttributeError):
+        import tiktoken
+
+        if model_name:
+            encoding = tiktoken.encoding_for_model(model_name)
+        else:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+    if encoding is not None:
+        return sum(len(encoding.encode(text)) for text in texts)
+
+    total = 0
+    for text in texts:
+        if not text:
+            continue
+        total += max(1, (len(text.encode("utf-8")) + 3) // 4)
+    return total
 
 
 def _status_text(state: str) -> str:
