@@ -1896,8 +1896,9 @@ def _embed_with_retry(
         return retryer(embed_fn, texts)
 
     def _tracked_embed(batch: list[str]) -> list[list[float]]:
+        vectors = embed_fn(batch)
         stats_tracker.record_batch(batch)
-        return embed_fn(batch)
+        return vectors
 
     return retryer(_tracked_embed, texts)
 
@@ -1922,8 +1923,9 @@ async def _async_embed_with_retry(
         return await retrying(async_embed_fn, texts)
 
     async def _tracked_embed(batch: list[str]) -> list[list[float]]:
+        vectors = await async_embed_fn(batch)
         stats_tracker.record_batch(batch)
-        return await async_embed_fn(batch)
+        return vectors
 
     return await retrying(_tracked_embed, texts)
 
