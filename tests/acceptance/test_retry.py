@@ -18,6 +18,7 @@ from minsync.core import (
     _async_embed_with_retry,
     _embed_with_retry,
     _is_transient_error,
+    _SyncStatsTracker,
 )
 from tests.conftest import create_test_repo
 from tests.mock_components import (
@@ -138,6 +139,25 @@ class TestEmbedWithRetry:
         captured = capsys.readouterr()
         assert "retrying" not in captured.err
 
+    def test_stats_tracker_counts_only_successful_retry(self) -> None:
+        embedder = TransientFailEmbedder(fail_count=2)
+        tracker = _SyncStatsTracker(embedder_id=embedder.id())
+
+        result = _embed_with_retry(
+            embedder.embed,
+            ["hello"],
+            max_retries=3,
+            quiet=True,
+            stats_tracker=tracker,
+        )
+
+        assert len(result) == 1
+        assert embedder.call_count == 3
+        assert tracker.embedding_api_calls == 1
+        assert tracker.embedded_texts == embedder.total_texts_embedded
+        assert tracker.embedded_texts == 1
+        assert tracker.estimated_tokens > 0
+
 
 # ===========================================================================
 # TestAsyncRetry
@@ -154,6 +174,26 @@ class TestAsyncRetry:
         embedder = TransientFailAsyncEmbedder(fail_count=10)
         with pytest.raises(_HttpLikeError, match="service unavailable"):
             asyncio.run(_async_embed_with_retry(embedder.async_embed, ["hello"], max_retries=2))
+
+    def test_async_stats_tracker_counts_only_successful_retry(self) -> None:
+        embedder = TransientFailAsyncEmbedder(fail_count=2)
+        tracker = _SyncStatsTracker(embedder_id=embedder.id())
+
+        result = asyncio.run(
+            _async_embed_with_retry(
+                embedder.async_embed,
+                ["hello"],
+                max_retries=3,
+                quiet=True,
+                stats_tracker=tracker,
+            )
+        )
+
+        assert len(result) == 1
+        assert tracker.embedding_api_calls == 1
+        assert tracker.embedded_texts == embedder.total_texts_embedded
+        assert tracker.embedded_texts == 1
+        assert tracker.estimated_tokens > 0
 
 
 # ===========================================================================
@@ -208,6 +248,19 @@ class TestSyncRetry:
         # Default config max_retries=3, so 2 failures should be OK
         result = ms.sync()
         assert result.chunks_added > 0
+
+    def test_sync_stats_ignore_failed_retry_attempts(self, tmp_path: Path) -> None:
+        repo = create_test_repo(tmp_path)
+        embedder = TransientFailEmbedder(fail_count=2)
+        ms, _store = _make_minsync(repo, embedder)
+        ms.init()
+
+        result = ms.sync(batch_size=2, quiet=True)
+
+        assert result.chunks_added > 0
+        assert embedder.call_count == result.stats.embedding_api_calls + 2
+        assert result.stats.embedded_texts == embedder.total_texts_embedded
+        assert result.stats.estimated_tokens > 0
 
 
 # ===========================================================================
