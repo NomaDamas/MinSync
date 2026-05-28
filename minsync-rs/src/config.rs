@@ -161,7 +161,8 @@ impl Config {
         let mut tmp = NamedTempFile::new_in(tmp_parent)?;
         tmp.write_all(toml_str.as_bytes())?;
         tmp.flush()?;
-        tmp.persist(path).map_err(|error| MinSyncError::Io(error.error))?;
+        tmp.persist(path)
+            .map_err(|error| MinSyncError::Io(error.error))?;
 
         Ok(())
     }
@@ -187,7 +188,11 @@ mod tests {
         assert_eq!(config.embedder.max_concurrent, 1);
         assert_eq!(config.embedder.max_retries, 3);
         assert_eq!(config.vectorstore.id, "json");
-        assert!(config.vectorstore.options.as_table().is_some_and(|table| table.is_empty()));
+        assert!(config
+            .vectorstore
+            .options
+            .as_table()
+            .is_some_and(|table| table.is_empty()));
         assert!(config.normalize.strip_trailing_whitespace);
         assert!(config.normalize.normalize_newlines);
         assert!(!config.normalize.collapse_whitespace);
@@ -264,8 +269,14 @@ strip_frontmatter = true
         assert_eq!(config.embedder.max_concurrent, 4);
         assert_eq!(config.embedder.max_retries, 9);
         assert_eq!(config.vectorstore.id, "custom_store");
-        assert_eq!(config.vectorstore.options["url"].as_str(), Some("http://localhost:1234"));
-        assert_eq!(config.vectorstore.options["dimension"].as_integer(), Some(1536));
+        assert_eq!(
+            config.vectorstore.options["url"].as_str(),
+            Some("http://localhost:1234")
+        );
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(1536)
+        );
         assert!(!config.normalize.strip_trailing_whitespace);
         assert!(!config.normalize.normalize_newlines);
         assert!(config.normalize.collapse_whitespace);

@@ -27,7 +27,10 @@ pub async fn query(
 
     let query_vec = embedder.embed_single(text).await?;
 
-    let mut filters = vec![Filter::Eq("source_id".to_string(), cursor.source_id.clone())];
+    let mut filters = vec![Filter::Eq(
+        "source_id".to_string(),
+        cursor.source_id.clone(),
+    )];
     if let Some(expr) = filter_expr {
         if !expr.trim().is_empty() {
             return Err(MinSyncError::Other(
@@ -127,7 +130,10 @@ mod tests {
         let source_id = "source-1";
         write_query_state(&dir, source_id);
 
-        let query_vec = embedder.embed_single("search text").await.expect("embed query");
+        let query_vec = embedder
+            .embed_single("search text")
+            .await
+            .expect("embed query");
         store
             .upsert(&[
                 doc("a", source_id, "a.txt", vec![0.0, 1.0, 0.0, 0.0]),

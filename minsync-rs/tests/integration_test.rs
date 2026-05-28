@@ -30,7 +30,13 @@ impl Embedder for MockEmbedder {
     }
 }
 
-fn fixture() -> (TempDir, MinSync, ChonkieChunker, MockEmbedder, InMemoryStore) {
+fn fixture() -> (
+    TempDir,
+    MinSync,
+    ChonkieChunker,
+    MockEmbedder,
+    InMemoryStore,
+) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let sync = MinSync::new(dir.path().to_path_buf());
     let chunker = ChonkieChunker::new(32, "\n ");
@@ -68,9 +74,16 @@ async fn test_full_workflow() {
     )
     .await
     .expect("query succeeds");
-    let verify_result = verify(&dir.path().join(".minsync"), dir.path(), &chunker, &mut store, false, None)
-        .await
-        .expect("verify succeeds");
+    let verify_result = verify(
+        &dir.path().join(".minsync"),
+        dir.path(),
+        &chunker,
+        &mut store,
+        false,
+        None,
+    )
+    .await
+    .expect("verify succeeds");
 
     assert_eq!(sync_result.files_processed, 2);
     assert!(sync_result.chunks_added > 0);
@@ -297,6 +310,9 @@ async fn test_minsyncignore_filtering() {
         .await
         .expect("sync succeeds");
 
-    assert_eq!(result.files_processed_paths, vec![".minsyncignore", "kept.txt"]);
+    assert_eq!(
+        result.files_processed_paths,
+        vec![".minsyncignore", "kept.txt"]
+    );
     assert_eq!(store.all_paths(), vec![".minsyncignore", "kept.txt"]);
 }

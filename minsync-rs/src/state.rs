@@ -44,7 +44,12 @@ impl Cursor {
 }
 
 impl Transaction {
-    pub fn new(source_id: &str, sync_token: &str, from_hash: Option<String>, to_hash: &str) -> Self {
+    pub fn new(
+        source_id: &str,
+        sync_token: &str,
+        from_hash: Option<String>,
+        to_hash: &str,
+    ) -> Self {
         Self {
             source_id: source_id.to_string(),
             sync_token: sync_token.to_string(),
@@ -90,9 +95,11 @@ impl FileLock {
             .open(path)?;
 
         if wait {
-            file.lock_exclusive().map_err(|_| MinSyncError::LockFailed)?;
+            file.lock_exclusive()
+                .map_err(|_| MinSyncError::LockFailed)?;
         } else {
-            file.try_lock_exclusive().map_err(|_| MinSyncError::LockFailed)?;
+            file.try_lock_exclusive()
+                .map_err(|_| MinSyncError::LockFailed)?;
         }
 
         let mut f = &file;
@@ -124,7 +131,8 @@ fn atomic_write_json<T: Serialize>(value: &T, path: &Path) -> Result<()> {
     tmp.write_all(&content)?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|error| MinSyncError::Io(error.error))?;
+    tmp.persist(path)
+        .map_err(|error| MinSyncError::Io(error.error))?;
 
     Ok(())
 }
@@ -176,7 +184,10 @@ mod tests {
 
         assert_eq!(transaction.source_id, "source-1");
         assert_eq!(transaction.sync_token, "0123456789abcdef");
-        assert_eq!(transaction.manifest_hash_from, Some("sha256:from".to_string()));
+        assert_eq!(
+            transaction.manifest_hash_from,
+            Some("sha256:from".to_string())
+        );
         assert_eq!(transaction.manifest_hash_to, "sha256:to");
         assert_eq!(transaction.status, "running");
         assert!(!transaction.started_at.is_empty());

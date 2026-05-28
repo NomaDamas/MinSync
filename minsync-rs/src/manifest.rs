@@ -52,9 +52,9 @@ impl Manifest {
 
         for entry in walker {
             let entry = entry.map_err(|error| MinSyncError::Manifest(error.to_string()))?;
-            let file_type = entry
-                .file_type()
-                .ok_or_else(|| MinSyncError::Manifest(format!("missing file type: {}", entry.path().display())))?;
+            let file_type = entry.file_type().ok_or_else(|| {
+                MinSyncError::Manifest(format!("missing file type: {}", entry.path().display()))
+            })?;
 
             if !file_type.is_file() {
                 continue;
@@ -140,7 +140,8 @@ impl Manifest {
         tmp.write_all(&content)?;
         tmp.flush()?;
         tmp.as_file().sync_all()?;
-        tmp.persist(path).map_err(|error| MinSyncError::Io(error.error))?;
+        tmp.persist(path)
+            .map_err(|error| MinSyncError::Io(error.error))?;
 
         Ok(())
     }
@@ -209,19 +210,33 @@ mod tests {
         assert_eq!(manifest.files["a.txt"].size, 5);
         assert_eq!(manifest.files["nested/b.txt"].size, 4);
         assert_eq!(manifest.files["c.txt"].size, 5);
-        assert_eq!(manifest.files["a.txt"].content_hash, prefixed_sha256(b"alpha"));
-        assert_eq!(manifest.files["nested/b.txt"].content_hash, prefixed_sha256(b"beta"));
-        assert_eq!(manifest.files["c.txt"].content_hash, prefixed_sha256(b"gamma"));
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            prefixed_sha256(b"alpha")
+        );
+        assert_eq!(
+            manifest.files["nested/b.txt"].content_hash,
+            prefixed_sha256(b"beta")
+        );
+        assert_eq!(
+            manifest.files["c.txt"].content_hash,
+            prefixed_sha256(b"gamma")
+        );
     }
 
     #[test]
     fn test_manifest_scan_with_minsyncignore() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        fs::write(dir.path().join(".minsyncignore"), "ignored.txt\nignored_dir/\n").expect("write ignore");
+        fs::write(
+            dir.path().join(".minsyncignore"),
+            "ignored.txt\nignored_dir/\n",
+        )
+        .expect("write ignore");
         fs::write(dir.path().join("kept.txt"), "kept").expect("write kept");
         fs::write(dir.path().join("ignored.txt"), "ignored").expect("write ignored");
         fs::create_dir(dir.path().join("ignored_dir")).expect("create ignored dir");
-        fs::write(dir.path().join("ignored_dir/file.txt"), "ignored").expect("write ignored nested");
+        fs::write(dir.path().join("ignored_dir/file.txt"), "ignored")
+            .expect("write ignored nested");
 
         let manifest = Manifest::scan(dir.path(), "source-1").expect("scan manifest");
 
@@ -249,7 +264,10 @@ mod tests {
         let old = manifest_with(&[("a.txt", "sha256:a")]);
         let new = manifest_with(&[("a.txt", "sha256:a"), ("b.txt", "sha256:b")]);
 
-        assert_eq!(Manifest::diff(&old, &new), vec![FileChange::Added("b.txt".to_string())]);
+        assert_eq!(
+            Manifest::diff(&old, &new),
+            vec![FileChange::Added("b.txt".to_string())]
+        );
     }
 
     #[test]
@@ -257,7 +275,10 @@ mod tests {
         let old = manifest_with(&[("a.txt", "sha256:a")]);
         let new = manifest_with(&[("a.txt", "sha256:b")]);
 
-        assert_eq!(Manifest::diff(&old, &new), vec![FileChange::Modified("a.txt".to_string())]);
+        assert_eq!(
+            Manifest::diff(&old, &new),
+            vec![FileChange::Modified("a.txt".to_string())]
+        );
     }
 
     #[test]
@@ -265,13 +286,24 @@ mod tests {
         let old = manifest_with(&[("a.txt", "sha256:a"), ("b.txt", "sha256:b")]);
         let new = manifest_with(&[("a.txt", "sha256:a")]);
 
-        assert_eq!(Manifest::diff(&old, &new), vec![FileChange::Deleted("b.txt".to_string())]);
+        assert_eq!(
+            Manifest::diff(&old, &new),
+            vec![FileChange::Deleted("b.txt".to_string())]
+        );
     }
 
     #[test]
     fn test_manifest_diff_mixed() {
-        let old = manifest_with(&[("a.txt", "sha256:a"), ("b.txt", "sha256:b"), ("c.txt", "sha256:c")]);
-        let new = manifest_with(&[("a.txt", "sha256:changed"), ("b.txt", "sha256:b"), ("d.txt", "sha256:d")]);
+        let old = manifest_with(&[
+            ("a.txt", "sha256:a"),
+            ("b.txt", "sha256:b"),
+            ("c.txt", "sha256:c"),
+        ]);
+        let new = manifest_with(&[
+            ("a.txt", "sha256:changed"),
+            ("b.txt", "sha256:b"),
+            ("d.txt", "sha256:d"),
+        ]);
 
         assert_eq!(
             Manifest::diff(&old, &new),

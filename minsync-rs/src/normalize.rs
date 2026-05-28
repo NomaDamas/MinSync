@@ -42,7 +42,10 @@ fn strip_yaml_frontmatter(text: &str) -> String {
         .map(|offset| closing_start + offset + 1)
         .unwrap_or(normalized.len());
 
-    normalized[closing_line_end..].strip_prefix('\n').unwrap_or(&normalized[closing_line_end..]).to_string()
+    normalized[closing_line_end..]
+        .strip_prefix('\n')
+        .unwrap_or(&normalized[closing_line_end..])
+        .to_string()
 }
 
 fn collapse_spaces_and_tabs(text: &str) -> String {
@@ -78,7 +81,10 @@ mod tests {
             strip_frontmatter: false,
         };
 
-        assert_eq!(normalize_text("hello\r\nworld\ragain", &config), "hello\nworld\nagain");
+        assert_eq!(
+            normalize_text("hello\r\nworld\ragain", &config),
+            "hello\nworld\nagain"
+        );
     }
 
     #[test]
@@ -102,7 +108,10 @@ mod tests {
             collapse_whitespace: false,
         };
 
-        assert_eq!(normalize_text("---\ntitle: x\n---\ncontent", &config), "content");
+        assert_eq!(
+            normalize_text("---\ntitle: x\n---\ncontent", &config),
+            "content"
+        );
     }
 
     #[test]
@@ -119,7 +128,10 @@ mod tests {
 
     #[test]
     fn test_normalize_defaults() {
-        assert_eq!(normalize_text("hello  \r\nworld\t ", &NormalizeConfig::default()), "hello\nworld");
+        assert_eq!(
+            normalize_text("hello  \r\nworld\t ", &NormalizeConfig::default()),
+            "hello\nworld"
+        );
     }
 
     #[test]

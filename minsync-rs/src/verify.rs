@@ -43,10 +43,19 @@ pub async fn status(minsync_dir: &Path) -> Result<StatusResult> {
         SyncState::OutOfDate
     };
 
-    Ok(status_result(&config, Some(&cursor), state, Some(manifest_hash)))
+    Ok(status_result(
+        &config,
+        Some(&cursor),
+        state,
+        Some(manifest_hash),
+    ))
 }
 
-pub async fn check(minsync_dir: &Path, embedder: &dyn Embedder, store: &dyn VectorStore) -> Result<CheckResult> {
+pub async fn check(
+    minsync_dir: &Path,
+    embedder: &dyn Embedder,
+    store: &dyn VectorStore,
+) -> Result<CheckResult> {
     if !minsync_dir.join("config.toml").exists() {
         return Err(MinSyncError::NotInitialized);
     }
@@ -194,7 +203,12 @@ fn sample_paths(manifest: &Manifest, sample: Option<usize>) -> Vec<String> {
     paths
 }
 
-fn expected_doc_ids(root: &Path, path: &str, config: &Config, chunker: &dyn Chunker) -> Result<Vec<String>> {
+fn expected_doc_ids(
+    root: &Path,
+    path: &str,
+    config: &Config,
+    chunker: &dyn Chunker,
+) -> Result<Vec<String>> {
     let raw_text = match std::fs::read_to_string(root.join(path)) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::InvalidData => String::new(),
@@ -255,7 +269,13 @@ mod tests {
         }
     }
 
-    fn fixture() -> (TempDir, MinSync, ChonkieChunker, MockEmbedder, InMemoryStore) {
+    fn fixture() -> (
+        TempDir,
+        MinSync,
+        ChonkieChunker,
+        MockEmbedder,
+        InMemoryStore,
+    ) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let sync = MinSync::new(dir.path().to_path_buf());
         let chunker = ChonkieChunker::new(32, "\n ");
@@ -278,7 +298,9 @@ mod tests {
         let (dir, sync, _chunker, _embedder, _store) = fixture();
         sync.init(false).expect("init succeeds");
 
-        let result = status(&dir.path().join(".minsync")).await.expect("status succeeds");
+        let result = status(&dir.path().join(".minsync"))
+            .await
+            .expect("status succeeds");
 
         assert_eq!(result.state, SyncState::NotSynced);
         assert_eq!(result.last_synced_at, None);
@@ -293,7 +315,9 @@ mod tests {
             .await
             .expect("sync succeeds");
 
-        let result = status(&dir.path().join(".minsync")).await.expect("status succeeds");
+        let result = status(&dir.path().join(".minsync"))
+            .await
+            .expect("status succeeds");
 
         assert_eq!(result.state, SyncState::UpToDate);
     }
@@ -307,7 +331,9 @@ mod tests {
             .await
             .expect("sync succeeds");
         std::fs::write(dir.path().join("a.txt"), "changed").expect("modify file");
-        let result = status(&dir.path().join(".minsync")).await.expect("status succeeds");
+        let result = status(&dir.path().join(".minsync"))
+            .await
+            .expect("status succeeds");
 
         assert_eq!(result.state, SyncState::OutOfDate);
     }
@@ -324,7 +350,9 @@ mod tests {
             .save(&dir.path().join(".minsync").join("txn.json"))
             .expect("save transaction");
 
-        let result = status(&dir.path().join(".minsync")).await.expect("status succeeds");
+        let result = status(&dir.path().join(".minsync"))
+            .await
+            .expect("status succeeds");
 
         assert_eq!(result.state, SyncState::Interrupted);
     }
@@ -353,9 +381,16 @@ mod tests {
             .await
             .expect("sync succeeds");
 
-        let result = verify(&dir.path().join(".minsync"), dir.path(), &chunker, &mut store, false, None)
-            .await
-            .expect("verify succeeds");
+        let result = verify(
+            &dir.path().join(".minsync"),
+            dir.path(),
+            &chunker,
+            &mut store,
+            false,
+            None,
+        )
+        .await
+        .expect("verify succeeds");
 
         assert!(result.all_passed);
         assert!(!result.fixed);
@@ -369,23 +404,31 @@ mod tests {
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("sync succeeds");
-        store.upsert(&[Document {
-            id: "stale".to_string(),
-            embedding: vec![0.0; 8],
-            text: "stale".to_string(),
-            source_id: config.source_id,
-            path: "deleted.txt".to_string(),
-            chunk_schema_id: chunker.schema_id().to_string(),
-            chunk_type: "text".to_string(),
-            heading_path: String::new(),
-            content_hash: "stale".to_string(),
-            seen_token: "old".to_string(),
-        }])
-        .expect("upsert stale doc");
+        store
+            .upsert(&[Document {
+                id: "stale".to_string(),
+                embedding: vec![0.0; 8],
+                text: "stale".to_string(),
+                source_id: config.source_id,
+                path: "deleted.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "stale".to_string(),
+                seen_token: "old".to_string(),
+            }])
+            .expect("upsert stale doc");
 
-        let result = verify(&dir.path().join(".minsync"), dir.path(), &chunker, &mut store, true, None)
-            .await
-            .expect("verify succeeds");
+        let result = verify(
+            &dir.path().join(".minsync"),
+            dir.path(),
+            &chunker,
+            &mut store,
+            true,
+            None,
+        )
+        .await
+        .expect("verify succeeds");
 
         assert!(result.all_passed);
         assert!(result.fixed);

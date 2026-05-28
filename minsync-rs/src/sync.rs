@@ -248,7 +248,9 @@ impl MinSync {
 
 fn change_path(change: &FileChange) -> String {
     match change {
-        FileChange::Added(path) | FileChange::Modified(path) | FileChange::Deleted(path) => path.clone(),
+        FileChange::Added(path) | FileChange::Modified(path) | FileChange::Deleted(path) => {
+            path.clone()
+        }
     }
 }
 
@@ -296,7 +298,13 @@ mod tests {
         }
     }
 
-    fn fixture() -> (TempDir, MinSync, ChonkieChunker, MockEmbedder, InMemoryStore) {
+    fn fixture() -> (
+        TempDir,
+        MinSync,
+        ChonkieChunker,
+        MockEmbedder,
+        InMemoryStore,
+    ) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let sync = MinSync::new(dir.path().to_path_buf());
         let chunker = ChonkieChunker::new(32, "\n ");

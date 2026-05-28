@@ -83,7 +83,11 @@ impl VectorStore for JsonStore {
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
         Ok(ids
             .iter()
-            .filter_map(|id| self.index.get(id).map(|position| self.docs[*position].clone()))
+            .filter_map(|id| {
+                self.index
+                    .get(id)
+                    .map(|position| self.docs[*position].clone())
+            })
             .collect())
     }
 
@@ -116,7 +120,12 @@ impl VectorStore for JsonStore {
             })
             .collect();
 
-        hits.sort_by(|left, right| right.score.partial_cmp(&left.score).unwrap_or(Ordering::Equal));
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        });
         hits.truncate(topk);
         Ok(hits)
     }
@@ -133,7 +142,8 @@ impl VectorStore for JsonStore {
         tmp.write_all(&content)?;
         tmp.flush()?;
         tmp.as_file().sync_all()?;
-        tmp.persist(&docs_path).map_err(|error| MinSyncError::Io(error.error))?;
+        tmp.persist(&docs_path)
+            .map_err(|error| MinSyncError::Io(error.error))?;
         self.dirty = false;
 
         Ok(())
@@ -187,8 +197,12 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 pub fn matches_filter(doc: &Document, filter: &Filter) -> bool {
     match filter {
-        Filter::Eq(field, value) => get_field(doc, field).is_some_and(|doc_value| doc_value == value),
-        Filter::Neq(field, value) => get_field(doc, field).is_some_and(|doc_value| doc_value != value),
+        Filter::Eq(field, value) => {
+            get_field(doc, field).is_some_and(|doc_value| doc_value == value)
+        }
+        Filter::Neq(field, value) => {
+            get_field(doc, field).is_some_and(|doc_value| doc_value != value)
+        }
         Filter::And(filters) => filters.iter().all(|nested| matches_filter(doc, nested)),
     }
 }
@@ -242,7 +256,9 @@ mod tests {
         ];
 
         store.upsert(&docs).expect("upsert docs");
-        let fetched = store.fetch(&["a".to_string(), "b".to_string(), "c".to_string()]).expect("fetch docs");
+        let fetched = store
+            .fetch(&["a".to_string(), "b".to_string(), "c".to_string()])
+            .expect("fetch docs");
 
         assert_eq!(fetched.len(), 3);
         assert_eq!(fetched[0].id, "a");
@@ -253,8 +269,12 @@ mod tests {
     #[test]
     fn test_upsert_replaces() {
         let mut store = store();
-        store.upsert(&[doc("a", "old.txt", "old", vec![1.0, 0.0])]).expect("upsert old");
-        store.upsert(&[doc("a", "new.txt", "new", vec![0.0, 1.0])]).expect("upsert new");
+        store
+            .upsert(&[doc("a", "old.txt", "old", vec![1.0, 0.0])])
+            .expect("upsert old");
+        store
+            .upsert(&[doc("a", "new.txt", "new", vec![0.0, 1.0])])
+            .expect("upsert new");
 
         let fetched = store.fetch(&["a".to_string()]).expect("fetch doc");
 
@@ -266,7 +286,9 @@ mod tests {
     #[test]
     fn test_update_metadata() {
         let mut store = store();
-        store.upsert(&[doc("a", "old.txt", "old", vec![1.0])]).expect("upsert doc");
+        store
+            .upsert(&[doc("a", "old.txt", "old", vec![1.0])])
+            .expect("upsert doc");
         store
             .update(&[DocumentUpdate {
                 id: "a".to_string(),
@@ -320,7 +342,10 @@ mod tests {
             .expect("delete docs");
 
         assert_eq!(deleted, 2);
-        assert_eq!(store.fetch(&["a".to_string()]).expect("fetch kept").len(), 1);
+        assert_eq!(
+            store.fetch(&["a".to_string()]).expect("fetch kept").len(),
+            1
+        );
     }
 
     #[test]
@@ -343,14 +368,24 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert_eq!(store.doc_count(), 2);
-        assert!(store.fetch(&["b".to_string()]).expect("fetch deleted").is_empty());
+        assert!(store
+            .fetch(&["b".to_string()])
+            .expect("fetch deleted")
+            .is_empty());
     }
 
     #[test]
     fn test_query_topk() {
         let mut store = store();
         let docs: Vec<_> = (0..10)
-            .map(|i| doc(&format!("doc-{i}"), "path.txt", "token", vec![i as f32, 0.0]))
+            .map(|i| {
+                doc(
+                    &format!("doc-{i}"),
+                    "path.txt",
+                    "token",
+                    vec![i as f32, 0.0],
+                )
+            })
             .collect();
         store.upsert(&docs).expect("upsert docs");
 
@@ -374,7 +409,11 @@ mod tests {
             .expect("upsert docs");
 
         let hits = store
-            .query(&[1.0, 0.0], Some(&Filter::Eq("path".to_string(), "x.txt".to_string())), 10)
+            .query(
+                &[1.0, 0.0],
+                Some(&Filter::Eq("path".to_string(), "x.txt".to_string())),
+                10,
+            )
             .expect("query docs");
 
         assert_eq!(hits.len(), 2);
@@ -385,7 +424,9 @@ mod tests {
     fn test_query_empty_store() {
         let store = store();
 
-        let hits = store.query(&[1.0, 0.0], None, 10).expect("query empty store");
+        let hits = store
+            .query(&[1.0, 0.0], None, 10)
+            .expect("query empty store");
 
         assert!(hits.is_empty());
     }
@@ -394,7 +435,9 @@ mod tests {
     fn test_persistence_roundtrip() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mut store = JsonStore::new(dir.path()).expect("create store");
-        store.upsert(&[doc("a", "a.txt", "token", vec![1.0, 0.0])]).expect("upsert doc");
+        store
+            .upsert(&[doc("a", "a.txt", "token", vec![1.0, 0.0])])
+            .expect("upsert doc");
         store.flush().expect("flush store");
 
         let loaded = JsonStore::new(dir.path()).expect("load store");

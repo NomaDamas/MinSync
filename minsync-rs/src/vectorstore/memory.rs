@@ -37,7 +37,10 @@ impl VectorStore for InMemoryStore {
     }
 
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
-        Ok(ids.iter().filter_map(|id| self.docs.get(id).cloned()).collect())
+        Ok(ids
+            .iter()
+            .filter_map(|id| self.docs.get(id).cloned())
+            .collect())
     }
 
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
@@ -63,7 +66,12 @@ impl VectorStore for InMemoryStore {
             })
             .collect();
 
-        hits.sort_by(|left, right| right.score.partial_cmp(&left.score).unwrap_or(Ordering::Equal));
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        });
         hits.truncate(topk);
         Ok(hits)
     }

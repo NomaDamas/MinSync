@@ -138,8 +138,8 @@ mod tests {
     #[tokio::test]
     async fn test_embed_single() {
         let (_server, url) = setup_mock(1).await;
-        let embedder = OpenAiEmbedder::new("text-embedding-3-small", "test-key", 10)
-            .with_base_url(&url);
+        let embedder =
+            OpenAiEmbedder::new("text-embedding-3-small", "test-key", 10).with_base_url(&url);
 
         let embedding = embedder.embed_single("hello").await.unwrap();
 
@@ -149,8 +149,8 @@ mod tests {
     #[tokio::test]
     async fn test_embed_multiple() {
         let (_server, url) = setup_mock(3).await;
-        let embedder = OpenAiEmbedder::new("text-embedding-3-small", "test-key", 10)
-            .with_base_url(&url);
+        let embedder =
+            OpenAiEmbedder::new("text-embedding-3-small", "test-key", 10).with_base_url(&url);
         let texts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
 
         let embeddings = embedder.embed(&texts).await.unwrap();

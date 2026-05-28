@@ -107,11 +107,13 @@ async fn run(
         }
         Commands::Query { text, k } => {
             let config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
-            let embedder = OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
+            let embedder =
+                OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
             let store_path = minsync_dir.join(&config.collection.path);
             let store = JsonStore::new(store_path)?;
 
-            let results = minsync::query::query(&minsync_dir, &text, k, &embedder, &store, None).await?;
+            let results =
+                minsync::query::query(&minsync_dir, &text, k, &embedder, &store, None).await?;
 
             match cli.format {
                 OutputFormat::Text => {
@@ -164,7 +166,8 @@ async fn run(
         }
         Commands::Check => {
             let config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
-            let embedder = OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
+            let embedder =
+                OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
             let store_path = minsync_dir.join(&config.collection.path);
             let store = JsonStore::new(store_path)?;
 
