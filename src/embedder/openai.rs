@@ -29,6 +29,10 @@ struct EmbedData {
 
 impl OpenAiEmbedder {
     pub fn new(model: &str, api_key: &str, batch_size: usize) -> Self {
+        // Config stores the embedder id with a provider scheme (e.g.
+        // "openai:text-embedding-3-small"). Strip the leading "openai:" prefix
+        // so the actual OpenAI API model name is sent in the request.
+        let model = model.strip_prefix("openai:").unwrap_or(model);
         Self {
             model: model.to_string(),
             api_key: api_key.to_string(),
@@ -169,6 +173,15 @@ mod tests {
         let embeddings = embedder.embed(&texts).await.unwrap();
 
         assert!(embeddings.is_empty());
+    }
+
+    #[test]
+    fn test_strips_openai_provider_prefix() {
+        let embedder = OpenAiEmbedder::new("openai:text-embedding-3-small", "test-key", 1);
+        assert_eq!(embedder.id(), "text-embedding-3-small");
+
+        let bare = OpenAiEmbedder::new("text-embedding-3-small", "test-key", 1);
+        assert_eq!(bare.id(), "text-embedding-3-small");
     }
 
     #[tokio::test]
