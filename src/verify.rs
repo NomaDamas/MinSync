@@ -296,7 +296,8 @@ mod tests {
     #[tokio::test]
     async fn test_status_not_synced() {
         let (dir, sync, _chunker, _embedder, _store) = fixture();
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
 
         let result = status(&dir.path().join(".minsync"))
             .await
@@ -310,7 +311,8 @@ mod tests {
     async fn test_status_up_to_date() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("sync succeeds");
@@ -326,7 +328,8 @@ mod tests {
     async fn test_status_out_of_date() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("sync succeeds");
@@ -342,7 +345,9 @@ mod tests {
     async fn test_status_interrupted() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        let config = sync.init(false).expect("init succeeds");
+        let config = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("sync succeeds");
@@ -360,7 +365,8 @@ mod tests {
     #[tokio::test]
     async fn test_check_all_pass() {
         let (dir, sync, _chunker, embedder, store) = fixture();
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
 
         let result = check(&dir.path().join(".minsync"), &embedder, &store)
             .await
@@ -376,7 +382,8 @@ mod tests {
     async fn test_verify_clean() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("sync succeeds");
@@ -400,7 +407,9 @@ mod tests {
     async fn test_verify_stale_fix() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        let config = sync.init(false).expect("init succeeds");
+        let config = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("sync succeeds");

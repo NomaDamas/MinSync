@@ -1,6 +1,5 @@
 use clap::Parser;
 use minsync::cli::{Cli, Commands, OutputFormat};
-use minsync::embedder::openai::OpenAiEmbedder;
 use minsync::sync::MinSync;
 use std::process;
 
@@ -41,9 +40,9 @@ async fn run(
     minsync_dir: std::path::PathBuf,
 ) -> minsync::error::Result<()> {
     match cli.command {
-        Commands::Init { force, .. } => {
+        Commands::Init { force, embedder, chunker } => {
             let ms = MinSync::new(root);
-            let config = ms.init(force)?;
+            let config = ms.init(force, &embedder, &chunker)?;
             match cli.format {
                 OutputFormat::Text => {
                     println!("Initialized MinSync in .minsync/");
@@ -65,12 +64,12 @@ async fn run(
             wait,
             batch_size,
         } => {
-            let config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
+            let mut config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
+            if let Some(bs) = batch_size {
+                config.embedder.batch_size = bs;
+            }
             let chunker = minsync::chunker::create_chunker(&config)?;
-            let embedder = OpenAiEmbedder::from_env(
-                &config.embedder.id,
-                batch_size.unwrap_or(config.embedder.batch_size),
-            )?;
+            let embedder = minsync::embedder::create_embedder(&config)?;
             let store_path = minsync_dir.join(&config.collection.path);
             let mut store = minsync::vectorstore::create_vectorstore(&config, &store_path)?;
 
@@ -78,7 +77,7 @@ async fn run(
             let result = ms
                 .sync(
                     chunker.as_ref(),
-                    &embedder,
+                    embedder.as_ref(),
                     store.as_mut(),
                     full,
                     dry_run,
@@ -112,14 +111,19 @@ async fn run(
         }
         Commands::Query { text, k } => {
             let config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
-            let embedder =
-                OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
+            let embedder = minsync::embedder::create_embedder(&config)?;
             let store_path = minsync_dir.join(&config.collection.path);
             let store = minsync::vectorstore::create_vectorstore(&config, &store_path)?;
 
-            let results =
-                minsync::query::query(&minsync_dir, &text, k, &embedder, store.as_ref(), None)
-                    .await?;
+            let results = minsync::query::query(
+                &minsync_dir,
+                &text,
+                k,
+                embedder.as_ref(),
+                store.as_ref(),
+                None,
+            )
+            .await?;
 
             match cli.format {
                 OutputFormat::Text => {
@@ -172,12 +176,12 @@ async fn run(
         }
         Commands::Check => {
             let config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
-            let embedder =
-                OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
+            let embedder = minsync::embedder::create_embedder(&config)?;
             let store_path = minsync_dir.join(&config.collection.path);
             let store = minsync::vectorstore::create_vectorstore(&config, &store_path)?;
 
-            let result = minsync::verify::check(&minsync_dir, &embedder, store.as_ref()).await?;
+            let result =
+                minsync::verify::check(&minsync_dir, embedder.as_ref(), store.as_ref()).await?;
             match cli.format {
                 OutputFormat::Text => {
                     println!("MinSync Health Check");
@@ -239,8 +243,7 @@ async fn run(
         Commands::Watch { debounce_ms } => {
             let config = minsync::config::Config::load(&minsync_dir.join("config.toml"))?;
             let chunker = minsync::chunker::create_chunker(&config)?;
-            let embedder =
-                OpenAiEmbedder::from_env(&config.embedder.id, config.embedder.batch_size)?;
+            let embedder = minsync::embedder::create_embedder(&config)?;
             let store_path = minsync_dir.join(&config.collection.path);
             let mut store = minsync::vectorstore::create_vectorstore(&config, &store_path)?;
 
@@ -251,7 +254,7 @@ async fn run(
             minsync::watch::run(
                 root,
                 chunker.as_ref(),
-                &embedder,
+                embedder.as_ref(),
                 store.as_mut(),
                 debounce_ms,
             )

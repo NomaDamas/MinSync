@@ -23,14 +23,16 @@ impl MinSync {
     }
 
     /// Initialize `.minsync/` with a default config and baseline manifest.
-    pub fn init(&self, force: bool) -> Result<Config> {
+    pub fn init(&self, force: bool, embedder_id: &str, chunker_id: &str) -> Result<Config> {
         if self.minsync_dir.exists() && !force {
             return Err(MinSyncError::AlreadyInitialized);
         }
 
         std::fs::create_dir_all(&self.minsync_dir)?;
         let source_id = uuid::Uuid::new_v4().to_string();
-        let config = Config::default_for(&source_id);
+        let mut config = Config::default_for(&source_id);
+        config.embedder.id = embedder_id.to_string();
+        config.chunker.id = chunker_id.to_string();
 
         config.save(&self.minsync_dir.join("config.toml"))?;
         Manifest::scan(&self.root, &source_id)?.save(&self.minsync_dir.join("manifest.json"))?;
@@ -317,7 +319,9 @@ mod tests {
     fn test_init_creates_minsync_dir() {
         let (_dir, sync, _chunker, _embedder, _store) = fixture();
 
-        let config = sync.init(false).expect("init succeeds");
+        let config = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
 
         assert!(sync.minsync_dir.exists());
         assert!(sync.minsync_dir.join("config.toml").exists());
@@ -328,9 +332,10 @@ mod tests {
     #[test]
     fn test_init_already_initialized() {
         let (_dir, sync, _chunker, _embedder, _store) = fixture();
-        sync.init(false).expect("first init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
 
-        let result = sync.init(false);
+        let result = sync.init(false, "openai:text-embedding-3-small", "recursive");
 
         assert!(matches!(result, Err(MinSyncError::AlreadyInitialized)));
     }
@@ -338,18 +343,44 @@ mod tests {
     #[test]
     fn test_init_force_reinit() {
         let (_dir, sync, _chunker, _embedder, _store) = fixture();
-        let first = sync.init(false).expect("first init succeeds");
+        let first = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
 
-        let second = sync.init(true).expect("force init succeeds");
+        let second = sync
+            .init(true, "openai:text-embedding-3-small", "recursive")
+            .expect("force init succeeds");
 
         assert_ne!(first.source_id, second.source_id);
+    }
+
+    #[test]
+    fn test_init_honors_overrides() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+
+        let config = sync
+            .init(
+                false,
+                "tei:intfloat/multilingual-e5-small",
+                "chonkie",
+            )
+            .expect("init succeeds");
+
+        let saved = Config::load(&sync.minsync_dir.join("config.toml"))
+            .expect("load saved config succeeds");
+
+        assert_eq!(config.embedder.id, "tei:intfloat/multilingual-e5-small");
+        assert_eq!(config.chunker.id, "chonkie");
+        assert_eq!(saved.embedder.id, "tei:intfloat/multilingual-e5-small");
+        assert_eq!(saved.chunker.id, "chonkie");
     }
 
     #[tokio::test]
     async fn test_sync_full_first_time() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
 
         let result = sync
             .sync(&chunker, &embedder, &mut store, true, false, false)
@@ -365,7 +396,8 @@ mod tests {
     async fn test_sync_incremental_add() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("first sync succeeds");
@@ -385,7 +417,8 @@ mod tests {
     async fn test_sync_incremental_modify() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("first sync succeeds");
@@ -405,7 +438,8 @@ mod tests {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("first sync succeeds");
@@ -426,7 +460,8 @@ mod tests {
     async fn test_sync_already_up_to_date() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("first sync succeeds");
@@ -444,7 +479,8 @@ mod tests {
     async fn test_sync_dry_run() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        sync.init(false).expect("init succeeds");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
 
         let result = sync
             .sync(&chunker, &embedder, &mut store, true, true, false)
@@ -461,7 +497,9 @@ mod tests {
     async fn test_sync_crash_recovery() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
-        let config = sync.init(false).expect("init succeeds");
+        let config = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
         Transaction::new(&config.source_id, "stale-token", None, "sha256:stale")
             .save(&sync.minsync_dir.join("txn.json"))
             .expect("write stale txn");

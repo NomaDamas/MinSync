@@ -25,7 +25,7 @@ pub async fn query(
     }
     let cursor = Cursor::load(&cursor_path)?;
 
-    let query_vec = embedder.embed_single(text).await?;
+    let query_vec = embedder.embed_query(text).await?;
 
     let mut filters = vec![Filter::Eq(
         "source_id".to_string(),
@@ -84,6 +84,26 @@ mod tests {
                     _ => vec![0.0, 1.0, 0.0, 0.0],
                 })
                 .collect())
+        }
+    }
+
+    struct SentinelEmbedder;
+
+    const SENTINEL_EMBED_VEC: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    const SENTINEL_QUERY_VEC: [f32; 4] = [0.0, 1.0, 0.0, 0.0];
+
+    #[async_trait::async_trait]
+    impl Embedder for SentinelEmbedder {
+        fn id(&self) -> &str {
+            "sentinel"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| SENTINEL_EMBED_VEC.to_vec()).collect())
+        }
+
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(SENTINEL_QUERY_VEC.to_vec())
         }
     }
 
@@ -199,5 +219,28 @@ mod tests {
             .expect("query succeeds");
 
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_uses_embed_query() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let minsync_dir = dir.path().join(".minsync");
+        let mut store = InMemoryStore::new();
+        let embedder = SentinelEmbedder;
+        let source_id = "source-1";
+        write_query_state(&dir, source_id);
+
+        store
+            .upsert(&[
+                doc("embed", source_id, "embed.txt", SENTINEL_EMBED_VEC.to_vec()),
+                doc("query", source_id, "query.txt", SENTINEL_QUERY_VEC.to_vec()),
+            ])
+            .expect("upsert docs");
+
+        let results = query(&minsync_dir, "search text", 2, &embedder, &store, None)
+            .await
+            .expect("query succeeds");
+
+        assert_eq!(results[0].doc_id, "query");
     }
 }
