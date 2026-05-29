@@ -1,13 +1,18 @@
 use minsync::chunker::chonkie::ChonkieChunker;
+use minsync::chunker::recursive::RecursiveChunker;
+use minsync::chunker::create_chunker;
+use minsync::config::Config;
 use minsync::embedder::Embedder;
 use minsync::error::{MinSyncError, Result};
 use minsync::query::query;
 use minsync::state::Transaction;
 use minsync::sync::MinSync;
 use minsync::types::SyncState;
+use minsync::vectorstore::lancedb_store::LanceDbStore;
 use minsync::vectorstore::memory::InMemoryStore;
-use minsync::vectorstore::VectorStore;
+use minsync::vectorstore::{create_vectorstore, VectorStore};
 use minsync::verify::{status, verify};
+use minsync::watch::should_index;
 use tempfile::TempDir;
 
 struct MockEmbedder;
@@ -315,4 +320,126 @@ async fn test_minsyncignore_filtering() {
         vec![".minsyncignore", "kept.txt"]
     );
     assert_eq!(store.all_paths(), vec![".minsyncignore", "kept.txt"]);
+}
+
+#[tokio::test]
+async fn test_recursive_chunker_end_to_end() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = RecursiveChunker::new(64);
+    let embedder = MockEmbedder;
+    let mut store = InMemoryStore::new();
+
+    write_file(
+        &dir,
+        "README.md",
+        "# Title\n\npara one about apples\n\npara two about oranges",
+    );
+
+    sync.init(false).expect("init succeeds");
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("recursive sync succeeds");
+
+    assert!(result.chunks_added > 0);
+    assert!(store.doc_count() > 0);
+
+    let query_results = query(
+        &dir.path().join(".minsync"),
+        "apples",
+        5,
+        &embedder,
+        &store,
+        None,
+    )
+    .await
+    .expect("query succeeds");
+
+    assert!(!query_results.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lancedb_backend_end_to_end() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let store_dir = tempfile::tempdir().expect("create store tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = RecursiveChunker::new(64);
+    let embedder = MockEmbedder;
+    // MockEmbedder produces 8-dim vectors, so LanceDB dimension MUST be 8.
+    let mut store =
+        LanceDbStore::open_or_create(store_dir.path(), 8).expect("create lancedb store");
+
+    write_file(
+        &dir,
+        "README.md",
+        "# Title\n\npara one about apples\n\npara two about oranges",
+    );
+    write_file(&dir, "notes.txt", "delta epsilon zeta extra content here");
+
+    sync.init(false).expect("init succeeds");
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("lancedb full sync succeeds");
+
+    assert!(result.chunks_added > 0);
+    assert!(store.doc_count() > 0);
+
+    let query_results = query(
+        &dir.path().join(".minsync"),
+        "apples",
+        5,
+        &embedder,
+        &store,
+        None,
+    )
+    .await
+    .expect("lancedb query succeeds");
+    assert!(!query_results.is_empty());
+
+    // Incremental sync after modifying a file proves the worker-thread bridge
+    // works through the full async pipeline without a nested-runtime panic.
+    write_file(
+        &dir,
+        "notes.txt",
+        "delta epsilon zeta extra content here plus brand new words",
+    );
+    let incremental = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("lancedb incremental sync succeeds");
+
+    assert_eq!(incremental.files_processed_paths, vec!["notes.txt"]);
+    assert!(incremental.chunks_added + incremental.chunks_updated > 0);
+    assert!(store.doc_count() > 0);
+}
+
+#[test]
+fn test_watch_should_index_integration() {
+    let root = std::path::Path::new("/project");
+    let minsync_dir = root.join(".minsync");
+
+    assert!(should_index(&root.join("doc.md"), &minsync_dir));
+    assert!(should_index(&root.join("notes.txt"), &minsync_dir));
+    assert!(!should_index(&root.join("image.png"), &minsync_dir));
+    assert!(!should_index(&minsync_dir.join("manifest.json"), &minsync_dir));
+    assert!(!should_index(&minsync_dir.join("nested.md"), &minsync_dir));
+}
+
+#[test]
+fn test_factory_selects_backends() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+    config.vectorstore.id = "lancedb".to_string();
+    let mut table = toml::value::Table::new();
+    table.insert("dimension".into(), toml::Value::Integer(8));
+    config.vectorstore.options = toml::Value::Table(table);
+
+    let store = create_vectorstore(&config, dir.path()).expect("create lancedb store");
+    assert_eq!(store.doc_count(), 0);
+
+    // Config::default_for sets chunker.id to "recursive".
+    let chunker = create_chunker(&config).expect("create recursive chunker");
+    assert_eq!(chunker.schema_id(), "recursive");
 }
