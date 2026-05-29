@@ -12,3 +12,4 @@ pub mod sync;
 pub mod types;
 pub mod vectorstore;
 pub mod verify;
+pub mod watch;
