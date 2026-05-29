@@ -61,6 +61,12 @@ pub struct EmbedderConfig {
     pub max_concurrent: usize,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub query_prefix: Option<String>,
+    #[serde(default)]
+    pub passage_prefix: Option<String>,
 }
 
 fn default_batch_size() -> usize {
@@ -135,6 +141,9 @@ impl Config {
                 batch_size: default_batch_size(),
                 max_concurrent: default_max_concurrent(),
                 max_retries: default_max_retries(),
+                base_url: None,
+                query_prefix: None,
+                passage_prefix: None,
             },
             vectorstore: VectorStoreConfig {
                 id: "json".to_string(),
@@ -189,6 +198,9 @@ mod tests {
         assert_eq!(config.embedder.batch_size, 64);
         assert_eq!(config.embedder.max_concurrent, 1);
         assert_eq!(config.embedder.max_retries, 3);
+        assert_eq!(config.embedder.base_url, None);
+        assert_eq!(config.embedder.query_prefix, None);
+        assert_eq!(config.embedder.passage_prefix, None);
         assert_eq!(config.vectorstore.id, "json");
         assert!(config
             .vectorstore
@@ -242,6 +254,9 @@ id = "custom_embedder"
 batch_size = 8
 max_concurrent = 4
 max_retries = 9
+base_url = "http://localhost:8080"
+query_prefix = "query: "
+passage_prefix = "passage: "
 
 [vectorstore]
 id = "custom_store"
@@ -270,6 +285,9 @@ strip_frontmatter = true
         assert_eq!(config.embedder.batch_size, 8);
         assert_eq!(config.embedder.max_concurrent, 4);
         assert_eq!(config.embedder.max_retries, 9);
+        assert_eq!(config.embedder.base_url.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(config.embedder.query_prefix.as_deref(), Some("query: "));
+        assert_eq!(config.embedder.passage_prefix.as_deref(), Some("passage: "));
         assert_eq!(config.vectorstore.id, "custom_store");
         assert_eq!(
             config.vectorstore.options["url"].as_str(),
@@ -283,5 +301,77 @@ strip_frontmatter = true
         assert!(!config.normalize.normalize_newlines);
         assert!(config.normalize.collapse_whitespace);
         assert!(config.normalize.strip_frontmatter);
+    }
+
+    #[test]
+    fn test_embedder_config_optional_fields() {
+        let toml_with_fields = r#"
+version = 1
+source_id = "source-1"
+
+[collection]
+name = "custom_collection"
+path = "custom_store"
+
+[chunker]
+id = "custom_chunker"
+
+[vectorstore]
+id = "custom_store"
+
+[embedder]
+id = "custom_embedder"
+batch_size = 8
+max_concurrent = 4
+max_retries = 9
+base_url = "http://localhost:8080"
+query_prefix = "query: "
+passage_prefix = "passage: "
+
+[normalize]
+strip_trailing_whitespace = true
+normalize_newlines = true
+collapse_whitespace = false
+strip_frontmatter = false
+"#;
+
+        let config_with_fields: Config = toml::from_str(toml_with_fields)
+            .expect("parse config with embedder optional fields");
+        assert_eq!(config_with_fields.embedder.base_url.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(config_with_fields.embedder.query_prefix.as_deref(), Some("query: "));
+        assert_eq!(config_with_fields.embedder.passage_prefix.as_deref(), Some("passage: "));
+
+        let toml_without_fields = r#"
+version = 1
+source_id = "source-1"
+
+[collection]
+name = "custom_collection"
+path = "custom_store"
+
+[chunker]
+id = "custom_chunker"
+
+[vectorstore]
+id = "custom_store"
+
+[embedder]
+id = "custom_embedder"
+batch_size = 8
+max_concurrent = 4
+max_retries = 9
+
+[normalize]
+strip_trailing_whitespace = true
+normalize_newlines = true
+collapse_whitespace = false
+strip_frontmatter = false
+"#;
+
+        let config_without_fields: Config = toml::from_str(toml_without_fields)
+            .expect("parse config without embedder optional fields");
+        assert_eq!(config_without_fields.embedder.base_url, None);
+        assert_eq!(config_without_fields.embedder.query_prefix, None);
+        assert_eq!(config_without_fields.embedder.passage_prefix, None);
     }
 }
