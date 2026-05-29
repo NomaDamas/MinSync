@@ -1,27 +1,62 @@
 # MinSync
 
-Git 저장소의 변경사항을 `git diff`로 감지하여 벡터 DB를 증분 갱신하는 도구.
+Manifest-based incremental vector DB indexing CLI tool written in Rust. No git required.
 
-## 핵심 원칙
+## Core Principles
 
-- **CLI = Python API Thin Wrapper**: 모든 기능은 `MinSync` 클래스 메서드. CLI는 인자 파싱+출력만.
-- **config.yaml = pre-built만**: 커스텀 chunker/embedder/vectorstore는 Python API로 객체 주입.
-- **LangChain 인터페이스 제공, 의존성 미포함**: 외부 패키지(weaviate-client 등)는 사용자가 직접 설치.
-- **상태 디렉토리**: `.minsync/` (config.yaml, cursor.json, txn.json, lock)
-- **인덱싱 대상**: git-tracked 전체 → `.gitignore`는 git이 자동 제외 → `.minsyncignore`로 추가 제외 (`.gitignore` 문법). `include` 없음.
-- **`.minsyncignore` 변경 시 `--full` 불필요**: sync + verify 조합으로 수렴.
-- **CI/CD 우선 설계**: GitHub Actions 비대화형 실행이 기본 전제.
-- **Crash-safe**: cursor는 모든 처리 완료 후에만 갱신. mark+sweep으로 수렴 보장.
-- **Deterministic ID**: `sha256(repo_id+ref+path+schema_id+chunk_type+heading_path+content_hash+dup_index)`.
+- **Git-free**: manifest (mtime + size + content_hash) based change detection. Zero git dependency.
+- **Rust native**: Pure Rust, no C++ dependencies. chonkie-core (chunk crate) built-in.
+- **State directory**: `.minsync/` (config.toml, manifest.json, cursor.json, txn.json, lock)
+- **Indexing target**: All files in directory. Exclude via `.minsyncignore` (`.gitignore` syntax).
+- **Crash-safe**: Cursor updated only after all processing completes. mark+sweep guarantees convergence.
+- **Deterministic ID**: `sha256(source_id + \0 + path + \0 + chunk_schema_id + \0 + chunk_type + \0 + content_hash + \0 + dup_index)`.
 
-## CLI 커맨드
+## Architecture
+
+```
+src/
+├── main.rs           # CLI entry point (clap + tokio)
+├── cli.rs            # clap derive definitions
+├── lib.rs            # Module declarations
+├── config.rs         # Config TOML parsing
+├── error.rs          # thiserror error hierarchy, exit codes
+├── manifest.rs       # ManifestBackend: scan, diff, atomic write
+├── state.rs          # Cursor, Transaction, FileLock (fs2)
+├── id.rs             # Deterministic doc_id + content_hash
+├── normalize.rs      # Text normalization
+├── types.rs          # Shared data models
+├── sync.rs           # MinSync struct: init() + sync()
+├── query.rs          # Query logic
+├── verify.rs         # Verify, Check, Status
+├── chunker/
+│   ├── mod.rs        # Chunker trait
+│   └── chonkie.rs    # chonkie-core based implementation
+├── embedder/
+│   ├── mod.rs        # Embedder trait (async)
+│   └── openai.rs     # OpenAI HTTP backend
+└── vectorstore/
+    ├── mod.rs        # VectorStore trait + types
+    ├── json_store.rs # JsonStore: cosine brute-force + JSON persist
+    └── memory.rs     # InMemoryStore (testing only)
+```
+
+## CLI Commands
 
 `init` / `sync` / `query` / `status` / `check` / `verify`
 
-## 상세 문서
+Exit codes: 0 (success), 1 (general error), 3 (Lock failed), 4 (VectorStore error), 5 (Embedding error)
 
-- `ai_instruction/CLI_SPEC.md` — CLI 및 Python API 명세
-- `ai_instruction/USER_SCENARIOS.md` — 유저 시나리오 19개
-- `ai_instruction/E2E_TEST_PLAN.md` — E2E 테스트 44개
-- `ai_instruction/IMPLEMENTATION_CHECKLIST.md` — 구현 체크리스트 232항목
-- `PRD.md` — 원본 PRD
+## Key Dependencies
+
+- `chunk` — chonkie-core SIMD chunker
+- `clap` — CLI framework
+- `tokio` + `reqwest` — async HTTP (OpenAI API)
+- `ignore` — .minsyncignore processing (ripgrep engine)
+- `sha2` — SHA-256 content hashing
+- `tempfile` — atomic writes
+- `fs2` — file locking
+- `serde` + `serde_json` + `toml` — serialization
+
+## Tests
+
+103 tests (90 unit + 13 integration). Run with `cargo test`.
