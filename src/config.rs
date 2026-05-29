@@ -75,6 +75,8 @@ fn default_max_retries() -> usize {
     3
 }
 
+/// For `vectorstore.id = "lancedb"`, `options.dimension` sets the embedding
+/// dimension (default 1536 for `openai:text-embedding-3-small`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VectorStoreConfig {
     pub id: String,
@@ -125,7 +127,7 @@ impl Config {
                 path: "store".to_string(),
             },
             chunker: ChunkerConfig {
-                id: "chonkie".to_string(),
+                id: "recursive".to_string(),
                 options: ChunkerOptions::default(),
             },
             embedder: EmbedderConfig {
@@ -180,7 +182,7 @@ mod tests {
         assert_eq!(config.source_id, "12345678-1234-4234-9234-123456789abc");
         assert_eq!(config.collection.name, "minsync_12345678");
         assert_eq!(config.collection.path, "store");
-        assert_eq!(config.chunker.id, "chonkie");
+        assert_eq!(config.chunker.id, "recursive");
         assert_eq!(config.chunker.options.max_chunk_size, 4096);
         assert_eq!(config.chunker.options.delimiters, "\n.?!");
         assert_eq!(config.embedder.id, "openai:text-embedding-3-small");

@@ -30,7 +30,7 @@ pub enum Commands {
         force: bool,
         #[arg(long, default_value = "openai:text-embedding-3-small")]
         embedder: String,
-        #[arg(long, default_value = "chonkie")]
+        #[arg(long, default_value = "recursive")]
         chunker: String,
     },
     /// Sync files to vector index
@@ -62,5 +62,10 @@ pub enum Commands {
         all: bool,
         #[arg(long, default_value = "10")]
         sample: usize,
+    },
+    /// Watch the directory and incrementally re-index changed .md/.txt files
+    Watch {
+        #[arg(long)]
+        debounce_ms: Option<u64>,
     },
 }
