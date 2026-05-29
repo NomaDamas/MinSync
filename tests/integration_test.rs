@@ -2,6 +2,7 @@ use minsync::chunker::chonkie::ChonkieChunker;
 use minsync::chunker::recursive::RecursiveChunker;
 use minsync::chunker::create_chunker;
 use minsync::config::Config;
+use minsync::embedder::tei::TeiEmbedder;
 use minsync::embedder::Embedder;
 use minsync::error::{MinSyncError, Result};
 use minsync::query::query;
@@ -64,7 +65,8 @@ async fn test_full_workflow() {
     write_file(&dir, "README.md", "# MinSync\n\nalpha beta gamma");
     write_file(&dir, "src/lib.txt", "delta epsilon zeta");
 
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     let sync_result = sync
         .sync(&chunker, &embedder, &mut store, true, false, false)
         .await
@@ -101,7 +103,9 @@ async fn test_full_workflow() {
 fn test_init_creates_structure() {
     let (dir, sync, _chunker, _embedder, _store) = fixture();
 
-    let config = sync.init(false).expect("init succeeds");
+    let config = sync
+        .init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
 
     assert_eq!(config.version, 1);
     assert!(dir.path().join(".minsync/config.toml").exists());
@@ -111,9 +115,10 @@ fn test_init_creates_structure() {
 #[test]
 fn test_init_already_exists() {
     let (_dir, sync, _chunker, _embedder, _store) = fixture();
-    sync.init(false).expect("first init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("first init succeeds");
 
-    let result = sync.init(false);
+    let result = sync.init(false, "openai:text-embedding-3-small", "recursive");
 
     assert!(matches!(result, Err(MinSyncError::AlreadyInitialized)));
 }
@@ -121,9 +126,13 @@ fn test_init_already_exists() {
 #[test]
 fn test_init_force() {
     let (_dir, sync, _chunker, _embedder, _store) = fixture();
-    let first = sync.init(false).expect("first init succeeds");
+    let first = sync
+        .init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("first init succeeds");
 
-    let second = sync.init(true).expect("force init succeeds");
+    let second = sync
+        .init(true, "openai:text-embedding-3-small", "recursive")
+        .expect("force init succeeds");
 
     assert_ne!(first.source_id, second.source_id);
 }
@@ -134,7 +143,8 @@ async fn test_sync_full_indexes_all() {
     write_file(&dir, "a.txt", "alpha beta gamma");
     write_file(&dir, "b.txt", "delta epsilon zeta");
     write_file(&dir, "nested/c.txt", "eta theta iota");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
 
     let result = sync
         .sync(&chunker, &embedder, &mut store, true, false, false)
@@ -151,7 +161,8 @@ async fn test_sync_full_indexes_all() {
 async fn test_sync_incremental_detects_new_file() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     sync.sync(&chunker, &embedder, &mut store, true, false, false)
         .await
         .expect("initial sync succeeds");
@@ -173,7 +184,8 @@ async fn test_sync_incremental_detects_new_file() {
 async fn test_sync_incremental_detects_modification() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     sync.sync(&chunker, &embedder, &mut store, true, false, false)
         .await
         .expect("initial sync succeeds");
@@ -193,7 +205,8 @@ async fn test_sync_incremental_detects_modification() {
 async fn test_sync_incremental_detects_deletion() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     sync.sync(&chunker, &embedder, &mut store, true, false, false)
         .await
         .expect("initial sync succeeds");
@@ -215,7 +228,8 @@ async fn test_sync_incremental_detects_deletion() {
 async fn test_sync_dry_run_no_side_effects() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
 
     let result = sync
         .sync(&chunker, &embedder, &mut store, true, true, false)
@@ -233,7 +247,8 @@ async fn test_sync_dry_run_no_side_effects() {
 async fn test_sync_already_up_to_date() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     sync.sync(&chunker, &embedder, &mut store, true, false, false)
         .await
         .expect("initial sync succeeds");
@@ -252,7 +267,9 @@ async fn test_sync_already_up_to_date() {
 async fn test_sync_crash_recovery_removes_stale_transaction() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    let config = sync.init(false).expect("init succeeds");
+    let config = sync
+        .init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     Transaction::new(&config.source_id, "stale-token", None, "sha256:stale")
         .save(&dir.path().join(".minsync/txn.json"))
         .expect("save stale transaction");
@@ -271,7 +288,9 @@ async fn test_sync_crash_recovery_removes_stale_transaction() {
 async fn test_status_states() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
-    let config = sync.init(false).expect("init succeeds");
+    let config = sync
+        .init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
 
     let not_synced = status(&dir.path().join(".minsync"))
         .await
@@ -308,7 +327,8 @@ async fn test_minsyncignore_filtering() {
     write_file(&dir, "kept.txt", "kept content");
     write_file(&dir, "ignored.txt", "ignored content");
     write_file(&dir, "ignored_dir/file.txt", "ignored nested content");
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
 
     let result = sync
         .sync(&chunker, &embedder, &mut store, true, false, false)
@@ -336,7 +356,8 @@ async fn test_recursive_chunker_end_to_end() {
         "# Title\n\npara one about apples\n\npara two about oranges",
     );
 
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     let result = sync
         .sync(&chunker, &embedder, &mut store, true, false, false)
         .await
@@ -377,7 +398,8 @@ async fn test_lancedb_backend_end_to_end() {
     );
     write_file(&dir, "notes.txt", "delta epsilon zeta extra content here");
 
-    sync.init(false).expect("init succeeds");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
     let result = sync
         .sync(&chunker, &embedder, &mut store, true, false, false)
         .await
@@ -442,4 +464,110 @@ fn test_factory_selects_backends() {
     // Config::default_for sets chunker.id to "recursive".
     let chunker = create_chunker(&config).expect("create recursive chunker");
     assert_eq!(chunker.schema_id(), "recursive");
+}
+
+#[tokio::test]
+async fn test_tei_embedder_passage_and_query_prefixes() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // Distinguish passage vs query requests by the prefix embedded in the body.
+    // Real TEI responds with a BARE 2D array (no {data:...} wrapper).
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .and(body_string_contains("passage: "))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([[1.0, 0.0, 0.0, 0.0]])),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .and(body_string_contains("query: "))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([[0.0, 1.0, 0.0, 0.0]])),
+        )
+        .mount(&server)
+        .await;
+
+    let embedder = TeiEmbedder::new("tei:test-model", &server.uri(), 64)
+        .with_passage_prefix(Some("passage: ".to_string()))
+        .with_query_prefix(Some("query: ".to_string()));
+
+    let passage = embedder
+        .embed(&["doc".to_string()])
+        .await
+        .expect("passage embed succeeds");
+    assert_eq!(passage, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+
+    let query_vec = embedder
+        .embed_query("hello")
+        .await
+        .expect("query embed succeeds");
+    assert_eq!(query_vec, vec![0.0, 1.0, 0.0, 0.0]);
+}
+
+#[tokio::test]
+async fn test_tei_full_sync_and_query_pipeline() {
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    // Dynamic responder: parse {"inputs":[...]} and emit one 4-dim vector per
+    // input, so the mock is robust regardless of how many chunks sync sends.
+    struct OnePerInput;
+    impl Respond for OnePerInput {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("valid embed request JSON");
+            let n = body["inputs"]
+                .as_array()
+                .map(|a| a.len())
+                .expect("inputs is an array");
+            let vectors: Vec<Vec<f32>> = (0..n).map(|_| vec![0.5, 0.5, 0.5, 0.5]).collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!(vectors))
+        }
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/embed"))
+        .respond_with(OnePerInput)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = RecursiveChunker::new(64);
+    let embedder = TeiEmbedder::new("tei:test-model", &server.uri(), 64);
+    let mut store = InMemoryStore::new();
+
+    write_file(&dir, "doc.md", "hello world");
+
+    // init baselines the manifest, so the first real sync must use full=true.
+    sync.init(false, "tei:test-model", "recursive")
+        .expect("init succeeds");
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("tei full sync succeeds");
+
+    assert!(result.chunks_added > 0);
+    assert!(store.doc_count() > 0);
+
+    let query_results = query(
+        &dir.path().join(".minsync"),
+        "hello",
+        1,
+        &embedder,
+        &store,
+        None,
+    )
+    .await
+    .expect("tei query succeeds");
+
+    assert!(!query_results.is_empty());
 }
