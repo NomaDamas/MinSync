@@ -127,6 +127,9 @@ target/
 
 ## Development
 
+CI assumes the standard GitHub-hosted runners on Ubuntu, macOS, and Windows, with Rust 1.91 installed through rustup.
+The build also expects a working C compiler toolchain, vendored protoc from protobuf-src, LanceDB native dependencies built on CI, and no secrets for normal CI runs.
+
 ```bash
 cargo test            # 140 tests
 cargo clippy          # lint
