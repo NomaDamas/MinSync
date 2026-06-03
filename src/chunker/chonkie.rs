@@ -175,9 +175,7 @@ mod tests {
         assert!(text.len() >= 10_000);
         assert!(chunks.len() > 1);
         assert_eq!(chunks.concat_text(), text);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.text.as_bytes().len() <= 512 + 40));
+        assert!(chunks.iter().all(|chunk| chunk.text.len() <= 512 + 40));
     }
 
     trait ChunkTextExt {

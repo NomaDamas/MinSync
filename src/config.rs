@@ -94,6 +94,12 @@ fn default_vectorstore_options() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
+fn default_lancedb_options() -> toml::Value {
+    let mut table = toml::map::Map::new();
+    table.insert("dimension".to_string(), toml::Value::Integer(1536));
+    toml::Value::Table(table)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizeConfig {
     #[serde(default = "bool_true")]
@@ -146,8 +152,8 @@ impl Config {
                 passage_prefix: None,
             },
             vectorstore: VectorStoreConfig {
-                id: "json".to_string(),
-                options: default_vectorstore_options(),
+                id: "lancedb".to_string(),
+                options: default_lancedb_options(),
             },
             normalize: NormalizeConfig::default(),
         }
@@ -201,12 +207,11 @@ mod tests {
         assert_eq!(config.embedder.base_url, None);
         assert_eq!(config.embedder.query_prefix, None);
         assert_eq!(config.embedder.passage_prefix, None);
-        assert_eq!(config.vectorstore.id, "json");
-        assert!(config
-            .vectorstore
-            .options
-            .as_table()
-            .is_some_and(|table| table.is_empty()));
+        assert_eq!(config.vectorstore.id, "lancedb");
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(1536)
+        );
         assert!(config.normalize.strip_trailing_whitespace);
         assert!(config.normalize.normalize_newlines);
         assert!(!config.normalize.collapse_whitespace);
@@ -285,7 +290,10 @@ strip_frontmatter = true
         assert_eq!(config.embedder.batch_size, 8);
         assert_eq!(config.embedder.max_concurrent, 4);
         assert_eq!(config.embedder.max_retries, 9);
-        assert_eq!(config.embedder.base_url.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(
+            config.embedder.base_url.as_deref(),
+            Some("http://localhost:8080")
+        );
         assert_eq!(config.embedder.query_prefix.as_deref(), Some("query: "));
         assert_eq!(config.embedder.passage_prefix.as_deref(), Some("passage: "));
         assert_eq!(config.vectorstore.id, "custom_store");
@@ -335,11 +343,20 @@ collapse_whitespace = false
 strip_frontmatter = false
 "#;
 
-        let config_with_fields: Config = toml::from_str(toml_with_fields)
-            .expect("parse config with embedder optional fields");
-        assert_eq!(config_with_fields.embedder.base_url.as_deref(), Some("http://localhost:8080"));
-        assert_eq!(config_with_fields.embedder.query_prefix.as_deref(), Some("query: "));
-        assert_eq!(config_with_fields.embedder.passage_prefix.as_deref(), Some("passage: "));
+        let config_with_fields: Config =
+            toml::from_str(toml_with_fields).expect("parse config with embedder optional fields");
+        assert_eq!(
+            config_with_fields.embedder.base_url.as_deref(),
+            Some("http://localhost:8080")
+        );
+        assert_eq!(
+            config_with_fields.embedder.query_prefix.as_deref(),
+            Some("query: ")
+        );
+        assert_eq!(
+            config_with_fields.embedder.passage_prefix.as_deref(),
+            Some("passage: ")
+        );
 
         let toml_without_fields = r#"
 version = 1

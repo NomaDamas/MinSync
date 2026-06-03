@@ -1,6 +1,6 @@
-pub mod json_store;
 pub mod lancedb_store;
 pub mod memory;
+pub mod similarity;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
@@ -65,12 +65,12 @@ use std::path::Path;
 /// Returns [`MinSyncError::Config`] when the id is unknown.
 pub fn create_vectorstore(config: &Config, store_path: &Path) -> Result<Box<dyn VectorStore>> {
     match config.vectorstore.id.as_str() {
-        "json" => Ok(Box::new(json_store::JsonStore::new(store_path)?)),
         "lancedb" => {
-            let dimension =
-                lancedb_store::LanceDbStore::dimension_from_options(Some(&config.vectorstore.options))?;
-            Ok(Box::new(lancedb_store::LanceDbStore::open_or_create(
-                store_path, dimension,
+            let options = Some(&config.vectorstore.options);
+            let dimension = lancedb_store::LanceDbStore::dimension_from_options(options)?;
+            let indexing = lancedb_store::IndexingConfig::from_options(options)?;
+            Ok(Box::new(lancedb_store::LanceDbStore::open_with_indexing(
+                store_path, dimension, indexing,
             )?))
         }
         other => Err(MinSyncError::Config(format!(
@@ -83,14 +83,6 @@ pub fn create_vectorstore(config: &Config, store_path: &Path) -> Result<Box<dyn 
 mod factory_tests {
     use super::*;
     use crate::config::Config;
-
-    #[test]
-    fn test_create_vectorstore_json() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-        let store = create_vectorstore(&config, dir.path()).expect("create json store");
-        assert_eq!(store.doc_count(), 0);
-    }
 
     #[test]
     fn test_create_vectorstore_lancedb() {

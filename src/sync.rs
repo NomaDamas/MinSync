@@ -16,6 +16,14 @@ pub struct MinSync {
     minsync_dir: PathBuf,
 }
 
+struct SyncFileContext<'a> {
+    config: &'a Config,
+    chunker: &'a dyn Chunker,
+    embedder: &'a dyn Embedder,
+    store: &'a mut dyn VectorStore,
+    sync_token: &'a str,
+}
+
 impl MinSync {
     pub fn new(root: PathBuf) -> Self {
         let minsync_dir = root.join(".minsync");
@@ -115,16 +123,14 @@ impl MinSync {
         for change in &changes {
             match change {
                 FileChange::Added(path) | FileChange::Modified(path) => {
-                    self.sync_file(
-                        path,
-                        &config,
+                    let context = SyncFileContext {
+                        config: &config,
                         chunker,
                         embedder,
                         store,
-                        &sync_token,
-                        &mut result,
-                    )
-                    .await?;
+                        sync_token: &sync_token,
+                    };
+                    self.sync_file(path, context, &mut result).await?;
                 }
                 FileChange::Deleted(path) => {
                     let deleted = store.delete_by_filter(&Filter::And(vec![
@@ -158,11 +164,7 @@ impl MinSync {
     async fn sync_file(
         &self,
         path: &str,
-        config: &Config,
-        chunker: &dyn Chunker,
-        embedder: &dyn Embedder,
-        store: &mut dyn VectorStore,
-        sync_token: &str,
+        context: SyncFileContext<'_>,
         result: &mut SyncResult,
     ) -> Result<()> {
         let raw_text = match std::fs::read_to_string(self.root.join(path)) {
@@ -170,9 +172,9 @@ impl MinSync {
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => String::new(),
             Err(error) => return Err(MinSyncError::Io(error)),
         };
-        let text = normalize_text(&raw_text, &config.normalize);
-        let chunks = chunker.chunk(&text, path)?;
-        let schema_id = chunker.schema_id();
+        let text = normalize_text(&raw_text, &context.config.normalize);
+        let chunks = context.chunker.chunk(&text, path)?;
+        let schema_id = context.chunker.schema_id();
         let mut docs_to_embed = Vec::new();
         let mut dup_counter: HashMap<String, usize> = HashMap::new();
 
@@ -181,7 +183,7 @@ impl MinSync {
             let dup_key = format!("{}\0{}", chunk_content_hash, chunk.heading_path);
             let dup_index = dup_counter.entry(dup_key).or_insert(0);
             let doc_id = compute_doc_id(
-                &config.source_id,
+                &context.config.source_id,
                 path,
                 schema_id,
                 &chunk.chunk_type,
@@ -190,23 +192,27 @@ impl MinSync {
             );
             *dup_index += 1;
 
-            if store.fetch(std::slice::from_ref(&doc_id))?.is_empty() {
+            if context
+                .store
+                .fetch(std::slice::from_ref(&doc_id))?
+                .is_empty()
+            {
                 docs_to_embed.push(Document {
                     id: doc_id,
                     embedding: Vec::new(),
                     text: chunk.text,
-                    source_id: config.source_id.clone(),
+                    source_id: context.config.source_id.clone(),
                     path: path.to_string(),
                     chunk_schema_id: schema_id.to_string(),
                     chunk_type: chunk.chunk_type,
                     heading_path: chunk.heading_path,
                     content_hash: chunk_content_hash,
-                    seen_token: sync_token.to_string(),
+                    seen_token: context.sync_token.to_string(),
                 });
             } else {
-                store.update(&[DocumentUpdate {
+                context.store.update(&[DocumentUpdate {
                     id: doc_id,
-                    seen_token: sync_token.to_string(),
+                    seen_token: context.sync_token.to_string(),
                     path: path.to_string(),
                     heading_path: chunk.heading_path,
                 }])?;
@@ -216,7 +222,7 @@ impl MinSync {
 
         if !docs_to_embed.is_empty() {
             let texts: Vec<String> = docs_to_embed.iter().map(|doc| doc.text.clone()).collect();
-            let embeddings = embedder.embed(&texts).await?;
+            let embeddings = context.embedder.embed(&texts).await?;
             if embeddings.len() != docs_to_embed.len() {
                 return Err(MinSyncError::Embedding(format!(
                     "expected {} embeddings, got {}",
@@ -233,13 +239,13 @@ impl MinSync {
                 doc.embedding = embedding;
             }
             result.chunks_added += docs_to_embed.len();
-            store.upsert(&docs_to_embed)?;
+            context.store.upsert(&docs_to_embed)?;
         }
 
-        result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
-            Filter::Eq("source_id".to_string(), config.source_id.clone()),
+        result.chunks_deleted += context.store.delete_by_filter(&Filter::And(vec![
+            Filter::Eq("source_id".to_string(), context.config.source_id.clone()),
             Filter::Eq("path".to_string(), path.to_string()),
-            Filter::Neq("seen_token".to_string(), sync_token.to_string()),
+            Filter::Neq("seen_token".to_string(), context.sync_token.to_string()),
         ]))?;
         result.files_processed += 1;
         result.files_processed_paths.push(path.to_string());
@@ -359,11 +365,7 @@ mod tests {
         let (_dir, sync, _chunker, _embedder, _store) = fixture();
 
         let config = sync
-            .init(
-                false,
-                "tei:intfloat/multilingual-e5-small",
-                "chonkie",
-            )
+            .init(false, "tei:intfloat/multilingual-e5-small", "chonkie")
             .expect("init succeeds");
 
         let saved = Config::load(&sync.minsync_dir.join("config.toml"))

@@ -5,8 +5,10 @@ use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
+use lancedb::index::vector::IvfHnswSqIndexBuilder;
+use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::table::OptimizeAction;
+use lancedb::table::{OptimizeAction, OptimizeOptions};
 use lancedb::{Connection, DistanceType, Table};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -18,6 +20,81 @@ const DEFAULT_DIMENSION: usize = 1536;
 const TABLE_NAME: &str = "documents";
 const VECTOR_COLUMN: &str = "vector";
 const DISTANCE_COLUMN: &str = "_distance";
+
+/// The distance metric used for BOTH index construction and query time. These
+/// must match: an index trained with one metric returns invalid results when
+/// searched with another. Cosine matches the in-memory store's scoring.
+const DISTANCE_TYPE: DistanceType = DistanceType::Cosine;
+
+const DEFAULT_INDEX_BUILD_THRESHOLD: usize = 256;
+const DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD: usize = 10_000;
+
+/// ANN index maintenance thresholds. These are tuning knobs, not capacity
+/// limits: any number of vectors can be stored and searched regardless of these
+/// values. They only decide *when* index maintenance runs.
+///
+/// The two thresholds are NOT a min/max pair on the same quantity. They gate
+/// two distinct, mutually exclusive events that measure different things:
+/// `index_build_threshold` triggers the one-time `create_index` (compared
+/// against TOTAL rows), while `index_optimize_delta_threshold` triggers the
+/// recurring incremental `optimize` (compared against UNINDEXED-delta rows).
+#[derive(Debug, Clone, Copy)]
+pub struct IndexingConfig {
+    /// Build the ANN index once the table's TOTAL row count reaches this value.
+    /// Below it, an exact flat scan is fast enough and IVF lacks the data to
+    /// train good partitions. This gates a one-time `create_index`.
+    pub index_build_threshold: usize,
+    /// Fold the unindexed delta into the existing index once that delta reaches
+    /// this value. The delta counts only rows not yet covered by the index (not
+    /// the total row count). New rows stay searchable (via flat scan over the
+    /// delta) throughout; this bounds how large that flat portion grows before a
+    /// recurring incremental `optimize` runs. Raise it to optimize less often,
+    /// lower it to keep query latency tighter.
+    pub index_optimize_delta_threshold: usize,
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            index_build_threshold: DEFAULT_INDEX_BUILD_THRESHOLD,
+            index_optimize_delta_threshold: DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD,
+        }
+    }
+}
+
+impl IndexingConfig {
+    /// Parse indexing knobs from `[vectorstore.options]`. Unknown/missing keys
+    /// fall back to defaults; `0` is rejected since it would index empty tables
+    /// or optimize on every flush.
+    pub fn from_options(options: Option<&toml::Value>) -> Result<Self> {
+        let mut config = Self::default();
+        let Some(options) = options else {
+            return Ok(config);
+        };
+        if let Some(value) = options.get("index_build_threshold") {
+            config.index_build_threshold = parse_positive_usize(value, "index_build_threshold")?;
+        }
+        if let Some(value) = options.get("index_optimize_delta_threshold") {
+            config.index_optimize_delta_threshold =
+                parse_positive_usize(value, "index_optimize_delta_threshold")?;
+        }
+        Ok(config)
+    }
+}
+
+fn parse_positive_usize(value: &toml::Value, key: &str) -> Result<usize> {
+    let integer = value.as_integer().ok_or_else(|| {
+        MinSyncError::Config(format!("vectorstore.options.{key} must be an integer"))
+    })?;
+    let parsed = usize::try_from(integer)
+        .map_err(|_| MinSyncError::Config(format!("vectorstore.options.{key} must be positive")))?;
+    if parsed == 0 {
+        return Err(MinSyncError::Config(format!(
+            "vectorstore.options.{key} must be greater than 0"
+        )));
+    }
+    Ok(parsed)
+}
 
 type Resp<T> = mpsc::Sender<Result<T>>;
 
@@ -35,6 +112,7 @@ enum Command {
     Flush(Resp<()>),
     DocCount(Resp<usize>),
     AllPaths(Resp<Vec<String>>),
+    IndexNames(Resp<Vec<String>>),
     Shutdown,
 }
 
@@ -48,10 +126,19 @@ struct LanceDbInner {
     conn: Connection,
     table: Table,
     dim: usize,
+    indexing: IndexingConfig,
 }
 
 impl LanceDbStore {
     pub fn open_or_create(path: &Path, dimension: usize) -> Result<Self> {
+        Self::open_with_indexing(path, dimension, IndexingConfig::default())
+    }
+
+    pub fn open_with_indexing(
+        path: &Path,
+        dimension: usize,
+        indexing: IndexingConfig,
+    ) -> Result<Self> {
         let dim = if dimension == 0 {
             DEFAULT_DIMENSION
         } else {
@@ -65,7 +152,7 @@ impl LanceDbStore {
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
-        let worker = thread::spawn(move || run_worker(uri, dim, cmd_rx, init_tx));
+        let worker = thread::spawn(move || run_worker(uri, dim, indexing, cmd_rx, init_tx));
 
         match init_rx.recv().map_err(to_store_error)? {
             Ok(()) => Ok(Self {
@@ -110,6 +197,10 @@ impl LanceDbStore {
 
     pub fn dimension(&self) -> usize {
         self.dim
+    }
+
+    pub fn index_names(&self) -> Result<Vec<String>> {
+        self.request(Command::IndexNames)
     }
 
     fn request<T>(&self, make: impl FnOnce(Resp<T>) -> Command) -> Result<T> {
@@ -182,6 +273,7 @@ impl VectorStore for LanceDbStore {
 fn run_worker(
     uri: String,
     dim: usize,
+    indexing: IndexingConfig,
     cmd_rx: mpsc::Receiver<Command>,
     init_tx: mpsc::Sender<Result<()>>,
 ) {
@@ -197,7 +289,7 @@ fn run_worker(
         }
     };
 
-    let inner = match rt.block_on(LanceDbInner::open_or_create(&uri, dim)) {
+    let inner = match rt.block_on(LanceDbInner::open_or_create(&uri, dim, indexing)) {
         Ok(inner) => inner,
         Err(error) => {
             let _ = init_tx.send(Err(error));
@@ -228,6 +320,7 @@ fn run_worker(
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
             Command::DocCount(resp) => send_response(resp, rt.block_on(inner.doc_count())),
             Command::AllPaths(resp) => send_response(resp, rt.block_on(inner.all_paths())),
+            Command::IndexNames(resp) => send_response(resp, rt.block_on(inner.index_names())),
             Command::Shutdown => break,
         }
     }
@@ -238,7 +331,7 @@ fn send_response<T>(resp: Resp<T>, result: Result<T>) {
 }
 
 impl LanceDbInner {
-    async fn open_or_create(uri: &str, dim: usize) -> Result<Self> {
+    async fn open_or_create(uri: &str, dim: usize, indexing: IndexingConfig) -> Result<Self> {
         let conn = lancedb::connect(uri)
             .execute()
             .await
@@ -259,7 +352,12 @@ impl LanceDbInner {
                 .map_err(to_store_error)?
         };
 
-        Ok(Self { conn, table, dim })
+        Ok(Self {
+            conn,
+            table,
+            dim,
+            indexing,
+        })
     }
 
     async fn upsert(&self, docs: Vec<Document>) -> Result<()> {
@@ -330,7 +428,7 @@ impl LanceDbInner {
             .vector_search(vector)
             .map_err(to_store_error)?
             .column(VECTOR_COLUMN)
-            .distance_type(DistanceType::Cosine)
+            .distance_type(DISTANCE_TYPE)
             .limit(topk)
             .select(Select::columns(&[
                 "id",
@@ -374,9 +472,9 @@ impl LanceDbInner {
                     heading_path: headings.value(row).to_string(),
                     chunk_type: chunk_types.value(row).to_string(),
                     text: texts.value(row).to_string(),
-                    // LanceDB returns cosine distance (lower is better). MinSync's
-                    // VectorStore contract requires cosine-like similarity scores
-                    // (higher is better), matching JsonStore, so reconcile here.
+                    // LanceDB returns cosine distance (lower is better). The
+                    // VectorStore contract requires similarity scores (higher is
+                    // better), matching the in-memory store, so reconcile here.
                     score: 1.0 - distance,
                     content_hash: hashes.value(row).to_string(),
                 });
@@ -395,10 +493,79 @@ impl LanceDbInner {
 
     async fn flush(&self) -> Result<()> {
         self.table
-            .optimize(OptimizeAction::All)
+            .optimize(OptimizeAction::Compact {
+                options: lancedb::table::CompactionOptions::default(),
+                remap_options: None,
+            })
             .await
             .map_err(to_store_error)?;
+        self.maintain_index().await?;
         Ok(())
+    }
+
+    /// Ensure the vector column is ANN-indexed and keep that index current.
+    ///
+    /// LanceDB never auto-indexes inserted rows: a fresh table answers queries
+    /// with an exhaustive `KNNFlatSearch`, and rows added after `create_index`
+    /// stay in an unindexed delta that is flat-scanned on every query. This
+    /// method (a) builds the index once enough rows exist, then (b) folds the
+    /// unindexed delta into the existing index via an incremental `optimize`
+    /// (no k-means retrain) once the delta grows large enough to hurt latency.
+    async fn maintain_index(&self) -> Result<()> {
+        let existing = self
+            .table
+            .list_indices()
+            .await
+            .map_err(to_store_error)?
+            .into_iter()
+            .find(|index| index.columns.iter().any(|column| column == VECTOR_COLUMN));
+
+        match existing {
+            None => {
+                let total_rows = self.table.count_rows(None).await.map_err(to_store_error)?;
+                if total_rows >= self.indexing.index_build_threshold {
+                    self.table
+                        .create_index(&[VECTOR_COLUMN], self.vector_index())
+                        .execute()
+                        .await
+                        .map_err(to_store_error)?;
+                }
+            }
+            Some(index) => {
+                let unindexed = self
+                    .table
+                    .index_stats(&index.name)
+                    .await
+                    .map_err(to_store_error)?
+                    .map(|stats| stats.num_unindexed_rows)
+                    .unwrap_or(0);
+                if unindexed >= self.indexing.index_optimize_delta_threshold {
+                    self.table
+                        .optimize(OptimizeAction::Index(OptimizeOptions::default()))
+                        .await
+                        .map_err(to_store_error)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// IVF-HNSW-SQ index pinned to [`DISTANCE_TYPE`]. The metric is set
+    /// explicitly because the builder defaults to L2, which would silently
+    /// mismatch the Cosine queries this store issues.
+    fn vector_index(&self) -> Index {
+        Index::IvfHnswSq(IvfHnswSqIndexBuilder::default().distance_type(DISTANCE_TYPE))
+    }
+
+    async fn index_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .table
+            .list_indices()
+            .await
+            .map_err(to_store_error)?
+            .into_iter()
+            .map(|index| index.name)
+            .collect())
     }
 
     async fn doc_count(&self) -> Result<usize> {
@@ -983,5 +1150,114 @@ mod tests {
             .expect("query doc");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "a");
+    }
+
+    fn indexed_store(dir: &TempDir, index_build_threshold: usize) -> LanceDbStore {
+        LanceDbStore::open_with_indexing(
+            dir.path(),
+            4,
+            IndexingConfig {
+                index_build_threshold,
+                index_optimize_delta_threshold: 1,
+            },
+        )
+        .expect("create lancedb store")
+    }
+
+    fn spread_doc(i: usize) -> Document {
+        let angle = i as f32 * 0.013;
+        doc(
+            &format!("doc-{i}"),
+            "corpus.txt",
+            "token",
+            vec![angle.cos(), angle.sin(), 0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn test_indexing_config_from_options() {
+        let mut table = toml::value::Table::new();
+        table.insert("index_build_threshold".into(), toml::Value::Integer(50));
+        table.insert(
+            "index_optimize_delta_threshold".into(),
+            toml::Value::Integer(2000),
+        );
+        let config = IndexingConfig::from_options(Some(&toml::Value::Table(table)))
+            .expect("parse indexing options");
+        assert_eq!(config.index_build_threshold, 50);
+        assert_eq!(config.index_optimize_delta_threshold, 2000);
+
+        let defaults = IndexingConfig::from_options(None).expect("defaults");
+        assert_eq!(
+            defaults.index_build_threshold,
+            DEFAULT_INDEX_BUILD_THRESHOLD
+        );
+        assert_eq!(
+            defaults.index_optimize_delta_threshold,
+            DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_indexing_config_rejects_zero() {
+        let mut table = toml::value::Table::new();
+        table.insert("index_build_threshold".into(), toml::Value::Integer(0));
+        assert!(IndexingConfig::from_options(Some(&toml::Value::Table(table))).is_err());
+    }
+
+    #[test]
+    fn test_no_index_built_below_threshold() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = indexed_store(&dir, 1000);
+        let docs: Vec<_> = (0..50).map(spread_doc).collect();
+        store.upsert(&docs).expect("upsert docs");
+        store.flush().expect("flush");
+        assert!(
+            store.index_names().expect("list indices").is_empty(),
+            "no ANN index should exist below the row threshold"
+        );
+    }
+
+    #[test]
+    fn test_index_built_above_threshold_and_query_still_accurate() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = indexed_store(&dir, 256);
+        let docs: Vec<_> = (0..300).map(spread_doc).collect();
+        store.upsert(&docs).expect("upsert docs");
+        store.flush().expect("flush builds index");
+
+        assert!(
+            !store.index_names().expect("list indices").is_empty(),
+            "ANN index should be built once the threshold is crossed"
+        );
+
+        // The nearest vector to doc-0's embedding is doc-0 itself. A Cosine-built
+        // index queried with Cosine must return it first; an L2/Cosine mismatch
+        // would scramble this ranking.
+        let target = spread_doc(0).embedding;
+        let hits = store.query(&target, None, 1).expect("query");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-0");
+        assert!(hits[0].score > 0.99);
+    }
+
+    #[test]
+    fn test_rows_added_after_index_remain_searchable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = indexed_store(&dir, 256);
+        let docs: Vec<_> = (0..300).map(spread_doc).collect();
+        store.upsert(&docs).expect("upsert initial docs");
+        store.flush().expect("flush builds index");
+
+        store
+            .upsert(&[doc("late", "corpus.txt", "token", vec![0.0, 0.0, 1.0, 0.0])])
+            .expect("upsert late doc");
+        store.flush().expect("flush folds delta");
+
+        let hits = store
+            .query(&[0.0, 0.0, 1.0, 0.0], None, 1)
+            .expect("query late doc");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "late");
     }
 }

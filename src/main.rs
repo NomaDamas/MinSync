@@ -40,7 +40,11 @@ async fn run(
     minsync_dir: std::path::PathBuf,
 ) -> minsync::error::Result<()> {
     match cli.command {
-        Commands::Init { force, embedder, chunker } => {
+        Commands::Init {
+            force,
+            embedder,
+            chunker,
+        } => {
             let ms = MinSync::new(root);
             let config = ms.init(force, &embedder, &chunker)?;
             match cli.format {

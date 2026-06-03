@@ -30,10 +30,29 @@ MinSync scans your directory, detects file changes via manifest comparison (mtim
 
 State lives in `.minsync/`. Delete it to start fresh.
 
-### Vector stores
+### Vector store
 
-- **`json`** (default): local JSON file, brute-force cosine similarity.
-- **`lancedb`** (optional): embedded LanceDB. Set `vectorstore.id = "lancedb"` and `[vectorstore.options] dimension = 1536` in `.minsync/config.toml`. The LanceDB build vendors `protoc` automatically (needs a C compiler, standard with rustup).
+MinSync stores vectors in an embedded [LanceDB](https://github.com/lancedb/lancedb) database (`vectorstore.id = "lancedb"`, the default). The LanceDB build vendors `protoc` automatically (needs a C compiler, standard with rustup).
+
+Set the embedding dimension to match your embedder in `.minsync/config.toml`:
+
+```toml
+[vectorstore]
+id = "lancedb"
+[vectorstore.options]
+dimension = 1536   # openai:text-embedding-3-small; use 384 for e5-small, 1024 for bge-m3
+```
+
+**ANN indexing.** A fresh table is searched by exhaustive flat scan (exact, 100% recall, but O(n)). Once a table grows past `index_build_threshold` chunks (default 256), MinSync builds an IVF-HNSW-SQ approximate-nearest-neighbour index — pinned to cosine distance to match query time — on the next `sync`/`flush`, so similarity search is accelerated. Newly synced chunks are immediately searchable via LanceDB's combined indexed + flat-over-delta search; once the unindexed delta reaches `index_optimize_delta_threshold` (default 10,000) MinSync folds it into the existing index incrementally (no full rebuild, no k-means retrain). No manual step is required.
+
+These two thresholds are independent tuning knobs, **not** a min/max pair and **not** capacity limits — any number of vectors can be stored and searched. `index_build_threshold` gates the one-time index build (compared against total rows); `index_optimize_delta_threshold` gates each incremental optimize (compared against the unindexed delta only). Override them in `.minsync/config.toml`:
+
+```toml
+[vectorstore.options]
+dimension = 1536
+index_build_threshold = 256              # build the ANN index once total rows hit this
+index_optimize_delta_threshold = 50000   # raise to optimize less often; lower for tighter query latency
+```
 
 ## Local embeddings (no OpenAI) — Hugging Face TEI
 
@@ -71,7 +90,7 @@ passage_prefix = "passage: "
 
 ### 3. LanceDB dimension note
 
-`intfloat/multilingual-e5-small` produces 384-dimensional vectors. If you're using the LanceDB vector store, set the dimension explicitly:
+`intfloat/multilingual-e5-small` produces 384-dimensional vectors. Set the dimension to match the embedder:
 
 ```toml
 [vectorstore]
@@ -79,8 +98,6 @@ id = "lancedb"
 [vectorstore.options]
 dimension = 384
 ```
-
-The default `json` store doesn't require a dimension setting.
 
 ### 4. Run normally
 

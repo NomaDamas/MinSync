@@ -39,7 +39,7 @@ pub async fn query(
         }
     }
 
-    let filter = Filter::And(filters.drain(..).collect());
+    let filter = Filter::And(std::mem::take(&mut filters));
     let hits = store.query(&query_vec, Some(&filter), k)?;
 
     Ok(hits

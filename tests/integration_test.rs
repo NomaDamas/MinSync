@@ -1,6 +1,6 @@
 use minsync::chunker::chonkie::ChonkieChunker;
-use minsync::chunker::recursive::RecursiveChunker;
 use minsync::chunker::create_chunker;
+use minsync::chunker::recursive::RecursiveChunker;
 use minsync::config::Config;
 use minsync::embedder::tei::TeiEmbedder;
 use minsync::embedder::Embedder;
@@ -445,7 +445,10 @@ fn test_watch_should_index_integration() {
     assert!(should_index(&root.join("doc.md"), &minsync_dir));
     assert!(should_index(&root.join("notes.txt"), &minsync_dir));
     assert!(!should_index(&root.join("image.png"), &minsync_dir));
-    assert!(!should_index(&minsync_dir.join("manifest.json"), &minsync_dir));
+    assert!(!should_index(
+        &minsync_dir.join("manifest.json"),
+        &minsync_dir
+    ));
     assert!(!should_index(&minsync_dir.join("nested.md"), &minsync_dir));
 }
 
@@ -479,8 +482,7 @@ async fn test_tei_embedder_passage_and_query_prefixes() {
         .and(path("/embed"))
         .and(body_string_contains("passage: "))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!([[1.0, 0.0, 0.0, 0.0]])),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([[1.0, 0.0, 0.0, 0.0]])),
         )
         .mount(&server)
         .await;
@@ -489,8 +491,7 @@ async fn test_tei_embedder_passage_and_query_prefixes() {
         .and(path("/embed"))
         .and(body_string_contains("query: "))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!([[0.0, 1.0, 0.0, 0.0]])),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([[0.0, 1.0, 0.0, 0.0]])),
         )
         .mount(&server)
         .await;

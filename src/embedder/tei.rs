@@ -151,10 +151,9 @@ mod tests {
                 "normalize": true,
                 "truncate": null
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                [0.1, 0.2, 0.3],
-                [0.4, 0.5, 0.6]
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])),
+            )
             .mount(&server)
             .await;
 
@@ -315,7 +314,11 @@ mod tests {
 
     #[test]
     fn test_id_strips_tei_prefix() {
-        let embedder = TeiEmbedder::new("tei:intfloat/multilingual-e5-small", "http://localhost:8080", 1);
+        let embedder = TeiEmbedder::new(
+            "tei:intfloat/multilingual-e5-small",
+            "http://localhost:8080",
+            1,
+        );
 
         assert_eq!(embedder.id(), "intfloat/multilingual-e5-small");
     }

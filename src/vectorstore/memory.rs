@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::vectorstore::json_store::{cosine_similarity, matches_filter};
+use crate::vectorstore::similarity::{cosine_similarity, matches_filter};
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, VectorStore};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
