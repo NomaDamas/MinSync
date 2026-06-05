@@ -31,7 +31,7 @@ futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 lzma-sys = { version = "*", features = ["static"] }
 
-[build-dependencies]
+[target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"
 
 [dev-dependencies]
