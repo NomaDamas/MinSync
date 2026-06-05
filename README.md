@@ -32,7 +32,7 @@ State lives in `.minsync/`. Delete it to start fresh.
 
 ### Vector store
 
-MinSync stores vectors in an embedded [LanceDB](https://github.com/lancedb/lancedb) database (`vectorstore.id = "lancedb"`, the default). The LanceDB build vendors `protoc` automatically (needs a C compiler, standard with rustup).
+MinSync stores vectors in an embedded [LanceDB](https://github.com/lancedb/lancedb) database (`vectorstore.id = "lancedb"`, the default). MinSync vendors `protoc` through `protobuf-src` for its own build script on non-Windows targets; Windows builds and LanceDB's dependency build scripts need a `protoc` binary available on `PATH`.
 
 Set the embedding dimension to match your embedder in `.minsync/config.toml`:
 
@@ -128,10 +128,10 @@ target/
 ## Development
 
 CI assumes the standard GitHub-hosted runners on Ubuntu, macOS, and Windows, with Rust 1.91 installed through rustup.
-The build also expects a working C compiler toolchain, vendored protoc from protobuf-src, LanceDB native dependencies built on CI, and no secrets for normal CI runs.
+The build also expects a working C compiler toolchain, vendored protoc from protobuf-src for MinSync's non-Windows build script, setup-protoc for Windows and LanceDB dependency build scripts, LanceDB native dependencies built on CI, and no secrets for normal CI runs.
 
 ```bash
-cargo test            # 140 tests
+cargo test            # full test suite
 cargo clippy          # lint
 cargo fmt             # format
 ```

@@ -91,6 +91,7 @@ impl FileLock {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
+            .read(true)
             .write(true)
             .open(path)?;
 
@@ -140,7 +141,7 @@ fn atomic_write_json<T: Serialize>(value: &T, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::io::{Read, Seek, SeekFrom};
 
     fn cursor() -> Cursor {
         Cursor {
@@ -252,9 +253,13 @@ mod tests {
     fn test_filelock_writes_pid() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("lock");
-        let _lock = FileLock::acquire(&path, false).expect("acquire lock");
+        let lock = FileLock::acquire(&path, false).expect("acquire lock");
 
-        let content = fs::read_to_string(&path).expect("read lock content");
+        let mut content = String::new();
+        let mut file = &lock.file;
+        file.seek(SeekFrom::Start(0)).expect("seek lock content");
+        file.read_to_string(&mut content)
+            .expect("read lock content");
 
         assert_eq!(content, std::process::id().to_string());
     }

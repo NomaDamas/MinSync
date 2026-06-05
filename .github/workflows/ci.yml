@@ -33,6 +33,10 @@ jobs:
           toolchain: 1.91.0
           components: rustfmt, clippy
 
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo fmt --all -- --check
