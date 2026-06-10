@@ -104,7 +104,12 @@ async fn run(
                         println!("  chunks added:    {}", result.chunks_added);
                         println!("  chunks updated:  {}", result.chunks_updated);
                         println!("  chunks deleted:  {}", result.chunks_deleted);
-                        println!("  elapsed:         {:.2}s", result.elapsed_seconds);
+                        println!();
+                        println!("Sync Stats");
+                        println!("  elapsed time:        {:.2}s", result.elapsed_seconds);
+                        println!("  embedding API calls: {}", result.embedding_api_calls);
+                        println!("  embedded texts:      {}", result.embedded_texts);
+                        println!("  estimated tokens:    {}", result.estimated_tokens);
                     }
                 }
                 OutputFormat::Json => {

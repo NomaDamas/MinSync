@@ -264,6 +264,46 @@ async fn test_sync_already_up_to_date() {
 }
 
 #[tokio::test]
+async fn test_sync_reports_embedding_stats() {
+    let (dir, sync, chunker, embedder, mut store) = fixture();
+    write_file(&dir, "a.txt", "alpha beta gamma");
+    write_file(&dir, "b.txt", "delta epsilon zeta");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
+
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("full sync succeeds");
+
+    assert!(result.embedding_api_calls > 0);
+    assert_eq!(result.embedded_texts, result.chunks_added);
+    assert!(result.estimated_tokens > 0);
+    assert!(result.elapsed_seconds >= 0.0);
+}
+
+#[tokio::test]
+async fn test_sync_stats_zeroed_when_up_to_date() {
+    let (dir, sync, chunker, embedder, mut store) = fixture();
+    write_file(&dir, "a.txt", "alpha beta gamma");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
+    sync.sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("initial sync succeeds");
+
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("second sync succeeds");
+
+    assert!(result.already_up_to_date);
+    assert_eq!(result.embedding_api_calls, 0);
+    assert_eq!(result.embedded_texts, 0);
+    assert_eq!(result.estimated_tokens, 0);
+}
+
+#[tokio::test]
 async fn test_sync_crash_recovery_removes_stale_transaction() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
