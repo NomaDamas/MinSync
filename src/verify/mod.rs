@@ -1,90 +1,27 @@
+//! Index consistency verification.
+//!
+//! Module layout: [`status`](mod@status) reports sync state, [`health`]
+//! checks the environment, [`sampling`] recomputes expected doc IDs, and
+//! this file orchestrates `minsync verify` (basic checks + stale repair).
+
+mod health;
+mod sampling;
+mod status;
+
+pub use health::check;
+pub use status::status;
+
 use crate::chunker::Chunker;
 use crate::config::Config;
-use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
-use crate::id::{compute_doc_id, content_hash};
 use crate::manifest::Manifest;
-use crate::normalize::normalize_text;
 use crate::state::Cursor;
-use crate::types::{CheckResult, StatusResult, SyncState, VerifyResult};
+use crate::types::VerifyResult;
 use crate::vectorstore::{Filter, VectorStore};
+use sampling::{expected_doc_ids, sample_paths};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
-
-pub async fn status(minsync_dir: &Path) -> Result<StatusResult> {
-    let config_path = minsync_dir.join("config.toml");
-    if !config_path.exists() {
-        return Err(MinSyncError::NotInitialized);
-    }
-
-    let config = Config::load(&config_path)?;
-    let cursor_path = minsync_dir.join("cursor.json");
-    let txn_path = minsync_dir.join("txn.json");
-
-    if !cursor_path.exists() {
-        return Ok(status_result(&config, None, SyncState::NotSynced, None));
-    }
-
-    let cursor = Cursor::load(&cursor_path)?;
-    if txn_path.exists() {
-        return Ok(status_result(
-            &config,
-            Some(&cursor),
-            SyncState::Interrupted,
-            Some(cursor.manifest_hash.clone()),
-        ));
-    }
-
-    let manifest_hash = load_or_scan_manifest(minsync_dir, &config)?.manifest_hash();
-    let state = if manifest_hash == cursor.manifest_hash {
-        SyncState::UpToDate
-    } else {
-        SyncState::OutOfDate
-    };
-
-    Ok(status_result(
-        &config,
-        Some(&cursor),
-        state,
-        Some(manifest_hash),
-    ))
-}
-
-pub async fn check(
-    minsync_dir: &Path,
-    embedder: &dyn Embedder,
-    store: &dyn VectorStore,
-) -> Result<CheckResult> {
-    if !minsync_dir.join("config.toml").exists() {
-        return Err(MinSyncError::NotInitialized);
-    }
-
-    let mut errors = Vec::new();
-    let embedder_ok = match embedder.embed_single("hello").await {
-        Ok(vector) if vector.is_empty() => {
-            errors.push("embedder returned empty embedding".to_string());
-            false
-        }
-        Ok(_) => true,
-        Err(error) => {
-            errors.push(format!("embedder check failed: {error}"));
-            false
-        }
-    };
-
-    let vectorstore_ok = {
-        let _ = store.doc_count();
-        true
-    };
-
-    Ok(CheckResult {
-        embedder_ok,
-        vectorstore_ok,
-        all_passed: embedder_ok && vectorstore_ok && errors.is_empty(),
-        errors,
-    })
-}
 
 pub async fn verify(
     minsync_dir: &Path,
@@ -119,34 +56,21 @@ pub async fn verify(
     );
 
     let manifest = Manifest::scan(root, &config.source_id)?;
-    let manifest_paths: HashSet<_> = manifest.files.keys().cloned().collect();
-    let store_paths = store.all_paths();
-    let stale_paths: Vec<_> = store_paths
-        .iter()
-        .filter(|path| !manifest_paths.contains(*path))
-        .cloned()
-        .collect();
-    let stale_clean = stale_paths.is_empty();
-    basic_checks.insert("no_stale_paths".to_string(), stale_clean);
+    let stale_paths = find_stale_paths(&manifest, store);
+    basic_checks.insert("no_stale_paths".to_string(), stale_paths.is_empty());
 
-    let mut fixed = false;
-    if fix {
-        for path in &stale_paths {
-            let deleted = store.delete_by_filter(&Filter::And(vec![
-                Filter::Eq("source_id".to_string(), config.source_id.clone()),
-                Filter::Eq("path".to_string(), path.clone()),
-            ]))?;
-            fixed |= deleted > 0;
-        }
-        if fixed {
-            store.flush()?;
+    let fixed = if fix {
+        let repaired = repair_stale_paths(store, &config, &stale_paths)?;
+        if repaired {
             basic_checks.insert("no_stale_paths".to_string(), true);
         }
-    }
+        repaired
+    } else {
+        false
+    };
 
-    let sample_paths = sample_paths(&manifest, sample);
     let mut sample_ok = true;
-    for path in sample_paths {
+    for path in sample_paths(&manifest, sample) {
         let expected_ids = expected_doc_ids(root, &path, &config, chunker)?;
         let fetched = store.fetch(&expected_ids)?;
         if fetched.len() != expected_ids.len() {
@@ -168,82 +92,47 @@ pub async fn verify(
     })
 }
 
-fn status_result(
-    config: &Config,
-    cursor: Option<&Cursor>,
-    state: SyncState,
-    manifest_hash: Option<String>,
-) -> StatusResult {
-    StatusResult {
-        source_id: config.source_id.clone(),
-        collection: config.collection.name.clone(),
-        chunker: config.chunker.id.clone(),
-        embedder: config.embedder.id.clone(),
-        vectorstore: config.vectorstore.id.clone(),
-        last_synced_at: cursor.map(|active_cursor| active_cursor.last_synced_at.clone()),
-        state,
-        manifest_hash,
-    }
-}
-
-fn load_or_scan_manifest(minsync_dir: &Path, config: &Config) -> Result<Manifest> {
-    if let Some(root) = minsync_dir.parent() {
-        return Manifest::scan(root, &config.source_id);
-    }
-
-    Manifest::load(&minsync_dir.join("manifest.json"))
-}
-
-fn sample_paths(manifest: &Manifest, sample: Option<usize>) -> Vec<String> {
-    let mut paths: Vec<_> = manifest.files.keys().cloned().collect();
-    paths.sort();
-    if let Some(limit) = sample {
-        paths.truncate(limit);
-    }
-    paths
-}
-
-fn expected_doc_ids(
-    root: &Path,
-    path: &str,
-    config: &Config,
-    chunker: &dyn Chunker,
-) -> Result<Vec<String>> {
-    let raw_text = match std::fs::read_to_string(root.join(path)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::InvalidData => String::new(),
-        Err(error) => return Err(MinSyncError::Io(error)),
-    };
-    let text = normalize_text(&raw_text, &config.normalize);
-    let chunks = chunker.chunk(&text, path)?;
-    let mut dup_counter: HashMap<String, usize> = HashMap::new();
-
-    Ok(chunks
+/// Paths present in the store but absent from the manifest (deleted or
+/// newly ignored files whose chunks were never swept).
+fn find_stale_paths(manifest: &Manifest, store: &dyn VectorStore) -> Vec<String> {
+    let manifest_paths: HashSet<_> = manifest.files.keys().cloned().collect();
+    store
+        .all_paths()
         .into_iter()
-        .map(|chunk| {
-            let chunk_content_hash = content_hash(&chunk.text);
-            let dup_key = format!("{}\0{}", chunk_content_hash, chunk.heading_path);
-            let dup_index = dup_counter.entry(dup_key).or_insert(0);
-            let doc_id = compute_doc_id(
-                &config.source_id,
-                path,
-                chunker.schema_id(),
-                &chunk.chunk_type,
-                &chunk_content_hash,
-                *dup_index,
-            );
-            *dup_index += 1;
-            doc_id
-        })
-        .collect())
+        .filter(|path| !manifest_paths.contains(path))
+        .collect()
+}
+
+/// Delete all chunks for the given stale paths. Returns true when anything
+/// was actually deleted (and flushed).
+fn repair_stale_paths(
+    store: &mut dyn VectorStore,
+    config: &Config,
+    stale_paths: &[String],
+) -> Result<bool> {
+    let mut fixed = false;
+    for path in stale_paths {
+        let deleted = store.delete_by_filter(&Filter::And(vec![
+            Filter::Eq("source_id".to_string(), config.source_id.clone()),
+            Filter::Eq("path".to_string(), path.clone()),
+        ]))?;
+        fixed |= deleted > 0;
+    }
+    if fixed {
+        store.flush()?;
+    }
+    Ok(fixed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chunker::chonkie::ChonkieChunker;
+    use crate::embedder::Embedder;
+    use crate::id::content_hash;
     use crate::state::Transaction;
     use crate::sync::MinSync;
+    use crate::types::SyncState;
     use crate::vectorstore::memory::InMemoryStore;
     use crate::vectorstore::Document;
     use async_trait::async_trait;
