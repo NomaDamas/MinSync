@@ -304,6 +304,56 @@ async fn test_sync_stats_zeroed_when_up_to_date() {
 }
 
 #[tokio::test]
+async fn test_cdc_chunker_limits_reembedding_after_top_insertion() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = minsync::chunker::cdc::CdcChunker::new(32, 64, 128);
+    let embedder = MockEmbedder;
+    let mut store = InMemoryStore::new();
+
+    let original: String = (0..200)
+        .map(|i| format!("{i} {}\n", minsync::id::content_hash(&i.to_string())))
+        .collect();
+    write_file(&dir, "big.txt", &original);
+    sync.init(false, "openai:text-embedding-3-small", "cdc")
+        .expect("init succeeds");
+
+    let first = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("first sync succeeds");
+    assert!(
+        first.embedded_texts > 20,
+        "expected many chunks on first sync, got {}",
+        first.embedded_texts
+    );
+
+    let edited = {
+        let mut lines: Vec<&str> = original.lines().collect();
+        lines.insert(1, "INSERTED LINE near the top");
+        format!("{}\n", lines.join("\n"))
+    };
+    write_file(&dir, "big.txt", &edited);
+
+    let second = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("second sync succeeds");
+
+    assert_eq!(second.files_processed_paths, vec!["big.txt"]);
+    assert!(
+        second.chunks_updated > 0,
+        "downstream chunks should be skipped (metadata-only update)"
+    );
+    assert!(
+        second.embedded_texts * 5 <= first.embedded_texts,
+        "a top insertion should re-embed only a small fraction: first={} second={}",
+        first.embedded_texts,
+        second.embedded_texts
+    );
+}
+
+#[tokio::test]
 async fn test_sync_crash_recovery_removes_stale_transaction() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");

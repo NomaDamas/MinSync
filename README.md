@@ -30,6 +30,16 @@ MinSync scans your directory, detects file changes via manifest comparison (mtim
 
 State lives in `.minsync/`. Delete it to start fresh.
 
+### Chunkers
+
+| id | Strategy | Boundary stability under edits |
+|---|---|---|
+| `recursive` (default) | paragraph→sentence→line splits merged to a size budget | an edit near the top of a file can shift every downstream boundary |
+| `chonkie` | delimiter/size-based chonkie-core chunking | same drift caveat as `recursive` |
+| `cdc` | content-defined chunking (FastCDC-style gear rolling hash) | boundaries are chosen by content, so a small edit only re-embeds the touched chunk(s) |
+
+Select at init time (`minsync init --chunker cdc`) or via `chunker.id` in `.minsync/config.toml`. `cdc` derives its size window from `chunker.options.max_chunk_size` (max = `max_chunk_size`, average = half, minimum = an eighth). Prefer it for large, frequently edited files where re-embedding cost matters; prefer `recursive` when chunks should align with sentence/paragraph semantics. Switching the chunker changes the chunk schema, so run `minsync sync --full` afterwards.
+
 ### Vector store
 
 MinSync stores vectors in an embedded [LanceDB](https://github.com/lancedb/lancedb) database (`vectorstore.id = "lancedb"`, the default). MinSync vendors `protoc` through `protobuf-src` for its own build script on non-Windows targets; Windows builds and LanceDB's dependency build scripts need a `protoc` binary available on `PATH`.

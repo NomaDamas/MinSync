@@ -1,3 +1,4 @@
+pub mod cdc;
 pub mod chonkie;
 pub mod recursive;
 
@@ -23,6 +24,9 @@ pub fn create_chunker(config: &Config) -> Result<Box<dyn Chunker>> {
         "chonkie" => Ok(Box::new(chonkie::ChonkieChunker::from_config(
             &config.chunker.options,
         ))),
+        "cdc" => Ok(Box::new(cdc::CdcChunker::from_config(
+            &config.chunker.options,
+        ))),
         other => Err(MinSyncError::Config(format!("unknown chunker id: {other}"))),
     }
 }
@@ -45,6 +49,14 @@ mod factory_tests {
         config.chunker.id = "chonkie".to_string();
         let chunker = create_chunker(&config).expect("create chonkie chunker");
         assert_eq!(chunker.schema_id(), "chonkie");
+    }
+
+    #[test]
+    fn test_create_chunker_cdc() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.chunker.id = "cdc".to_string();
+        let chunker = create_chunker(&config).expect("create cdc chunker");
+        assert_eq!(chunker.schema_id(), "cdc");
     }
 
     #[test]
