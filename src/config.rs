@@ -61,6 +61,8 @@ pub struct EmbedderConfig {
     pub max_concurrent: usize,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -79,6 +81,10 @@ fn default_max_concurrent() -> usize {
 
 fn default_max_retries() -> usize {
     3
+}
+
+fn default_timeout_seconds() -> u64 {
+    60
 }
 
 /// For `vectorstore.id = "lancedb"`, `options.dimension` sets the embedding
@@ -147,6 +153,7 @@ impl Config {
                 batch_size: default_batch_size(),
                 max_concurrent: default_max_concurrent(),
                 max_retries: default_max_retries(),
+                timeout_seconds: default_timeout_seconds(),
                 base_url: None,
                 query_prefix: None,
                 passage_prefix: None,
@@ -204,6 +211,7 @@ mod tests {
         assert_eq!(config.embedder.batch_size, 64);
         assert_eq!(config.embedder.max_concurrent, 1);
         assert_eq!(config.embedder.max_retries, 3);
+        assert_eq!(config.embedder.timeout_seconds, 60);
         assert_eq!(config.embedder.base_url, None);
         assert_eq!(config.embedder.query_prefix, None);
         assert_eq!(config.embedder.passage_prefix, None);
@@ -259,6 +267,7 @@ id = "custom_embedder"
 batch_size = 8
 max_concurrent = 4
 max_retries = 9
+timeout_seconds = 5
 base_url = "http://localhost:8080"
 query_prefix = "query: "
 passage_prefix = "passage: "
@@ -290,6 +299,7 @@ strip_frontmatter = true
         assert_eq!(config.embedder.batch_size, 8);
         assert_eq!(config.embedder.max_concurrent, 4);
         assert_eq!(config.embedder.max_retries, 9);
+        assert_eq!(config.embedder.timeout_seconds, 5);
         assert_eq!(
             config.embedder.base_url.as_deref(),
             Some("http://localhost:8080")

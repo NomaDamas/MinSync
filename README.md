@@ -64,6 +64,21 @@ index_build_threshold = 256              # build the ANN index once total rows h
 index_optimize_delta_threshold = 50000   # raise to optimize less often; lower for tighter query latency
 ```
 
+## Embedding network reliability
+
+Embedding requests (OpenAI and TEI) use a bounded per-request timeout and are retried with exponential backoff plus jitter when the failure is transient: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures — invalid auth, 4xx validation errors, malformed responses — fail immediately. A failed sync never advances the cursor or manifest, so the next `minsync sync` picks up exactly where it left off.
+
+Tune the knobs in `.minsync/config.toml`:
+
+```toml
+[embedder]
+max_retries = 3       # retries after the first attempt (total attempts = max_retries + 1)
+timeout_seconds = 60  # per-request HTTP timeout
+max_concurrent = 1    # concurrent batch requests within one sync embedding call
+```
+
+`base_url` also applies to `openai:` embedders, for OpenAI-compatible proxies/gateways.
+
 ## Local embeddings (no OpenAI) — Hugging Face TEI
 
 You can run MinSync entirely offline using a local [Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) server. No `OPENAI_API_KEY` needed.

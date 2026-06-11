@@ -1,14 +1,28 @@
+use crate::embedder::retry::{classify_send_error, classify_status, RequestError, RetryPolicy};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OpenAiEmbedder {
     model: String,
     api_key: String,
     batch_size: usize,
+    max_concurrent: usize,
+    retry: RetryPolicy,
     client: reqwest::Client,
     base_url: String,
+}
+
+pub(crate) fn build_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default()
 }
 
 #[derive(Serialize)]
@@ -37,7 +51,9 @@ impl OpenAiEmbedder {
             model: model.to_string(),
             api_key: api_key.to_string(),
             batch_size,
-            client: reqwest::Client::new(),
+            max_concurrent: 1,
+            retry: RetryPolicy::default(),
+            client: build_client(DEFAULT_REQUEST_TIMEOUT),
             base_url: "https://api.openai.com".to_string(),
         }
     }
@@ -45,6 +61,63 @@ impl OpenAiEmbedder {
     pub fn with_base_url(mut self, url: &str) -> Self {
         self.base_url = url.to_string();
         self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = build_client(timeout);
+        self
+    }
+
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.retry.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_backoff(mut self, base_delay: Duration, max_delay: Duration) -> Self {
+        self.retry.base_delay = base_delay;
+        self.retry.max_delay = max_delay;
+        self
+    }
+
+    pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
+        self.max_concurrent = max_concurrent.max(1);
+        self
+    }
+
+    async fn embed_batch(&self, batch: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.retry
+            .run(|| async {
+                let request = EmbedRequest {
+                    input: batch.clone(),
+                    model: self.model.clone(),
+                };
+
+                let response = self
+                    .client
+                    .post(format!("{}/v1/embeddings", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|error| classify_send_error(&error, "OpenAI"))?;
+
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(classify_status(status, "OpenAI", &body));
+                }
+
+                let embed_response: EmbedResponse = response.json().await.map_err(|error| {
+                    RequestError::Fatal(format!("OpenAI malformed response: {error}"))
+                })?;
+
+                Ok(embed_response
+                    .data
+                    .into_iter()
+                    .map(|data| data.embedding)
+                    .collect())
+            })
+            .await
     }
 
     pub fn from_env(model: &str, batch_size: usize) -> Result<Self> {
@@ -71,42 +144,20 @@ impl Embedder for OpenAiEmbedder {
             ));
         }
 
+        let batches: Vec<Vec<String>> = texts
+            .chunks(self.batch_size)
+            .map(|batch| batch.to_vec())
+            .collect();
+        let batch_results: Vec<Result<Vec<Vec<f32>>>> =
+            futures::stream::iter(batches.into_iter().map(|batch| self.embed_batch(batch)))
+                .buffered(self.max_concurrent)
+                .collect()
+                .await;
+
         let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for batch in texts.chunks(self.batch_size) {
-            let request = EmbedRequest {
-                input: batch.to_vec(),
-                model: self.model.clone(),
-            };
-
-            let response = self
-                .client
-                .post(format!("{}/v1/embeddings", self.base_url))
-                .bearer_auth(&self.api_key)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| MinSyncError::Embedding(e.to_string()))?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(MinSyncError::Embedding(format!(
-                    "OpenAI API error {}: {}",
-                    status, body
-                )));
-            }
-
-            let embed_response: EmbedResponse = response
-                .json()
-                .await
-                .map_err(|e| MinSyncError::Embedding(e.to_string()))?;
-
-            for data in embed_response.data {
-                all_embeddings.push(data.embedding);
-            }
+        for batch in batch_results {
+            all_embeddings.extend(batch?);
         }
-
         Ok(all_embeddings)
     }
 }
@@ -115,6 +166,7 @@ impl Embedder for OpenAiEmbedder {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -256,5 +308,171 @@ mod tests {
         let embedder = OpenAiEmbedder::new("text-embedding-3-small", "test-key", 10);
 
         assert_eq!(embedder.id(), "text-embedding-3-small");
+    }
+
+    fn fast_retry_embedder(url: &str, max_retries: usize) -> OpenAiEmbedder {
+        OpenAiEmbedder::new("text-embedding-3-small", "test-key", 10)
+            .with_base_url(url)
+            .with_max_retries(max_retries)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4))
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_503_then_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"embedding": [0.1, 0.2], "index": 0}],
+                "model": "text-embedding-3-small"
+            })))
+            .mount(&server)
+            .await;
+
+        let embedder = fast_retry_embedder(&server.uri(), 3);
+        let embeddings = embedder.embed(&["hello".to_string()]).await.unwrap();
+
+        assert_eq!(embeddings, vec![vec![0.1, 0.2]]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_429_then_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"embedding": [0.5], "index": 0}],
+                "model": "text-embedding-3-small"
+            })))
+            .mount(&server)
+            .await;
+
+        let embedder = fast_retry_embedder(&server.uri(), 2);
+        let embeddings = embedder.embed(&["hello".to_string()]).await.unwrap();
+
+        assert_eq!(embeddings, vec![vec![0.5]]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhaustion_on_503() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+
+        let embedder = fast_retry_embedder(&server.uri(), 1);
+        let error = embedder.embed(&["hello".to_string()]).await.unwrap_err();
+
+        assert!(error.to_string().contains("retries exhausted"));
+        assert!(error.to_string().contains("503"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fail_fast_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+
+        let embedder = fast_retry_embedder(&server.uri(), 3);
+        let error = embedder.embed(&["hello".to_string()]).await.unwrap_err();
+
+        assert!(error.to_string().contains("OpenAI API error 401"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_is_retried_then_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(500))
+                    .set_body_json(json!({"data": [], "model": "m"})),
+            )
+            .mount(&server)
+            .await;
+
+        let embedder =
+            fast_retry_embedder(&server.uri(), 1).with_timeout(Duration::from_millis(50));
+        let error = embedder.embed(&["hello".to_string()]).await.unwrap_err();
+
+        assert!(error.to_string().contains("retries exhausted"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_response_fails_fast() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let embedder = fast_retry_embedder(&server.uri(), 3);
+        let error = embedder.embed(&["hello".to_string()]).await.unwrap_err();
+
+        assert!(error.to_string().contains("malformed response"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_batches_run_in_parallel_and_keep_order() {
+        let server = MockServer::start().await;
+        for (text, value) in [("t-one", 0.1f32), ("t-two", 0.2), ("t-three", 0.3)] {
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .and(wiremock::matchers::body_string_contains(text))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(200))
+                        .set_body_json(json!({
+                            "data": [{"embedding": [value], "index": 0}],
+                            "model": "text-embedding-3-small"
+                        })),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let embedder = OpenAiEmbedder::new("text-embedding-3-small", "test-key", 1)
+            .with_base_url(&server.uri())
+            .with_max_concurrent(3);
+        let texts = vec![
+            "t-one".to_string(),
+            "t-two".to_string(),
+            "t-three".to_string(),
+        ];
+
+        let started = std::time::Instant::now();
+        let embeddings = embedder.embed(&texts).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(embeddings, vec![vec![0.1], vec![0.2], vec![0.3]]);
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "3 batches x 200ms should overlap with max_concurrent=3, took {elapsed:?}"
+        );
     }
 }
