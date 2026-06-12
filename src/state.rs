@@ -2,8 +2,8 @@ use crate::error::{MinSyncError, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,7 +28,6 @@ pub struct Transaction {
 
 pub struct FileLock {
     file: std::fs::File,
-    path: PathBuf,
 }
 
 impl Cursor {
@@ -90,7 +89,7 @@ impl FileLock {
 
         let file = std::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -103,21 +102,19 @@ impl FileLock {
                 .map_err(|_| MinSyncError::LockFailed)?;
         }
 
+        file.set_len(0)?;
         let mut f = &file;
+        f.seek(SeekFrom::Start(0))?;
         write!(f, "{}", std::process::id())?;
         f.flush()?;
 
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-        })
+        Ok(Self { file })
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -231,11 +228,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("lock");
 
-        let lock = FileLock::acquire(&path, false).expect("acquire lock");
-        assert!(path.exists());
-        drop(lock);
+        {
+            let lock = FileLock::acquire(&path, false).expect("acquire lock");
+            assert!(path.exists());
+            drop(lock);
+        }
 
-        assert!(!path.exists());
+        let _lock = FileLock::acquire(&path, false).expect("re-acquire lock");
     }
 
     #[test]

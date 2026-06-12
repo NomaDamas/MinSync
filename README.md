@@ -18,7 +18,7 @@ minsync init                          # initialize .minsync/
 minsync sync                          # index files (incremental)
 minsync sync --full                   # rebuild from scratch
 minsync query "search text" --k 5     # semantic search
-minsync watch                         # watch .md/.txt files and incrementally re-index on change
+minsync watch                         # watch files and incrementally re-index on change
 minsync status                        # sync state
 minsync check                         # health check
 minsync verify --fix                  # consistency check + repair

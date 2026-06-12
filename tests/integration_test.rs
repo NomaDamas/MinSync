@@ -534,12 +534,13 @@ fn test_watch_should_index_integration() {
 
     assert!(should_index(&root.join("doc.md"), &minsync_dir));
     assert!(should_index(&root.join("notes.txt"), &minsync_dir));
-    assert!(!should_index(&root.join("image.png"), &minsync_dir));
+    assert!(should_index(&root.join("image.png"), &minsync_dir));
     assert!(!should_index(
         &minsync_dir.join("manifest.json"),
         &minsync_dir
     ));
     assert!(!should_index(&minsync_dir.join("nested.md"), &minsync_dir));
+    assert!(!should_index(&root.join(".git/config"), &minsync_dir));
 }
 
 #[test]

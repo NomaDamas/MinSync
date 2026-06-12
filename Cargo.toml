@@ -29,7 +29,7 @@ arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
-lzma-sys = { version = "*", features = ["static"] }
+lzma-sys = { version = "0.1", features = ["static"] }
 
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"

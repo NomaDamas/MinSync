@@ -43,6 +43,14 @@ impl Manifest {
     }
 
     pub fn scan(root: &Path, source_id: &str) -> Result<Self> {
+        Self::scan_with_baseline(root, source_id, None)
+    }
+
+    pub fn scan_with_baseline(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+    ) -> Result<Self> {
         let mut manifest = Self::new(source_id);
         let walker = WalkBuilder::new(root)
             .add_custom_ignore_filename(".minsyncignore")
@@ -61,30 +69,37 @@ impl Manifest {
             }
 
             let path = entry.path();
-            let relative_path = path
-                .strip_prefix(root)
-                .map_err(|error| MinSyncError::Manifest(error.to_string()))?;
-            let manifest_path = relative_path.to_string_lossy().replace('\\', "/");
-            let content = fs::read(path)?;
             let metadata = fs::metadata(path)?;
             let modified = metadata.modified()?;
             let mtime_ns = modified
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| MinSyncError::Manifest(error.to_string()))?
                 .as_nanos();
+            let relative_path = path
+                .strip_prefix(root)
+                .map_err(|error| MinSyncError::Manifest(error.to_string()))?;
+            let manifest_path = relative_path.to_string_lossy().replace('\\', "/");
+            let content_hash = match baseline
+                .and_then(|manifest| manifest.files.get(&manifest_path))
+                .filter(|entry| entry.size == metadata.len() && entry.mtime_ns == mtime_ns)
+            {
+                Some(entry) => entry.content_hash.clone(),
+                None => hash_file(path)?,
+            };
 
             manifest.files.insert(
                 manifest_path,
                 ManifestFileEntry {
                     size: metadata.len(),
                     mtime_ns,
-                    content_hash: prefixed_sha256(&content),
+                    content_hash,
                 },
             );
         }
 
         Ok(manifest)
     }
+
 
     pub fn diff(old: &Manifest, new: &Manifest) -> Vec<FileChange> {
         let mut changes = Vec::new();
@@ -116,6 +131,8 @@ impl Manifest {
         let mut hasher = Sha256::new();
         for path in paths {
             if let Some(entry) = self.files.get(path) {
+                hasher.update(path.as_bytes());
+                hasher.update(b"\0");
                 hasher.update(entry.content_hash.as_bytes());
             }
         }
@@ -160,10 +177,18 @@ fn change_path(change: &FileChange) -> &str {
     }
 }
 
+#[cfg(test)]
 fn prefixed_sha256(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content);
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 #[cfg(test)]
@@ -221,6 +246,46 @@ mod tests {
         assert_eq!(
             manifest.files["c.txt"].content_hash,
             prefixed_sha256(b"gamma")
+        );
+    }
+
+    #[test]
+    fn test_scan_with_baseline_reuses_matching_metadata_hash() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "alpha").expect("write file");
+        let mut baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+        baseline
+            .files
+            .get_mut("a.txt")
+            .expect("baseline entry")
+            .content_hash = "sha256:baseline".to_string();
+
+        let manifest = Manifest::scan_with_baseline(dir.path(), "source-1", Some(&baseline))
+            .expect("scan with baseline");
+
+        assert_eq!(manifest.files["a.txt"].content_hash, "sha256:baseline");
+    }
+
+    #[test]
+    fn test_scan_with_baseline_rehashes_modified_size() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "alpha").expect("write file");
+        let mut baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+        baseline
+            .files
+            .get_mut("a.txt")
+            .expect("baseline entry")
+            .content_hash = "sha256:baseline".to_string();
+        fs::write(&path, "alpha beta").expect("modify file");
+
+        let manifest = Manifest::scan_with_baseline(dir.path(), "source-1", Some(&baseline))
+            .expect("scan with baseline");
+
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            prefixed_sha256(b"alpha beta")
         );
     }
 
@@ -347,6 +412,14 @@ mod tests {
     fn test_manifest_hash_different() {
         let first = manifest_with(&[("a.txt", "sha256:a")]);
         let second = manifest_with(&[("a.txt", "sha256:b")]);
+
+        assert_ne!(first.manifest_hash(), second.manifest_hash());
+    }
+
+    #[test]
+    fn test_manifest_hash_includes_path() {
+        let first = manifest_with(&[("a.txt", "sha256:same")]);
+        let second = manifest_with(&[("b.txt", "sha256:same")]);
 
         assert_ne!(first.manifest_hash(), second.manifest_hash());
     }

@@ -1,10 +1,9 @@
 //! File-watching incremental indexing.
 //!
 //! Watches the project tree with `notify-debouncer-full` (0.8.0-rc.2) and,
-//! whenever a relevant `.md`/`.txt` file changes, re-runs the existing
-//! incremental [`MinSync::sync`] pipeline. The watcher never builds its own
-//! indexing path — it merely decides *when* to ask `sync()` to re-diff the
-//! manifest.
+//! whenever a non-internal path changes, re-runs the existing incremental
+//! [`MinSync::sync`] pipeline. The watcher never builds its own indexing path —
+//! it merely decides *when* to ask `sync()` to re-diff the manifest.
 //!
 //! ## notify-debouncer-full 0.8.0-rc.2 API used
 //!
@@ -38,25 +37,19 @@ use crate::vectorstore::VectorStore;
 ///
 /// Pure function (no I/O):
 /// - returns `false` if `path` is inside `minsync_dir`,
-/// - returns `false` unless the lowercased extension is `md` or `txt`,
+/// - returns `false` if any path component equals `.git`,
 /// - returns `true` otherwise.
 pub fn should_index(path: &Path, minsync_dir: &Path) -> bool {
     if path.starts_with(minsync_dir) {
         return false;
     }
 
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => {
-            let ext = ext.to_ascii_lowercase();
-            ext == "md" || ext == "txt"
-        }
-        None => false,
-    }
+    !path.components().any(|component| component.as_os_str() == ".git")
 }
 
 /// Run the file-watch loop until Ctrl-C.
 ///
-/// On any relevant `.md`/`.txt` change (or a debouncer rescan signal), this
+/// On any non-internal path change (or a debouncer rescan signal), this
 /// re-runs [`MinSync::sync`] incrementally. The store borrow is held across the
 /// loop and `sync()` is called sequentially, so the `&mut dyn VectorStore`
 /// never overlaps an await of itself.
@@ -81,7 +74,7 @@ pub async fn run(
             MinSyncError::Other(format!("failed to watch {}: {error}", root.display()))
         })?;
 
-    tracing::info!("Watching {} for .md/.txt changes", root.display());
+    tracing::info!("Watching {} for indexable changes", root.display());
 
     let sync = MinSync::new(root.clone());
 
@@ -174,18 +167,13 @@ mod tests {
     }
 
     #[test]
-    fn test_should_index_accepts_md_and_txt() {
+    fn test_should_index_accepts_all_non_internal_paths() {
         let dir = minsync_dir();
         assert!(should_index(&root().join("a.md"), &dir));
         assert!(should_index(&root().join("b.txt"), &dir));
-    }
-
-    #[test]
-    fn test_should_index_rejects_other_ext() {
-        let dir = minsync_dir();
-        assert!(!should_index(&root().join("c.png"), &dir));
-        assert!(!should_index(&root().join("d.rs"), &dir));
-        assert!(!should_index(&root().join("e"), &dir));
+        assert!(should_index(&root().join("c.png"), &dir));
+        assert!(should_index(&root().join("d.rs"), &dir));
+        assert!(should_index(&root().join("e"), &dir));
     }
 
     #[test]
@@ -196,9 +184,9 @@ mod tests {
     }
 
     #[test]
-    fn test_should_index_case_insensitive_ext() {
+    fn test_should_index_rejects_git_component() {
         let dir = minsync_dir();
-        assert!(should_index(&root().join("A.MD"), &dir));
-        assert!(should_index(&root().join("B.TXT"), &dir));
+        assert!(!should_index(&root().join(".git/config"), &dir));
+        assert!(!should_index(&root().join("nested/.git/index"), &dir));
     }
 }

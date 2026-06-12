@@ -72,12 +72,20 @@ impl MinSync {
             Transaction::remove(&txn_path)?;
         }
 
-        let old_manifest = if full || !manifest_path.exists() {
+        let stored_manifest = if manifest_path.exists() {
+            Some(Manifest::load(&manifest_path)?)
+        } else {
+            None
+        };
+        let old_manifest = if full {
             Manifest::new(&config.source_id)
         } else {
-            Manifest::load(&manifest_path)?
+            stored_manifest
+                .clone()
+                .unwrap_or_else(|| Manifest::new(&config.source_id))
         };
-        let new_manifest = Manifest::scan(&self.root, &config.source_id)?;
+        let scan_baseline = if full { None } else { stored_manifest.as_ref() };
+        let new_manifest = Manifest::scan_with_baseline(&self.root, &config.source_id, scan_baseline)?;
         let changes = Manifest::diff(&old_manifest, &new_manifest);
 
         if changes.is_empty() && !full {
@@ -130,6 +138,13 @@ impl MinSync {
             }
         }
 
+        if full {
+            result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
+                Filter::Eq("source_id".to_string(), config.source_id.clone()),
+                Filter::Neq("seen_token".to_string(), sync_token.clone()),
+            ]))?;
+        }
+
         store.flush()?;
         Cursor {
             source_id: config.source_id.clone(),
@@ -154,6 +169,7 @@ mod tests {
     use crate::chunker::chonkie::ChonkieChunker;
     use crate::embedder::Embedder;
     use crate::vectorstore::memory::InMemoryStore;
+    use crate::sync::indexer::{index_file, SyncFileContext};
     use tempfile::TempDir;
 
     struct MockEmbedder;
@@ -325,6 +341,65 @@ mod tests {
 
         assert_eq!(result.files_processed_paths, vec!["a.txt"]);
         assert!(result.chunks_deleted > 0);
+        assert_eq!(store.doc_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_full_sync_sweeps_stale_deleted_paths() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "alpha beta gamma").expect("write file");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first sync succeeds");
+
+        std::fs::remove_file(path).expect("delete file");
+        std::fs::write(dir.path().join("b.txt"), "delta epsilon zeta").expect("write b");
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("full sync succeeds");
+
+        assert!(result.chunks_deleted > 0);
+        assert_eq!(store.all_paths(), vec!["b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_index_file_missing_path_deletes_existing_chunks() {
+        let (dir, _sync, chunker, embedder, mut store) = fixture();
+        let config = Config::default_for("source-1");
+        store
+            .upsert(&[crate::vectorstore::Document {
+                id: "doc-1".to_string(),
+                embedding: vec![1.0],
+                text: "stale".to_string(),
+                source_id: config.source_id.clone(),
+                path: "missing.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "sha256:stale".to_string(),
+                seen_token: "old".to_string(),
+            }])
+            .expect("upsert stale doc");
+        let mut result = empty_sync_result(false, false);
+        let context = SyncFileContext {
+            config: &config,
+            chunker: &chunker,
+            embedder: &embedder,
+            store: &mut store,
+            sync_token: "new-token",
+        };
+
+        index_file(dir.path(), "missing.txt", context, &mut result)
+            .await
+            .expect("missing file is tolerated");
+
+        assert_eq!(result.files_processed, 1);
+        assert_eq!(result.files_processed_paths, vec!["missing.txt"]);
+        assert_eq!(result.chunks_deleted, 1);
         assert_eq!(store.doc_count(), 0);
     }
 

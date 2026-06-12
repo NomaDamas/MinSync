@@ -175,6 +175,14 @@ impl LanceDbInner {
             .await
             .map_err(to_store_error)?;
         maintain_index(&self.table, &self.indexing).await?;
+        self.table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(chrono::Duration::zero()),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: None,
+            })
+            .await
+            .map_err(to_store_error)?;
         Ok(())
     }
 
