@@ -9,6 +9,18 @@
 .sisyphus/
 .omo/
 .omx/
+.ralph-state/
+.worktrees/
+.ruff_cache/
+.pytest_cache/
+.venv/
+runs/
+evidence/
+prompts/
+goal.md
+prd.json
+progress.txt
+AGENTS.md.untracked-backup
 
 # IDE
 .idea/
