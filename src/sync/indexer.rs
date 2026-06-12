@@ -46,7 +46,12 @@ pub(super) async fn index_file(
     let doc_ids = doc_ids_for_chunks(&context.config.source_id, path, schema_id, &chunks);
     let existing_ids: HashSet<_> = context
         .store
-        .fetch(&doc_ids.iter().map(|(doc_id, _)| doc_id.clone()).collect::<Vec<_>>())?
+        .fetch(
+            &doc_ids
+                .iter()
+                .map(|(doc_id, _)| doc_id.clone())
+                .collect::<Vec<_>>(),
+        )?
         .into_iter()
         .map(|doc| doc.id)
         .collect();
@@ -90,7 +95,10 @@ pub(super) async fn index_file(
 
         result.embedding_api_calls += 1;
         result.embedded_texts += texts.len();
-        result.estimated_tokens += texts.iter().map(|text| estimate_tokens(text)).sum::<usize>();
+        result.estimated_tokens += texts
+            .iter()
+            .map(|text| estimate_tokens(text))
+            .sum::<usize>();
 
         for (doc, embedding) in docs_to_embed.iter_mut().zip(embeddings) {
             doc.embedding = embedding;

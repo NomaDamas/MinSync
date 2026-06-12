@@ -85,7 +85,8 @@ impl MinSync {
                 .unwrap_or_else(|| Manifest::new(&config.source_id))
         };
         let scan_baseline = if full { None } else { stored_manifest.as_ref() };
-        let new_manifest = Manifest::scan_with_baseline(&self.root, &config.source_id, scan_baseline)?;
+        let new_manifest =
+            Manifest::scan_with_baseline(&self.root, &config.source_id, scan_baseline)?;
         let changes = Manifest::diff(&old_manifest, &new_manifest);
 
         if changes.is_empty() && !full {
@@ -168,8 +169,8 @@ mod tests {
     use super::*;
     use crate::chunker::chonkie::ChonkieChunker;
     use crate::embedder::Embedder;
-    use crate::vectorstore::memory::InMemoryStore;
     use crate::sync::indexer::{index_file, SyncFileContext};
+    use crate::vectorstore::memory::InMemoryStore;
     use tempfile::TempDir;
 
     struct MockEmbedder;

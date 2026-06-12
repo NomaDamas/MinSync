@@ -44,7 +44,9 @@ pub fn should_index(path: &Path, minsync_dir: &Path) -> bool {
         return false;
     }
 
-    !path.components().any(|component| component.as_os_str() == ".git")
+    !path
+        .components()
+        .any(|component| component.as_os_str() == ".git")
 }
 
 /// Run the file-watch loop until Ctrl-C.

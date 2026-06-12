@@ -100,7 +100,6 @@ impl Manifest {
         Ok(manifest)
     }
 
-
     pub fn diff(old: &Manifest, new: &Manifest) -> Vec<FileChange> {
         let mut changes = Vec::new();
 
