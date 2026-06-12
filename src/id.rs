@@ -33,6 +33,38 @@ pub fn content_hash(text: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Derive `(doc_id, content_hash)` for each chunk of a file, assigning
+/// duplicate indices to chunks with identical content hash + heading path.
+/// Sync (doc building) and verify (expected-id sampling) must agree on this
+/// derivation, so both call here.
+pub fn doc_ids_for_chunks(
+    source_id: &str,
+    path: &str,
+    schema_id: &str,
+    chunks: &[crate::types::Chunk],
+) -> Vec<(String, String)> {
+    let mut dup_counter: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    chunks
+        .iter()
+        .map(|chunk| {
+            let chunk_content_hash = content_hash(&chunk.text);
+            let dup_key = format!("{}\0{}", chunk_content_hash, chunk.heading_path);
+            let dup_index = dup_counter.entry(dup_key).or_insert(0);
+            let doc_id = compute_doc_id(
+                source_id,
+                path,
+                schema_id,
+                &chunk.chunk_type,
+                &chunk_content_hash,
+                *dup_index,
+            );
+            *dup_index += 1;
+            (doc_id, chunk_content_hash)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +106,35 @@ mod tests {
     #[test]
     fn test_content_hash_different() {
         assert_ne!(content_hash("text a"), content_hash("text b"));
+    }
+
+    fn chunk(text: &str) -> crate::types::Chunk {
+        crate::types::Chunk {
+            text: text.to_string(),
+            chunk_type: "chunk".to_string(),
+            heading_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_doc_ids_for_chunks_duplicates_get_distinct_ids() {
+        let chunks = vec![chunk("same"), chunk("same"), chunk("other")];
+
+        let ids = doc_ids_for_chunks("source", "a.txt", "schema", &chunks);
+
+        assert_eq!(ids.len(), 3);
+        assert_ne!(ids[0].0, ids[1].0, "duplicate chunks get distinct doc ids");
+        assert_eq!(ids[0].1, ids[1].1, "duplicate chunks share a content hash");
+        assert_ne!(ids[0].0, ids[2].0);
+    }
+
+    #[test]
+    fn test_doc_ids_for_chunks_deterministic() {
+        let chunks = vec![chunk("alpha"), chunk("beta")];
+
+        let first = doc_ids_for_chunks("source", "a.txt", "schema", &chunks);
+        let second = doc_ids_for_chunks("source", "a.txt", "schema", &chunks);
+
+        assert_eq!(first, second);
     }
 }

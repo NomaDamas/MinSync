@@ -30,6 +30,16 @@ MinSync scans your directory, detects file changes via manifest comparison (mtim
 
 State lives in `.minsync/`. Delete it to start fresh.
 
+### Chunkers
+
+| id | Strategy | Boundary stability under edits |
+|---|---|---|
+| `recursive` (default) | paragraph→sentence→line splits merged to a size budget | an edit near the top of a file can shift every downstream boundary |
+| `chonkie` | delimiter/size-based chonkie-core chunking | same drift caveat as `recursive` |
+| `cdc` | content-defined chunking (FastCDC-style gear rolling hash) | boundaries are chosen by content, so a small edit only re-embeds the touched chunk(s) |
+
+Select at init time (`minsync init --chunker cdc`) or via `chunker.id` in `.minsync/config.toml`. `cdc` derives its size window from `chunker.options.max_chunk_size` (max = `max_chunk_size`, average = half, minimum = an eighth). Prefer it for large, frequently edited files where re-embedding cost matters; prefer `recursive` when chunks should align with sentence/paragraph semantics. Switching the chunker changes the chunk schema, so run `minsync sync --full` afterwards.
+
 ### Vector store
 
 MinSync stores vectors in an embedded [LanceDB](https://github.com/lancedb/lancedb) database (`vectorstore.id = "lancedb"`, the default). MinSync vendors `protoc` through `protobuf-src` for its own build script on non-Windows targets; Windows builds and LanceDB's dependency build scripts need a `protoc` binary available on `PATH`.
@@ -53,6 +63,21 @@ dimension = 1536
 index_build_threshold = 256              # build the ANN index once total rows hit this
 index_optimize_delta_threshold = 50000   # raise to optimize less often; lower for tighter query latency
 ```
+
+## Embedding network reliability
+
+Embedding requests (OpenAI and TEI) use a bounded per-request timeout and are retried with exponential backoff plus jitter when the failure is transient: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures — invalid auth, 4xx validation errors, malformed responses — fail immediately. A failed sync never advances the cursor or manifest, so the next `minsync sync` picks up exactly where it left off.
+
+Tune the knobs in `.minsync/config.toml`:
+
+```toml
+[embedder]
+max_retries = 3       # retries after the first attempt (total attempts = max_retries + 1)
+timeout_seconds = 60  # per-request HTTP timeout
+max_concurrent = 1    # concurrent batch requests within one sync embedding call
+```
+
+`base_url` also applies to `openai:` embedders, for OpenAI-compatible proxies/gateways.
 
 ## Local embeddings (no OpenAI) — Hugging Face TEI
 

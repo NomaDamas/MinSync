@@ -304,6 +304,56 @@ async fn test_sync_stats_zeroed_when_up_to_date() {
 }
 
 #[tokio::test]
+async fn test_cdc_chunker_limits_reembedding_after_top_insertion() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = minsync::chunker::cdc::CdcChunker::new(32, 64, 128);
+    let embedder = MockEmbedder;
+    let mut store = InMemoryStore::new();
+
+    let original: String = (0..200)
+        .map(|i| format!("{i} {}\n", minsync::id::content_hash(&i.to_string())))
+        .collect();
+    write_file(&dir, "big.txt", &original);
+    sync.init(false, "openai:text-embedding-3-small", "cdc")
+        .expect("init succeeds");
+
+    let first = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("first sync succeeds");
+    assert!(
+        first.embedded_texts > 20,
+        "expected many chunks on first sync, got {}",
+        first.embedded_texts
+    );
+
+    let edited = {
+        let mut lines: Vec<&str> = original.lines().collect();
+        lines.insert(1, "INSERTED LINE near the top");
+        format!("{}\n", lines.join("\n"))
+    };
+    write_file(&dir, "big.txt", &edited);
+
+    let second = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("second sync succeeds");
+
+    assert_eq!(second.files_processed_paths, vec!["big.txt"]);
+    assert!(
+        second.chunks_updated > 0,
+        "downstream chunks should be skipped (metadata-only update)"
+    );
+    assert!(
+        second.embedded_texts * 5 <= first.embedded_texts,
+        "a top insertion should re-embed only a small fraction: first={} second={}",
+        first.embedded_texts,
+        second.embedded_texts
+    );
+}
+
+#[tokio::test]
 async fn test_sync_crash_recovery_removes_stale_transaction() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
@@ -551,6 +601,150 @@ async fn test_tei_embedder_passage_and_query_prefixes() {
         .await
         .expect("query embed succeeds");
     assert_eq!(query_vec, vec![0.0, 1.0, 0.0, 0.0]);
+}
+
+#[tokio::test]
+async fn test_sync_against_flaky_tei_server_eventually_succeeds() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    struct OnePerInput;
+    impl Respond for OnePerInput {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("valid embed request JSON");
+            let n = body["inputs"]
+                .as_array()
+                .map(|a| a.len())
+                .expect("inputs is an array");
+            let vectors: Vec<Vec<f32>> = (0..n).map(|_| vec![0.5, 0.5]).collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!(vectors))
+        }
+    }
+
+    let server = MockServer::start().await;
+    // The first two requests fail with a retryable 503, then the server heals.
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("flaky"))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(OnePerInput)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = ChonkieChunker::new(32, "\n ");
+    let embedder = TeiEmbedder::new("tei:test-model", &server.uri(), 64)
+        .with_max_retries(3)
+        .with_backoff(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(4),
+        );
+    let mut store = InMemoryStore::new();
+
+    write_file(&dir, "doc.md", "hello world from a flaky network");
+    sync.init(false, "tei:test-model", "chonkie")
+        .expect("init succeeds");
+
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("sync succeeds despite transient 503s");
+
+    assert!(result.chunks_added > 0);
+    assert!(store.doc_count() > 0);
+    assert!(dir.path().join(".minsync/cursor.json").exists());
+    assert!(
+        server.received_requests().await.unwrap().len() >= 3,
+        "expected the two 503s to be retried"
+    );
+}
+
+#[tokio::test]
+async fn test_sync_embedding_failure_keeps_cursor_and_manifest_unchanged() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = ChonkieChunker::new(32, "\n ");
+    let embedder = TeiEmbedder::new("tei:test-model", &server.uri(), 64)
+        .with_max_retries(1)
+        .with_backoff(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(4),
+        );
+    let mut store = InMemoryStore::new();
+
+    sync.init(false, "tei:test-model", "chonkie")
+        .expect("init succeeds");
+    let manifest_before = std::fs::read_to_string(dir.path().join(".minsync/manifest.json"))
+        .expect("read baseline manifest");
+    write_file(&dir, "doc.md", "content that will fail to embed");
+
+    let error = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect_err("sync fails after retry exhaustion");
+
+    assert!(error.to_string().contains("retries exhausted"));
+    assert!(
+        !dir.path().join(".minsync/cursor.json").exists(),
+        "cursor must not advance on embedding failure"
+    );
+    assert!(
+        dir.path().join(".minsync/txn.json").exists(),
+        "interrupted transaction must remain for recovery"
+    );
+    let manifest_after = std::fs::read_to_string(dir.path().join(".minsync/manifest.json"))
+        .expect("read manifest after failed sync");
+    assert_eq!(
+        manifest_before, manifest_after,
+        "manifest must not advance on embedding failure"
+    );
+
+    // The next sync against a healed server converges.
+    struct OnePerInput;
+    impl wiremock::Respond for OnePerInput {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("valid embed request JSON");
+            let n = body["inputs"]
+                .as_array()
+                .map(|a| a.len())
+                .expect("inputs is an array");
+            let vectors: Vec<Vec<f32>> = (0..n).map(|_| vec![0.5, 0.5]).collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!(vectors))
+        }
+    }
+    let healed = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(OnePerInput)
+        .mount(&healed)
+        .await;
+    let healed_embedder = TeiEmbedder::new("tei:test-model", &healed.uri(), 64);
+
+    let result = sync
+        .sync(&chunker, &healed_embedder, &mut store, false, false, false)
+        .await
+        .expect("sync converges once the server heals");
+
+    assert!(result.chunks_added > 0);
+    assert!(dir.path().join(".minsync/cursor.json").exists());
+    assert!(!dir.path().join(".minsync/txn.json").exists());
 }
 
 #[tokio::test]

@@ -1,0 +1,58 @@
+//! Result accounting helpers for sync runs.
+
+use crate::manifest::FileChange;
+use crate::types::SyncResult;
+
+pub(super) fn change_path(change: &FileChange) -> String {
+    match change {
+        FileChange::Added(path) | FileChange::Modified(path) | FileChange::Deleted(path) => {
+            path.clone()
+        }
+    }
+}
+
+pub(super) fn empty_sync_result(dry_run: bool, already_up_to_date: bool) -> SyncResult {
+    SyncResult {
+        files_processed: 0,
+        chunks_added: 0,
+        chunks_updated: 0,
+        chunks_deleted: 0,
+        dry_run,
+        already_up_to_date,
+        files_processed_paths: Vec::new(),
+        elapsed_seconds: 0.0,
+        embedding_api_calls: 0,
+        embedded_texts: 0,
+        estimated_tokens: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_change_path_covers_all_variants() {
+        assert_eq!(
+            change_path(&FileChange::Added("a.txt".to_string())),
+            "a.txt"
+        );
+        assert_eq!(
+            change_path(&FileChange::Modified("b.txt".to_string())),
+            "b.txt"
+        );
+        assert_eq!(
+            change_path(&FileChange::Deleted("c.txt".to_string())),
+            "c.txt"
+        );
+    }
+
+    #[test]
+    fn test_empty_sync_result_flags() {
+        let result = empty_sync_result(true, false);
+        assert!(result.dry_run);
+        assert!(!result.already_up_to_date);
+        assert_eq!(result.files_processed, 0);
+        assert_eq!(result.chunks_added, 0);
+    }
+}
