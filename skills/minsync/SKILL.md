@@ -5,7 +5,7 @@ description: Use MinSync to add git-free incremental semantic indexing and query
 
 # MinSync
 
-Use this skill when an agent needs to install, initialize, sync, watch, or query MinSync in a workspace. MinSync is a Rust CLI that indexes UTF-8 text files into a local LanceDB vector store using manifest-based change detection. It does not require git.
+Use this skill when an agent needs to install, initialize, sync, watch, query, or extend MinSync in a workspace. MinSync is a Rust CLI that indexes UTF-8 text files into a local LanceDB vector store using manifest-based change detection. It does not require git.
 
 ## Install
 
@@ -47,7 +47,7 @@ State is stored in `.minsync/`: `config.toml`, `manifest.json`, `cursor.json`, `
 
 ## Ignore Binary and Generated Files
 
-MinSync reads UTF-8 text only. It does not extract text from PDF, DOCX, XLSX, images, archives, or other binary formats. Add those to `.minsyncignore` before syncing:
+MinSync reads UTF-8 text only; this is not limited to `.md`. Any file extension can be indexed when the file decodes as UTF-8. Japanese, Chinese, Korean, and other Unicode text are handled as UTF-8 strings. MinSync does not extract text from PDF, DOCX, XLSX, images, archives, or other binary formats. Add those to `.minsyncignore` before syncing:
 
 ```gitignore
 target/
@@ -88,6 +88,36 @@ passage_prefix = "passage: "
 [vectorstore.options]
 dimension = 384
 ```
+
+## Extending Vector Stores
+
+Use this checklist when adding a vector database backend:
+
+1. Add a module under `src/vectorstore/` that implements `VectorStore`.
+2. Preserve the existing contract: `upsert`, metadata-only `update`, `fetch`, filtered `delete_by_filter`, filtered `query`, `flush`, `doc_count`, and `all_paths`.
+3. Support the current filter subset: `Eq`, `Neq`, and `And`.
+4. Validate embedding dimensions before writing vectors.
+5. Keep cosine-compatible query scoring unless the backend explicitly documents a matching distance conversion.
+6. Add the backend id to `create_vectorstore` in `src/vectorstore/mod.rs`.
+7. Add integration coverage for full sync, incremental update, deletion sweep, and query.
+
+The default production backend is `lancedb`. `memory` is test-only and should not be documented as durable storage.
+
+## Extending Embedders
+
+Use this checklist when adding an embedding provider or model family:
+
+1. Add a module under `src/embedder/` that implements `Embedder`.
+2. Choose an id prefix such as `provider:model-name`; `create_embedder` dispatches on this prefix.
+3. Implement both document embedding and query embedding. Override `embed_query` when the model requires a query prefix or different endpoint.
+4. Enforce `batch_size > 0`, timeout, retry, and `max_concurrent` behavior consistently with OpenAI and TEI.
+5. Return one embedding per input and fail fast on count mismatch or malformed responses.
+6. Document the model dimension and tell agents to update `[vectorstore.options].dimension`, then run `minsync sync --full`.
+7. Add tests for prefix stripping, batching, retryable errors, fatal errors, timeout retry, and query/document prefix behavior.
+
+The default embedder is `openai:text-embedding-3-small` with dimension `1536`. TEI models are supported with ids like `tei:intfloat/multilingual-e5-small` and `tei:BAAI/bge-m3`.
+
+For a longer implementation checklist, read `docs/EXTENDING.md` in the MinSync repository.
 
 ## Sync and Query
 

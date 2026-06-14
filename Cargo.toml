@@ -1,6 +1,6 @@
 [package]
 name = "minsync"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.91"
 description = "Manifest-based incremental vector DB indexing CLI for text files"
@@ -9,7 +9,17 @@ repository = "https://github.com/NomaDamas/MinSync"
 readme = "README.md"
 keywords = ["vector-database", "embeddings", "semantic-search", "indexing", "rag"]
 categories = ["command-line-utilities", "text-processing"]
-exclude = [".github/", ".idea/", "runs/", "evidence/", "prompts/", "scripts/", "tests/"]
+exclude = [
+    ".github/",
+    ".idea/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "runs/",
+    "evidence/",
+    "prompts/",
+    "scripts/",
+    "tests/",
+]
 
 [dependencies]
 chunk = "0.10"

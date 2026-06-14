@@ -63,7 +63,7 @@ pub enum Commands {
         #[arg(long, default_value = "10")]
         sample: usize,
     },
-    /// Watch the directory and incrementally re-index changed .md/.txt files
+    /// Watch the directory and incrementally re-index changed UTF-8 text files
     Watch {
         #[arg(long)]
         debounce_ms: Option<u64>,

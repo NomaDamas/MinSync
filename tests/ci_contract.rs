@@ -133,11 +133,50 @@ fn agent_skill_packages_minsync_operating_instructions() {
         "minsync query",
         ".minsyncignore",
         "UTF-8 text only",
+        "Japanese",
+        "Chinese",
+        "Korean",
         "tei:intfloat/multilingual-e5-small",
+        "Extending Vector Stores",
+        "Extending Embedders",
+        "docs/EXTENDING.md",
     ] {
         assert!(
             skill.contains(needle),
             "expected agent skill to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn extending_guide_documents_agent_backend_workflows() {
+    let guide = read_file("docs/EXTENDING.md");
+
+    for needle in [
+        "Agent Extension Guide",
+        "Vector Store Backends",
+        "Embedding Providers",
+        "create_vectorstore",
+        "create_embedder",
+        "Japanese, Chinese, Korean",
+        "UTF-8",
+        "sync --full",
+    ] {
+        assert!(
+            guide.contains(needle),
+            "expected extension guide to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn crate_package_excludes_local_agent_guidance() {
+    let manifest = read_file("Cargo.toml");
+
+    for needle in ["AGENTS.md", "CLAUDE.md"] {
+        assert!(
+            manifest.contains(needle),
+            "expected Cargo.toml package exclude list to contain {needle:?}"
         );
     }
 }

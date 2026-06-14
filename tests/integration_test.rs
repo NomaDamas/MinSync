@@ -99,6 +99,39 @@ async fn test_full_workflow() {
     assert!(verify_result.all_passed);
 }
 
+#[tokio::test]
+async fn test_utf8_multilingual_text_across_file_extensions() {
+    let (dir, sync, chunker, embedder, mut store) = fixture();
+    write_file(&dir, "docs/japanese.md", "日本語のメモを検索できます。");
+    write_file(&dir, "notes/chinese.txt", "中文内容会作为 UTF-8 文本处理。");
+    write_file(
+        &dir,
+        "src/korean.note",
+        "한국어 파일도 확장자와 무관하게 처리됩니다.",
+    );
+
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
+    sync.sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("sync succeeds");
+
+    assert_eq!(
+        store.all_paths(),
+        vec!["docs/japanese.md", "notes/chinese.txt", "src/korean.note"]
+    );
+
+    let hits = store.query(&[1.0; 8], None, 10).expect("query docs");
+    let indexed_text = hits
+        .iter()
+        .map(|hit| hit.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(indexed_text.contains("日本語"));
+    assert!(indexed_text.contains("中文内容"));
+    assert!(indexed_text.contains("한국어"));
+}
+
 #[test]
 fn test_init_creates_structure() {
     let (dir, sync, _chunker, _embedder, _store) = fixture();
