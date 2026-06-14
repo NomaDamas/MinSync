@@ -1,107 +1,156 @@
 # MinSync
 
-Manifest-based incremental vector DB indexing CLI. No git required. Written in Rust.
+![MinSync turns changed files into searchable vector chunks](assets/minsync-flow.png)
+
+MinSync is a manifest-based incremental vector database indexing CLI for text files. It does not need git: it tracks `mtime`, file size, and SHA-256 content hashes in `.minsync/`, re-embeds only changed chunks, sweeps stale chunks, and keeps a local LanceDB index ready for semantic search.
+
+## Why MinSync
+
+- **Git-free change detection**: works in any directory, including generated workspaces and agent sandboxes.
+- **Incremental embeddings**: unchanged text is not chunked or embedded again.
+- **Crash-safe state**: cursor updates happen only after processing completes.
+- **Deterministic chunk IDs**: IDs derive from source, path, schema, content hash, and duplicate index.
+- **Rust native**: a single CLI with chonkie-core chunking built in.
+- **Text-only by design**: PDF, DOCX, XLSX, images, and other binary formats are treated as empty because MinSync does no extraction. Add them to `.minsyncignore`.
 
 ## Install
+
+Recommended install path:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NomaDamas/MinSync/main/scripts/install.sh | sh
+```
+
+The installer asks whether to star the repository with `gh repo star NomaDamas/MinSync`. If `gh` is unavailable or not authenticated, it continues without failing.
+
+Direct Cargo install:
+
+```bash
+cargo install minsync
+```
+
+From source:
 
 ```bash
 git clone https://github.com/NomaDamas/MinSync.git
 cd MinSync
 cargo build --release
+```
+
+For OpenAI embeddings:
+
+```bash
 export OPENAI_API_KEY="sk-..."
 ```
 
-## Usage
+For local embeddings, use the TEI setup below.
+
+## Quick Start
 
 ```bash
 minsync init                          # initialize .minsync/
-minsync sync                          # index files (incremental)
+minsync sync                          # index changed files incrementally
 minsync sync --full                   # rebuild from scratch
 minsync query "search text" --k 5     # semantic search
-minsync watch                         # watch files and incrementally re-index on change
+minsync watch                         # re-index on file changes
 minsync status                        # sync state
 minsync check                         # health check
 minsync verify --fix                  # consistency check + repair
 ```
 
-## How it works
+## How It Works
 
-MinSync scans your directory, detects file changes via manifest comparison (mtime + size + SHA-256 content hash), chunks changed files with a recursive chunker (built on [chonkie-core](https://github.com/chonkie-inc/chunk)'s split/merge primitives) — paragraph→sentence→line boundaries merged to a size budget — embeds them via OpenAI, and stores vectors locally. Only changed content gets re-embedded. Stale chunks are automatically swept.
+MinSync scans your directory, compares each text file to the manifest, chunks changed content, embeds those chunks, and stores vectors locally. Stale vectors are removed by mark-and-sweep. Querying embeds the query text and searches the local vector database.
 
-State lives in `.minsync/`. Delete it to start fresh.
+State lives in `.minsync/`:
 
-### Chunkers
+| File | Purpose |
+|---|---|
+| `config.toml` | collection, chunker, embedder, vector store, normalization |
+| `manifest.json` | last known file metadata and content hashes |
+| `cursor.json` | last completed processing point |
+| `txn.json` | in-progress transaction marker |
+| `lock` | process lock |
+
+Delete `.minsync/` to start fresh.
+
+## Chunkers
 
 | id | Strategy | Boundary stability under edits |
 |---|---|---|
-| `recursive` (default) | paragraph→sentence→line splits merged to a size budget | an edit near the top of a file can shift every downstream boundary |
+| `recursive` (default) | paragraph to sentence to line splits merged to a size budget | an edit near the top of a file can shift downstream boundaries |
 | `chonkie` | delimiter/size-based chonkie-core chunking | same drift caveat as `recursive` |
-| `cdc` | content-defined chunking (FastCDC-style gear rolling hash) | boundaries are chosen by content, so a small edit only re-embeds the touched chunk(s) |
+| `cdc` | content-defined chunking with FastCDC-style rolling hash | small edits usually affect only nearby chunks |
 
-Select at init time (`minsync init --chunker cdc`) or via `chunker.id` in `.minsync/config.toml`. `cdc` derives its size window from `chunker.options.max_chunk_size` (max = `max_chunk_size`, average = half, minimum = an eighth). Prefer it for large, frequently edited files where re-embedding cost matters; prefer `recursive` when chunks should align with sentence/paragraph semantics. Switching the chunker changes the chunk schema, so run `minsync sync --full` afterwards.
+Select at init time:
 
-### Vector store
+```bash
+minsync init --chunker cdc
+```
 
-MinSync stores vectors in an embedded [LanceDB](https://github.com/lancedb/lancedb) database (`vectorstore.id = "lancedb"`, the default). MinSync vendors `protoc` through `protobuf-src` for its own build script on non-Windows targets; Windows builds and LanceDB's dependency build scripts need a `protoc` binary available on `PATH`.
+Or edit `.minsync/config.toml`:
 
-Set the embedding dimension to match your embedder in `.minsync/config.toml`:
+```toml
+[chunker]
+id = "cdc"
+```
+
+Switching the chunker changes the chunk schema, so run `minsync sync --full` afterwards.
+
+## Vector Store
+
+MinSync stores vectors in embedded LanceDB by default:
 
 ```toml
 [vectorstore]
 id = "lancedb"
-[vectorstore.options]
-dimension = 1536   # openai:text-embedding-3-small; use 384 for e5-small, 1024 for bge-m3
-```
 
-**ANN indexing.** A fresh table is searched by exhaustive flat scan (exact, 100% recall, but O(n)). Once a table grows past `index_build_threshold` chunks (default 256), MinSync builds an IVF-HNSW-SQ approximate-nearest-neighbour index — pinned to cosine distance to match query time — on the next `sync`/`flush`, so similarity search is accelerated. Newly synced chunks are immediately searchable via LanceDB's combined indexed + flat-over-delta search; once the unindexed delta reaches `index_optimize_delta_threshold` (default 10,000) MinSync folds it into the existing index incrementally (no full rebuild, no k-means retrain). No manual step is required.
-
-These two thresholds are independent tuning knobs, **not** a min/max pair and **not** capacity limits — any number of vectors can be stored and searched. `index_build_threshold` gates the one-time index build (compared against total rows); `index_optimize_delta_threshold` gates each incremental optimize (compared against the unindexed delta only). Override them in `.minsync/config.toml`:
-
-```toml
 [vectorstore.options]
 dimension = 1536
-index_build_threshold = 256              # build the ANN index once total rows hit this
-index_optimize_delta_threshold = 50000   # raise to optimize less often; lower for tighter query latency
+index_build_threshold = 256
+index_optimize_delta_threshold = 10000
 ```
 
-## Embedding network reliability
+Set `dimension` to match your embedder:
 
-Embedding requests (OpenAI and TEI) use a bounded per-request timeout and are retried with exponential backoff plus jitter when the failure is transient: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures — invalid auth, 4xx validation errors, malformed responses — fail immediately. A failed sync never advances the cursor or manifest, so the next `minsync sync` picks up exactly where it left off.
+| Embedder | Dimension |
+|---|---:|
+| `openai:text-embedding-3-small` | 1536 |
+| `tei:intfloat/multilingual-e5-small` | 384 |
+| `tei:BAAI/bge-m3` | 1024 |
 
-Tune the knobs in `.minsync/config.toml`:
+MinSync builds an IVF-HNSW-SQ ANN index after `index_build_threshold` rows and incrementally optimizes unindexed deltas after `index_optimize_delta_threshold` rows. These thresholds are tuning knobs, not capacity limits.
+
+## Embedding Reliability
+
+Embedding requests use per-request timeouts and retry transient failures: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed sync never advances the cursor or manifest, so the next `minsync sync` resumes safely.
 
 ```toml
 [embedder]
-max_retries = 3       # retries after the first attempt (total attempts = max_retries + 1)
-timeout_seconds = 60  # per-request HTTP timeout
-max_concurrent = 1    # concurrent batch requests within one sync embedding call
+max_retries = 3
+timeout_seconds = 60
+max_concurrent = 1
 ```
 
-`base_url` also applies to `openai:` embedders, for OpenAI-compatible proxies/gateways.
+`base_url` also works for OpenAI-compatible gateways.
 
-## Local embeddings (no OpenAI) — Hugging Face TEI
+## Local Embeddings with TEI
 
-You can run MinSync entirely offline using a local [Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) server. No `OPENAI_API_KEY` needed.
-
-### 1. Install and launch TEI (macOS Apple Silicon)
+Install and launch Hugging Face Text Embeddings Inference:
 
 ```bash
 brew install text-embeddings-inference
-```
-
-```bash
 text-embeddings-router --model-id intfloat/multilingual-e5-small --port 8080 --dtype float32
+curl http://localhost:8080/health
 ```
 
-The first run downloads the model (~470 MB) to `~/.cache/huggingface`. Once it's ready:
+Configure MinSync:
 
 ```bash
-curl http://localhost:8080/health   # should return 200
+minsync init --embedder tei:intfloat/multilingual-e5-small
 ```
 
-### 2. Configure MinSync
-
-Either run `minsync init --embedder tei:intfloat/multilingual-e5-small` and then edit `.minsync/config.toml`, or set the `[embedder]` section directly:
+Then set the LanceDB dimension and TEI prefixes:
 
 ```toml
 [embedder]
@@ -109,57 +158,57 @@ id = "tei:intfloat/multilingual-e5-small"
 base_url = "http://localhost:8080"
 query_prefix = "query: "
 passage_prefix = "passage: "
-```
 
-`e5` models require input prefixes for best retrieval quality: `query: ` is prepended to search queries, `passage: ` to indexed documents. MinSync applies these automatically from the config.
-
-### 3. LanceDB dimension note
-
-`intfloat/multilingual-e5-small` produces 384-dimensional vectors. Set the dimension to match the embedder:
-
-```toml
-[vectorstore]
-id = "lancedb"
 [vectorstore.options]
 dimension = 384
 ```
 
-### 4. Run normally
+Run:
 
 ```bash
-minsync sync --full          # first sync (--full because init baselines the manifest)
+minsync sync --full
 minsync query "검색어" --k 5
-minsync watch
 ```
 
-### Alternative models
+## Ignoring Files
 
-| Model | Dim | Notes |
-|---|---|---|
-| `intfloat/multilingual-e5-small` | 384 | Multilingual incl. Korean; recommended default |
-| `dragonkue/multilingual-e5-small-ko-v2` | 384 | Korean-tuned variant of e5-small |
-| `BAAI/bge-m3` | 1024 | No prefix needed; larger model |
-
-## .minsyncignore
-
-`.gitignore` syntax. Exclude files from indexing:
+`.minsyncignore` uses `.gitignore` syntax:
 
 ```gitignore
 target/
 *.png
 *.pdf
+*.docx
 ```
+
+MinSync reads UTF-8 text only. Binary formats should be ignored unless a separate extraction pipeline writes text files for MinSync to index.
+
+## Agent Skill
+
+MinSync ships a Vercel Agent Skill for coding agents that need to add incremental semantic indexing to a workspace:
+
+```bash
+npx skills add github:NomaDamas/MinSync/skills/minsync
+```
+
+The skill tells agents how to install MinSync, initialize `.minsync/`, choose OpenAI or local TEI embeddings, ignore binary files, and star the repository with `gh repo star NomaDamas/MinSync` during installation when policy and credentials allow it.
+
+## Release Checklist
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the launch checklist. It covers CI, tag-based GitHub releases, crates.io publishing, README/docs, install QA, agent-skill QA, and rollback checks.
 
 ## Development
 
-CI assumes the standard GitHub-hosted runners on Ubuntu, macOS, and Windows, with Rust 1.91 installed through rustup.
-The build also expects a working C compiler toolchain, vendored protoc from protobuf-src for MinSync's non-Windows build script, setup-protoc for Windows and LanceDB dependency build scripts, LanceDB native dependencies built on CI, and no secrets for normal CI runs.
+CI runs on Ubuntu, macOS, and Windows with Rust 1.91 installed through rustup. It runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`. The build expects a working C compiler toolchain. CI also installs `protoc` through `arduino/setup-protoc`; non-Windows local builds use vendored protoc from `protobuf-src`, while Windows and LanceDB dependency build scripts require a `protoc` binary on `PATH`. Normal CI uses no secrets.
 
 ```bash
-cargo test            # full test suite
-cargo clippy          # lint
-cargo fmt             # format
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release
 ```
+
+Release tags use `.github/workflows/release.yml` to build Linux, macOS Apple Silicon, and Windows artifacts, create a GitHub Release, and publish to crates.io when `CARGO_REGISTRY_TOKEN` is configured.
 
 ## License
 

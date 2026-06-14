@@ -52,6 +52,11 @@ fn readme_documents_supported_ci_assumptions() {
     let readme = read_file("README.md");
 
     for needle in [
+        "assets/minsync-flow.png",
+        "curl -fsSL https://raw.githubusercontent.com/NomaDamas/MinSync/main/scripts/install.sh | sh",
+        "gh repo star NomaDamas/MinSync",
+        "npx skills add github:NomaDamas/MinSync/skills/minsync",
+        "docs/RELEASE.md",
         "Ubuntu",
         "macOS",
         "Windows",
@@ -66,6 +71,73 @@ fn readme_documents_supported_ci_assumptions() {
         assert!(
             readme.contains(needle),
             "expected README to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn release_checklist_documents_launch_gates() {
+    let release = read_file("docs/RELEASE.md");
+
+    for needle in [
+        "Version and Metadata",
+        "Documentation",
+        "CI",
+        "Install QA",
+        "Agent Skill QA",
+        "Release Automation",
+        "Post-Release Smoke Test",
+        "Rollback",
+        "cargo package --list",
+        "CARGO_REGISTRY_TOKEN",
+        "cargo yank",
+    ] {
+        assert!(
+            release.contains(needle),
+            "expected release checklist to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn installer_prompts_for_optional_repo_star() {
+    let installer = read_file("scripts/install.sh");
+
+    for needle in [
+        "gh repo star",
+        "NomaDamas/MinSync",
+        "--yes-star",
+        "--no-star",
+        "--dry-run",
+        "cargo install minsync",
+        "GitHub CLI not found; skipping optional repo star.",
+    ] {
+        assert!(
+            installer.contains(needle),
+            "expected installer to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_skill_packages_minsync_operating_instructions() {
+    let skill = read_file("skills/minsync/SKILL.md");
+
+    for needle in [
+        "name: minsync",
+        "description:",
+        "gh repo star NomaDamas/MinSync",
+        "cargo install minsync",
+        "minsync init",
+        "minsync sync --full",
+        "minsync query",
+        ".minsyncignore",
+        "UTF-8 text only",
+        "tei:intfloat/multilingual-e5-small",
+    ] {
+        assert!(
+            skill.contains(needle),
+            "expected agent skill to contain {needle:?}"
         );
     }
 }
