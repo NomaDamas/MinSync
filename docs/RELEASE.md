@@ -6,7 +6,7 @@ Use this checklist before cutting a public release.
 
 - [ ] Confirm `Cargo.toml` version is the intended release version.
 - [ ] Confirm package metadata: description, license, repository, readme, keywords, and categories.
-- [ ] Run `cargo package --list` and check that `README.md`, `assets/minsync-flow.png`, `docs/RELEASE.md`, and `skills/minsync/SKILL.md` are present.
+- [ ] Run `cargo package --list` and check that `README.md`, `assets/minsync-flow.svg`, `docs/RELEASE.md`, and `skills/minsync/SKILL.md` are present.
 - [ ] Confirm no private agent artifacts, local state, secrets, or generated run logs are included.
 
 ## 2. Documentation

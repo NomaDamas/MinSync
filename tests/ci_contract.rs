@@ -52,7 +52,7 @@ fn readme_documents_supported_ci_assumptions() {
     let readme = read_file("README.md");
 
     for needle in [
-        "assets/minsync-flow.png",
+        "assets/minsync-flow.svg",
         "curl -fsSL https://raw.githubusercontent.com/NomaDamas/MinSync/main/scripts/install.sh | sh",
         "gh repo star NomaDamas/MinSync",
         "npx skills add github:NomaDamas/MinSync/skills/minsync",

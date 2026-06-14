@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title desc">
+  <title id="title">MinSync incremental indexing flow</title>
+  <desc id="desc">Files are scanned into a manifest, changed chunks are embedded into a vector database, and queries return matching text.</desc>
+  <defs>
+    <linearGradient id="fade" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#f7f7f7"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000" flood-opacity=".08"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#111"/>
+    </marker>
+    <style>
+      .bg { fill: url(#fade); }
+      .grid { stroke: #eaeaea; stroke-width: 1; }
+      .card { fill: #fff; stroke: #111; stroke-width: 2; rx: 28; filter: url(#soft); }
+      .mini { fill: #fafafa; stroke: #d7d7d7; stroke-width: 1.5; rx: 16; }
+      .title { font-family: Arial, Helvetica, sans-serif; font-size: 44px; font-weight: 700; fill: #050505; letter-spacing: 0; }
+      .label { font-family: Arial, Helvetica, sans-serif; font-size: 23px; font-weight: 700; fill: #111; letter-spacing: 0; }
+      .small { font-family: Arial, Helvetica, sans-serif; font-size: 18px; font-weight: 500; fill: #666; letter-spacing: 0; }
+      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 15px; font-weight: 600; fill: #777; letter-spacing: 0; }
+      .line { stroke: #111; stroke-width: 3; fill: none; marker-end: url(#arrow); stroke-linecap: round; }
+      .muted { stroke: #b8b8b8; stroke-width: 3; stroke-linecap: round; }
+      .dark { fill: #111; }
+      .ok { fill: #16a34a; }
+      .blue { fill: #2563eb; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1600" height="760"/>
+  <g opacity=".75">
+    <path class="grid" d="M80 0v760M160 0v760M240 0v760M320 0v760M400 0v760M480 0v760M560 0v760M640 0v760M720 0v760M800 0v760M880 0v760M960 0v760M1040 0v760M1120 0v760M1200 0v760M1280 0v760M1360 0v760M1440 0v760M1520 0v760"/>
+    <path class="grid" d="M0 80h1600M0 160h1600M0 240h1600M0 320h1600M0 400h1600M0 480h1600M0 560h1600M0 640h1600"/>
+  </g>
+
+  <text x="80" y="92" class="title">MinSync</text>
+  <text x="80" y="130" class="small">Manifest-based incremental vector indexing, no git required.</text>
+
+  <g transform="translate(80 210)">
+    <rect class="card" width="210" height="250"/>
+    <text x="28" y="48" class="label">Files</text>
+    <text x="28" y="78" class="small">UTF-8 text</text>
+    <g transform="translate(36 112)">
+      <rect class="mini" x="34" y="-36" width="92" height="114"/>
+      <path d="M126 -36v32h32" fill="none" stroke="#d7d7d7" stroke-width="1.5"/>
+      <rect class="mini" x="0" y="0" width="128" height="150"/>
+      <path class="muted" d="M26 42h76M26 76h66M26 110h84"/>
+      <rect x="26" y="116" width="70" height="12" rx="6" class="dark" opacity=".9"/>
+    </g>
+  </g>
+
+  <path class="line" d="M318 335h96"/>
+
+  <g transform="translate(440 210)">
+    <rect class="card" width="230" height="250"/>
+    <text x="28" y="48" class="label">Manifest</text>
+    <text x="28" y="78" class="small">mtime · size · hash</text>
+    <g transform="translate(34 110)">
+      <path d="M0 8l14 14L42-8" fill="none" stroke="#16a34a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path class="muted" d="M72 12h96M72 46h72"/>
+      <path d="M0 76l14 14 28-30" fill="none" stroke="#16a34a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path class="muted" d="M72 80h104M72 114h84"/>
+    </g>
+  </g>
+
+  <path class="line" d="M698 335h96"/>
+
+  <g transform="translate(820 210)">
+    <rect class="card" width="260" height="250"/>
+    <text x="28" y="48" class="label">Changed chunks</text>
+    <text x="28" y="78" class="small">only re-embed diffs</text>
+    <g transform="translate(30 106)">
+      <rect class="mini" width="200" height="46"/>
+      <rect class="dark" x="18" y="16" width="64" height="14" rx="7"/>
+      <path class="muted" d="M96 23h78"/>
+      <rect class="mini" y="64" width="200" height="46"/>
+      <rect class="dark" x="18" y="80" width="94" height="14" rx="7"/>
+      <path class="muted" d="M126 87h48"/>
+      <rect class="mini" y="128" width="200" height="46"/>
+      <rect class="dark" x="18" y="144" width="48" height="14" rx="7"/>
+      <path class="muted" d="M80 151h94"/>
+    </g>
+  </g>
+
+  <path class="line" d="M1108 335h96"/>
+
+  <g transform="translate(1230 210)">
+    <rect class="card" width="290" height="250"/>
+    <text x="28" y="48" class="label">Vector DB</text>
+    <text x="28" y="78" class="small">local LanceDB search</text>
+    <g transform="translate(44 104)">
+      <ellipse cx="92" cy="24" rx="92" ry="24" fill="#fff" stroke="#111" stroke-width="2"/>
+      <path d="M0 24v106c0 13 41 24 92 24s92-11 92-24V24" fill="#fff" stroke="#111" stroke-width="2"/>
+      <ellipse cx="92" cy="130" rx="92" ry="24" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle class="dark" cx="44" cy="68" r="5"/>
+      <circle class="dark" cx="72" cy="68" r="5"/>
+      <circle class="dark" cx="100" cy="68" r="5"/>
+      <circle class="dark" cx="128" cy="68" r="5"/>
+      <circle class="dark" cx="56" cy="104" r="5"/>
+      <circle class="dark" cx="84" cy="104" r="5"/>
+      <circle class="dark" cx="112" cy="104" r="5"/>
+      <circle class="dark" cx="140" cy="104" r="5"/>
+    </g>
+  </g>
+
+  <path class="line" d="M1375 488c0 58-56 86-126 86H352c-92 0-142-34-142-86"/>
+
+  <g transform="translate(548 560)">
+    <rect class="card" width="560" height="98" rx="24"/>
+    <text x="28" y="42" class="label">Query</text>
+    <text x="28" y="70" class="small">embed once, return semantic matches</text>
+    <circle cx="498" cy="49" r="18" fill="none" stroke="#111" stroke-width="4"/>
+    <path d="M511 62l22 22" stroke="#111" stroke-width="5" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(80 686)">
+    <rect x="0" y="-28" width="1440" height="1" fill="#e5e5e5"/>
+    <text x="0" y="12" class="tiny">Change detection without git</text>
+    <circle cx="235" cy="6" r="4" class="dark"/>
+    <text x="254" y="12" class="tiny">Deterministic chunk IDs</text>
+    <circle cx="478" cy="6" r="4" class="dark"/>
+    <text x="497" y="12" class="tiny">Crash-safe cursor</text>
+    <circle cx="690" cy="6" r="4" class="dark"/>
+    <text x="709" y="12" class="tiny">Text-only indexing</text>
+  </g>
+</svg>

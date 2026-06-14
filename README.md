@@ -1,6 +1,6 @@
 # MinSync
 
-![MinSync turns changed files into searchable vector chunks](assets/minsync-flow.png)
+![MinSync turns changed files into searchable vector chunks](assets/minsync-flow.svg)
 
 MinSync is a manifest-based incremental vector database indexing CLI for text files. It does not need git: it tracks `mtime`, file size, and SHA-256 content hashes in `.minsync/`, re-embeds only changed chunks, sweeps stale chunks, and keeps a local LanceDB index ready for semantic search.
 
