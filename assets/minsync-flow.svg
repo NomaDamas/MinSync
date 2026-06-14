@@ -1,128 +1,141 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title desc">
   <title id="title">MinSync incremental indexing flow</title>
-  <desc id="desc">Files are scanned into a manifest, changed chunks are embedded into a vector database, and queries return matching text.</desc>
+  <desc id="desc">A five step diagram: files, manifest, changed chunks, embeddings, vector database, and query results.</desc>
   <defs>
-    <linearGradient id="fade" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0" stop-color="#fff"/>
-      <stop offset="1" stop-color="#f7f7f7"/>
-    </linearGradient>
-    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000" flood-opacity=".08"/>
-    </filter>
-    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#111"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 10 5 0 10z" fill="#111111"/>
     </marker>
     <style>
-      .bg { fill: url(#fade); }
-      .grid { stroke: #eaeaea; stroke-width: 1; }
-      .card { fill: #fff; stroke: #111; stroke-width: 2; rx: 28; filter: url(#soft); }
-      .mini { fill: #fafafa; stroke: #d7d7d7; stroke-width: 1.5; rx: 16; }
-      .title { font-family: Arial, Helvetica, sans-serif; font-size: 44px; font-weight: 700; fill: #050505; letter-spacing: 0; }
-      .label { font-family: Arial, Helvetica, sans-serif; font-size: 23px; font-weight: 700; fill: #111; letter-spacing: 0; }
-      .small { font-family: Arial, Helvetica, sans-serif; font-size: 18px; font-weight: 500; fill: #666; letter-spacing: 0; }
-      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 15px; font-weight: 600; fill: #777; letter-spacing: 0; }
-      .line { stroke: #111; stroke-width: 3; fill: none; marker-end: url(#arrow); stroke-linecap: round; }
-      .muted { stroke: #b8b8b8; stroke-width: 3; stroke-linecap: round; }
-      .dark { fill: #111; }
-      .ok { fill: #16a34a; }
+      .bg { fill: #ffffff; }
+      .grid { stroke: #eeeeee; stroke-width: 1; }
+      .card { fill: #ffffff; stroke: #111111; stroke-width: 2; rx: 8; }
+      .soft { fill: #fafafa; stroke: #dddddd; stroke-width: 1.5; rx: 8; }
+      .ink { fill: #111111; }
+      .muted-fill { fill: #e5e5e5; }
+      .green { fill: #16a34a; }
       .blue { fill: #2563eb; }
+      .line { stroke: #111111; stroke-width: 3; fill: none; stroke-linecap: round; marker-end: url(#arrow); }
+      .muted-line { stroke: #b7b7b7; stroke-width: 3; fill: none; stroke-linecap: round; }
+      .title { font-family: Arial, Helvetica, sans-serif; font-size: 52px; font-weight: 700; fill: #050505; letter-spacing: 0; }
+      .subtitle { font-family: Arial, Helvetica, sans-serif; font-size: 22px; font-weight: 500; fill: #666666; letter-spacing: 0; }
+      .label { font-family: Arial, Helvetica, sans-serif; font-size: 24px; font-weight: 700; fill: #111111; letter-spacing: 0; }
+      .small { font-family: Arial, Helvetica, sans-serif; font-size: 17px; font-weight: 600; fill: #666666; letter-spacing: 0; }
+      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 15px; font-weight: 600; fill: #777777; letter-spacing: 0; }
     </style>
   </defs>
 
-  <rect class="bg" width="1600" height="760"/>
-  <g opacity=".75">
-    <path class="grid" d="M80 0v760M160 0v760M240 0v760M320 0v760M400 0v760M480 0v760M560 0v760M640 0v760M720 0v760M800 0v760M880 0v760M960 0v760M1040 0v760M1120 0v760M1200 0v760M1280 0v760M1360 0v760M1440 0v760M1520 0v760"/>
+  <rect class="bg" width="1600" height="720"/>
+  <g opacity=".72">
+    <path class="grid" d="M80 0v720M160 0v720M240 0v720M320 0v720M400 0v720M480 0v720M560 0v720M640 0v720M720 0v720M800 0v720M880 0v720M960 0v720M1040 0v720M1120 0v720M1200 0v720M1280 0v720M1360 0v720M1440 0v720M1520 0v720"/>
     <path class="grid" d="M0 80h1600M0 160h1600M0 240h1600M0 320h1600M0 400h1600M0 480h1600M0 560h1600M0 640h1600"/>
   </g>
 
-  <text x="80" y="92" class="title">MinSync</text>
-  <text x="80" y="130" class="small">Manifest-based incremental vector indexing, no git required.</text>
+  <text class="title" x="80" y="92">MinSync</text>
+  <text class="subtitle" x="80" y="130">Manifest-based incremental vector indexing, no git required.</text>
 
   <g transform="translate(80 210)">
-    <rect class="card" width="210" height="250"/>
-    <text x="28" y="48" class="label">Files</text>
-    <text x="28" y="78" class="small">UTF-8 text</text>
-    <g transform="translate(36 112)">
-      <rect class="mini" x="34" y="-36" width="92" height="114"/>
-      <path d="M126 -36v32h32" fill="none" stroke="#d7d7d7" stroke-width="1.5"/>
-      <rect class="mini" x="0" y="0" width="128" height="150"/>
-      <path class="muted" d="M26 42h76M26 76h66M26 110h84"/>
-      <rect x="26" y="116" width="70" height="12" rx="6" class="dark" opacity=".9"/>
+    <rect class="card" width="220" height="230"/>
+    <text class="label" x="24" y="44">Files</text>
+    <text class="small" x="24" y="74">UTF-8 text only</text>
+    <g transform="translate(46 104)">
+      <rect class="soft" x="0" y="0" width="128" height="86"/>
+      <path class="muted-line" d="M22 28h84M22 50h62"/>
+      <rect class="ink" x="22" y="62" width="56" height="10" rx="5"/>
     </g>
   </g>
 
-  <path class="line" d="M318 335h96"/>
+  <path class="line" d="M320 325h48"/>
 
-  <g transform="translate(440 210)">
-    <rect class="card" width="230" height="250"/>
-    <text x="28" y="48" class="label">Manifest</text>
-    <text x="28" y="78" class="small">mtime · size · hash</text>
-    <g transform="translate(34 110)">
-      <path d="M0 8l14 14L42-8" fill="none" stroke="#16a34a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-      <path class="muted" d="M72 12h96M72 46h72"/>
-      <path d="M0 76l14 14 28-30" fill="none" stroke="#16a34a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-      <path class="muted" d="M72 80h104M72 114h84"/>
+  <g transform="translate(390 210)">
+    <rect class="card" width="220" height="230"/>
+    <text class="label" x="24" y="44">Manifest</text>
+    <text class="small" x="24" y="74">mtime · size · hash</text>
+    <g transform="translate(42 100)">
+      <path d="M0 16l16 16 36-40" fill="none" stroke="#16a34a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path class="muted-line" d="M78 16h86M78 48h62"/>
+      <path d="M0 82l16 16 36-40" fill="none" stroke="#16a34a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path class="muted-line" d="M78 82h86M78 112h62"/>
     </g>
   </g>
 
-  <path class="line" d="M698 335h96"/>
+  <path class="line" d="M630 325h48"/>
 
-  <g transform="translate(820 210)">
-    <rect class="card" width="260" height="250"/>
-    <text x="28" y="48" class="label">Changed chunks</text>
-    <text x="28" y="78" class="small">only re-embed diffs</text>
-    <g transform="translate(30 106)">
-      <rect class="mini" width="200" height="46"/>
-      <rect class="dark" x="18" y="16" width="64" height="14" rx="7"/>
-      <path class="muted" d="M96 23h78"/>
-      <rect class="mini" y="64" width="200" height="46"/>
-      <rect class="dark" x="18" y="80" width="94" height="14" rx="7"/>
-      <path class="muted" d="M126 87h48"/>
-      <rect class="mini" y="128" width="200" height="46"/>
-      <rect class="dark" x="18" y="144" width="48" height="14" rx="7"/>
-      <path class="muted" d="M80 151h94"/>
+  <g transform="translate(700 210)">
+    <rect class="card" width="220" height="230"/>
+    <text class="label" x="24" y="44">Changed</text>
+    <text class="small" x="24" y="74">chunks only</text>
+    <g transform="translate(30 96)">
+      <rect class="soft" x="0" y="0" width="160" height="32"/>
+      <rect class="ink" x="16" y="11" width="54" height="10" rx="5"/>
+      <path class="muted-line" d="M88 16h52"/>
+      <rect class="soft" x="0" y="46" width="160" height="32"/>
+      <rect class="ink" x="16" y="57" width="86" height="10" rx="5"/>
+      <path class="muted-line" d="M120 62h20"/>
+      <rect class="soft" x="0" y="92" width="160" height="32"/>
+      <rect class="ink" x="16" y="103" width="44" height="10" rx="5"/>
+      <path class="muted-line" d="M78 108h62"/>
     </g>
   </g>
 
-  <path class="line" d="M1108 335h96"/>
+  <path class="line" d="M940 325h48"/>
 
-  <g transform="translate(1230 210)">
-    <rect class="card" width="290" height="250"/>
-    <text x="28" y="48" class="label">Vector DB</text>
-    <text x="28" y="78" class="small">local LanceDB search</text>
-    <g transform="translate(44 104)">
-      <ellipse cx="92" cy="24" rx="92" ry="24" fill="#fff" stroke="#111" stroke-width="2"/>
-      <path d="M0 24v106c0 13 41 24 92 24s92-11 92-24V24" fill="#fff" stroke="#111" stroke-width="2"/>
-      <ellipse cx="92" cy="130" rx="92" ry="24" fill="#fff" stroke="#111" stroke-width="2"/>
-      <circle class="dark" cx="44" cy="68" r="5"/>
-      <circle class="dark" cx="72" cy="68" r="5"/>
-      <circle class="dark" cx="100" cy="68" r="5"/>
-      <circle class="dark" cx="128" cy="68" r="5"/>
-      <circle class="dark" cx="56" cy="104" r="5"/>
-      <circle class="dark" cx="84" cy="104" r="5"/>
-      <circle class="dark" cx="112" cy="104" r="5"/>
-      <circle class="dark" cx="140" cy="104" r="5"/>
+  <g transform="translate(1010 210)">
+    <rect class="card" width="220" height="230"/>
+    <text class="label" x="24" y="44">Embeddings</text>
+    <text class="small" x="24" y="74">vectors from text</text>
+    <g transform="translate(34 112)">
+      <rect class="soft" x="0" y="0" width="152" height="34"/>
+      <circle class="blue" cx="22" cy="17" r="7"/>
+      <circle class="blue" cx="50" cy="17" r="7"/>
+      <circle class="blue" cx="78" cy="17" r="7"/>
+      <circle class="muted-fill" cx="108" cy="17" r="4"/>
+      <circle class="muted-fill" cx="124" cy="17" r="4"/>
+      <circle class="blue" cx="142" cy="17" r="7"/>
+      <rect class="soft" x="0" y="58" width="152" height="34"/>
+      <circle class="blue" cx="22" cy="75" r="7"/>
+      <circle class="blue" cx="50" cy="75" r="7"/>
+      <circle class="muted-fill" cx="78" cy="75" r="4"/>
+      <circle class="muted-fill" cx="94" cy="75" r="4"/>
+      <circle class="blue" cx="122" cy="75" r="7"/>
     </g>
   </g>
 
-  <path class="line" d="M1375 488c0 58-56 86-126 86H352c-92 0-142-34-142-86"/>
+  <path class="line" d="M1250 325h48"/>
 
-  <g transform="translate(548 560)">
-    <rect class="card" width="560" height="98" rx="24"/>
-    <text x="28" y="42" class="label">Query</text>
-    <text x="28" y="70" class="small">embed once, return semantic matches</text>
-    <circle cx="498" cy="49" r="18" fill="none" stroke="#111" stroke-width="4"/>
-    <path d="M511 62l22 22" stroke="#111" stroke-width="5" stroke-linecap="round"/>
+  <g transform="translate(1320 210)">
+    <rect class="card" width="220" height="230"/>
+    <text class="label" x="24" y="44">Vector DB</text>
+    <text class="small" x="24" y="74">local LanceDB</text>
+    <g transform="translate(54 108)">
+      <ellipse cx="56" cy="18" rx="56" ry="18" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+      <path d="M0 18v84c0 10 25 18 56 18s56-8 56-18V18" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+      <ellipse cx="56" cy="102" rx="56" ry="18" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+      <circle class="ink" cx="28" cy="50" r="4"/>
+      <circle class="ink" cx="48" cy="50" r="4"/>
+      <circle class="ink" cx="68" cy="50" r="4"/>
+      <circle class="ink" cx="88" cy="50" r="4"/>
+      <circle class="ink" cx="38" cy="78" r="4"/>
+      <circle class="ink" cx="58" cy="78" r="4"/>
+      <circle class="ink" cx="78" cy="78" r="4"/>
+    </g>
   </g>
 
-  <g transform="translate(80 686)">
-    <rect x="0" y="-28" width="1440" height="1" fill="#e5e5e5"/>
-    <text x="0" y="12" class="tiny">Change detection without git</text>
-    <circle cx="235" cy="6" r="4" class="dark"/>
-    <text x="254" y="12" class="tiny">Deterministic chunk IDs</text>
-    <circle cx="478" cy="6" r="4" class="dark"/>
-    <text x="497" y="12" class="tiny">Crash-safe cursor</text>
-    <circle cx="690" cy="6" r="4" class="dark"/>
-    <text x="709" y="12" class="tiny">Text-only indexing</text>
+  <g transform="translate(390 520)">
+    <rect class="card" width="820" height="94"/>
+    <text class="label" x="28" y="39">Query</text>
+    <text class="small" x="28" y="68">embed once, return semantic matches from the local vector index</text>
+    <circle cx="750" cy="45" r="18" fill="none" stroke="#111111" stroke-width="4"/>
+    <path d="M763 58l24 24" stroke="#111111" stroke-width="5" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(80 662)">
+    <rect x="0" y="-26" width="1440" height="1" fill="#e5e5e5"/>
+    <text class="tiny" x="0" y="12">Change detection without git</text>
+    <circle class="ink" cx="230" cy="6" r="4"/>
+    <text class="tiny" x="250" y="12">Deterministic chunk IDs</text>
+    <circle class="ink" cx="470" cy="6" r="4"/>
+    <text class="tiny" x="490" y="12">Crash-safe cursor</text>
+    <circle class="ink" cx="680" cy="6" r="4"/>
+    <text class="tiny" x="700" y="12">Text-only indexing</text>
   </g>
 </svg>
