@@ -1,8 +1,24 @@
 # MinSync
 
+[English](README.md) | [한국어](README.ko.md)
+
 ![MinSync turns changed files into searchable vector chunks](assets/minsync-flow.svg)
 
 MinSync is a manifest-based incremental vector database indexing CLI for text files. It does not need git: it tracks `mtime`, file size, and SHA-256 content hashes in `.minsync/`, re-embeds only changed chunks, sweeps stale chunks, and keeps a local LanceDB index ready for semantic search.
+
+## Contents
+
+- [Why MinSync](#why-minsync)
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Core Concepts](#core-concepts)
+- [How It Works](#how-it-works)
+- [Chunkers](#chunkers)
+- [Vector Store](#vector-store)
+- [Embedding Reliability](#embedding-reliability)
+- [Local Embeddings with TEI](#local-embeddings-with-tei)
+- [Ignoring Files](#ignoring-files)
+- [Development](#development)
 
 ## Why MinSync
 
@@ -47,6 +63,8 @@ For local embeddings, use the TEI setup below.
 
 ## Quick Start
 
+Run these commands from the directory you want to index:
+
 ```bash
 minsync init                          # initialize .minsync/
 minsync sync                          # index changed files incrementally
@@ -57,6 +75,17 @@ minsync status                        # sync state
 minsync check                         # health check
 minsync verify --fix                  # consistency check + repair
 ```
+
+## Core Concepts
+
+| Concept | What it means |
+|---|---|
+| Manifest | File metadata and content hashes used to detect changes without git |
+| Cursor | The last completed processing point; updated only after a safe sync |
+| Chunk | A text segment that can be embedded and searched semantically |
+| Deterministic chunk ID | A stable ID derived from source, path, schema, content hash, and duplicate index |
+| Mark-and-sweep | Cleanup pass that removes vectors for files or chunks that no longer exist |
+| `.minsyncignore` | `.gitignore`-style ignore file for generated output, binaries, and unsupported formats |
 
 ## How It Works
 
