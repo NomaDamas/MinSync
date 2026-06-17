@@ -1,6 +1,20 @@
 # MinSync
 
+[English](README.md) | [한국어](README.ko.md)
+
 Manifest-based incremental vector DB indexing CLI. No git required. Written in Rust.
+
+## Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [How it works](#how-it-works)
+- [Chunkers](#chunkers)
+- [Vector store](#vector-store)
+- [Embedding network reliability](#embedding-network-reliability)
+- [Local embeddings with Hugging Face TEI](#local-embeddings-no-openai--hugging-face-tei)
+- [.minsyncignore](#minsyncignore)
+- [Development](#development)
 
 ## Install
 
