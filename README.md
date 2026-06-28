@@ -1,5 +1,7 @@
 # MinSync
 
+[English](README.md) | [한국어](README.ko.md)
+
 ![MinSync turns changed files into searchable vector chunks](assets/minsync-flow.svg)
 
 MinSync is a manifest-based incremental vector database indexing CLI for text files. It does not need git: it tracks `mtime`, file size, and SHA-256 content hashes in `.minsync/`, re-embeds only changed chunks, sweeps stale chunks, and keeps a local LanceDB index ready for semantic search.
@@ -12,6 +14,18 @@ MinSync is a manifest-based incremental vector database indexing CLI for text fi
 - **Deterministic chunk IDs**: IDs derive from source, path, schema, content hash, and duplicate index.
 - **Rust native**: a single CLI with chonkie-core chunking built in.
 - **Text-only by design**: PDF, DOCX, XLSX, images, and other binary formats are treated as empty because MinSync does no extraction. Add them to `.minsyncignore`.
+
+## Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [How it works](#how-it-works)
+- [Chunkers](#chunkers)
+- [Vector store](#vector-store)
+- [Embedding network reliability](#embedding-network-reliability)
+- [Local embeddings with Hugging Face TEI](#local-embeddings-no-openai--hugging-face-tei)
+- [.minsyncignore](#minsyncignore)
+- [Development](#development)
 
 ## Install
 
