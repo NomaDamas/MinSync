@@ -166,7 +166,10 @@ impl Embedder for OpenAiEmbedder {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::net::TcpListener;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -317,6 +320,25 @@ mod tests {
             .with_backoff(Duration::from_millis(1), Duration::from_millis(4))
     }
 
+    async fn hanging_openai_endpoint() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging endpoint");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_task = Arc::clone(&attempts);
+        let task = tokio::spawn(async move {
+            while let Ok((socket, _addr)) = listener.accept().await {
+                attempts_for_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _socket = socket;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+        (url, attempts, task)
+    }
+
     #[tokio::test]
     async fn test_retry_on_503_then_success() {
         let server = MockServer::start().await;
@@ -402,23 +424,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_is_retried_then_exhausted() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/embeddings"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(500))
-                    .set_body_json(json!({"data": [], "model": "m"})),
-            )
-            .mount(&server)
-            .await;
-
-        let embedder =
-            fast_retry_embedder(&server.uri(), 1).with_timeout(Duration::from_millis(50));
+        let (url, attempts, server_task) = hanging_openai_endpoint().await;
+        let embedder = fast_retry_embedder(&url, 1).with_timeout(Duration::from_millis(50));
         let error = embedder.embed(&["hello".to_string()]).await.unwrap_err();
+        server_task.abort();
 
         assert!(error.to_string().contains("retries exhausted"));
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

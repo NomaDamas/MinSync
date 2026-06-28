@@ -248,6 +248,48 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_prunes_after_repeated_upsert_replacements() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "old-a.txt", "old", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "old-b.txt", "old", vec![0.0, 1.0, 0.0, 0.0]),
+            ])
+            .expect("upsert initial docs");
+        store.flush().expect("flush initial docs");
+
+        for generation in 0..3 {
+            store
+                .upsert(&[
+                    doc(
+                        "a",
+                        &format!("new-a-{generation}.txt"),
+                        &format!("token-{generation}"),
+                        vec![0.0, 0.0, 1.0, 0.0],
+                    ),
+                    doc(
+                        "b",
+                        &format!("new-b-{generation}.txt"),
+                        &format!("token-{generation}"),
+                        vec![0.0, 0.0, 0.0, 1.0],
+                    ),
+                ])
+                .expect("upsert replacement docs");
+            store.flush().expect("flush replacement docs");
+        }
+
+        let fetched = store
+            .fetch(&["a".to_string(), "b".to_string()])
+            .expect("fetch replacement docs");
+        assert_eq!(store.doc_count(), 2);
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].path, "new-a-2.txt");
+        assert_eq!(fetched[0].seen_token, "token-2");
+        assert_eq!(fetched[1].path, "new-b-2.txt");
+        assert_eq!(fetched[1].seen_token, "token-2");
+    }
+
+    #[test]
     fn test_upsert_dedupes_input_batch_last_wins() {
         let (_dir, mut store) = store();
         store
