@@ -16,6 +16,9 @@ pub struct SyncResult {
     pub chunks_deleted: usize,
     pub dry_run: bool,
     pub already_up_to_date: bool,
+    /// True when this run performed the initial full sync because no
+    /// cursor.json existed (machine-readable readiness state).
+    pub initial_sync: bool,
     pub files_processed_paths: Vec<String>,
     pub elapsed_seconds: f64,
     pub embedding_api_calls: usize,

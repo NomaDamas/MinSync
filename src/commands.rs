@@ -108,6 +108,9 @@ async fn sync(
                     result.files_processed_paths.len()
                 );
             } else {
+                if result.initial_sync {
+                    println!("Initial sync: no cursor found — performed full sync.");
+                }
                 println!("Sync complete:");
                 println!("  files processed: {}", result.files_processed);
                 println!("  chunks added:    {}", result.chunks_added);

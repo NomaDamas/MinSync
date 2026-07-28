@@ -277,6 +277,70 @@ async fn test_sync_dry_run_no_side_effects() {
 }
 
 #[tokio::test]
+async fn test_init_then_plain_sync_is_queryable() {
+    // Regression for issue #31: init baselines the manifest, so a plain sync
+    // on a cursor-less workspace must perform the initial full sync instead
+    // of reporting already_up_to_date and leaving the workspace unqueryable.
+    let (dir, sync, chunker, embedder, mut store) = fixture();
+    write_file(&dir, "doc.txt", "alpha beta gamma");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
+
+    let result = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("plain sync succeeds");
+
+    assert!(
+        !result.already_up_to_date,
+        "sync must never report already_up_to_date when no cursor exists"
+    );
+    assert!(
+        result.initial_sync,
+        "sync on a cursor-less workspace must report initial_sync"
+    );
+    assert_eq!(result.files_processed, 1);
+    assert!(result.chunks_added > 0);
+    assert!(
+        dir.path().join(".minsync/cursor.json").exists(),
+        "plain sync on a cursor-less workspace must create cursor.json"
+    );
+
+    let query_results = query(
+        &dir.path().join(".minsync"),
+        "alpha beta",
+        3,
+        &embedder,
+        &store,
+        None,
+    )
+    .await
+    .expect("query immediately after plain sync succeeds");
+    assert!(!query_results.is_empty());
+}
+
+#[tokio::test]
+async fn test_sync_after_initial_sync_is_incremental_not_initial() {
+    let (dir, sync, chunker, embedder, mut store) = fixture();
+    write_file(&dir, "a.txt", "alpha beta gamma");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
+    let first = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("initial sync succeeds");
+    assert!(first.initial_sync);
+
+    let second = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("second sync succeeds");
+
+    assert!(second.already_up_to_date);
+    assert!(!second.initial_sync);
+}
+
+#[tokio::test]
 async fn test_sync_already_up_to_date() {
     let (dir, sync, chunker, embedder, mut store) = fixture();
     write_file(&dir, "a.txt", "alpha beta gamma");
