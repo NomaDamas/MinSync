@@ -14,7 +14,7 @@ pub enum MinSyncError {
     #[error("schema/embedder mismatch — run sync with --full")]
     SchemaMismatch,
 
-    #[error("never synced — run `minsync sync` first")]
+    #[error("never synced — run `minsync sync --full` first")]
     NeverSynced,
 
     #[error("query text is required")]

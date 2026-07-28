@@ -201,7 +201,12 @@ mod tests {
 
         let result = query(&minsync_dir, "search text", 5, &embedder, &store, None).await;
 
-        assert!(matches!(result, Err(MinSyncError::NeverSynced)));
+        let err = result.expect_err("query without cursor fails");
+        assert!(matches!(err, MinSyncError::NeverSynced));
+        assert!(
+            err.to_string().contains("minsync sync --full"),
+            "error must name the command that resolves the state, got: {err}"
+        );
     }
 
     #[tokio::test]
