@@ -19,6 +19,7 @@ pub(super) fn empty_sync_result(dry_run: bool, already_up_to_date: bool) -> Sync
         chunks_deleted: 0,
         dry_run,
         already_up_to_date,
+        initial_sync: false,
         files_processed_paths: Vec::new(),
         elapsed_seconds: 0.0,
         embedding_api_calls: 0,
@@ -52,6 +53,7 @@ mod tests {
         let result = empty_sync_result(true, false);
         assert!(result.dry_run);
         assert!(!result.already_up_to_date);
+        assert!(!result.initial_sync);
         assert_eq!(result.files_processed, 0);
         assert_eq!(result.chunks_added, 0);
     }

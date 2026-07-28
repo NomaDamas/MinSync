@@ -68,6 +68,14 @@ impl MinSync {
         let cursor_path = self.minsync_dir.join("cursor.json");
         let manifest_path = self.minsync_dir.join("manifest.json");
 
+        // A cursor-less workspace has never completed an initial sync: its
+        // baseline manifest (written by `init`) cannot drive a meaningful
+        // incremental diff, so upgrade to a full sync. This also guarantees
+        // the `already_up_to_date` early return below is unreachable while
+        // no cursor exists.
+        let initial_sync = !cursor_path.exists();
+        let full = full || initial_sync;
+
         if txn_path.exists() {
             Transaction::remove(&txn_path)?;
         }
@@ -99,6 +107,7 @@ impl MinSync {
                 files_processed_paths,
                 dry_run: true,
                 already_up_to_date: false,
+                initial_sync,
                 ..empty_sync_result(true, false)
             });
         }
@@ -114,6 +123,7 @@ impl MinSync {
 
         let start = std::time::Instant::now();
         let mut result = empty_sync_result(false, false);
+        result.initial_sync = initial_sync;
 
         for change in &changes {
             match change {
