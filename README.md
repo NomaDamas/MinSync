@@ -215,6 +215,14 @@ The skill tells agents how to install MinSync, initialize `.minsync/`, choose Op
 
 See [docs/RELEASE.md](docs/RELEASE.md) for the launch checklist. It covers CI, tag-based GitHub releases, crates.io publishing, README/docs, install QA, agent-skill QA, and rollback checks.
 
+## Architecture Scope
+
+MinSync intentionally remains a focused, cross-platform Rust tool for
+incremental Markdown-centered UTF-8 text indexing. It does not aim to become a
+general-purpose incremental dataflow framework. See
+[docs/ARCHITECTURE_SCOPE.md](docs/ARCHITECTURE_SCOPE.md) for the CocoIndex
+comparison, extension boundary, and accepted scope decision.
+
 ## Development
 
 CI runs on Ubuntu, macOS, and Windows with Rust 1.91 installed through rustup. It runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`. The build expects a working C compiler toolchain. CI also installs `protoc` through `arduino/setup-protoc`; non-Windows local builds use vendored protoc from `protobuf-src`, while Windows and LanceDB dependency build scripts require a `protoc` binary on `PATH`. Normal CI uses no secrets.

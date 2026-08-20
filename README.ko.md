@@ -203,6 +203,13 @@ npx skills add github:NomaDamas/MinSync/skills/minsync
 
 Launch checklist는 `docs/RELEASE.md`를 참고하세요. CI, tag 기반 GitHub release, crates.io publishing, README/docs, install QA, agent-skill QA, rollback check를 포함합니다.
 
+## Architecture Scope
+
+MinSync는 Markdown 중심 UTF-8 text를 증분 인덱싱하는 작고 효율적인
+cross-platform Rust 도구로 유지합니다. 범용 증분 dataflow framework를
+목표로 하지 않습니다. CocoIndex 비교, extension 경계, 채택된 범위 결정은
+[docs/ARCHITECTURE_SCOPE.md](docs/ARCHITECTURE_SCOPE.md)를 참고하세요.
+
 ## 개발
 
 CI는 Ubuntu, macOS, Windows에서 rustup으로 Rust 1.91을 설치한 뒤 `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`를 실행합니다. Build에는 C compiler toolchain이 필요합니다. CI는 `arduino/setup-protoc`으로 `protoc`을 설치합니다. Non-Windows local build는 `protobuf-src` vendored protoc을 사용하지만, Windows와 LanceDB dependency build script는 `PATH`의 `protoc` binary를 요구합니다. 일반 CI에는 secret이 필요하지 않습니다.
