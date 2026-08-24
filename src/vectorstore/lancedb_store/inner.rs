@@ -15,6 +15,7 @@ use arrow_array::RecordBatch;
 use futures::TryStreamExt;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::NewColumnTransform;
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, Table};
 use std::cmp::Ordering;
@@ -25,6 +26,7 @@ pub(super) struct LanceDbInner {
     table: Table,
     dim: usize,
     indexing: IndexingConfig,
+    language: String,
 }
 
 impl LanceDbInner {
@@ -32,6 +34,7 @@ impl LanceDbInner {
         uri: &str,
         dim: usize,
         indexing: IndexingConfig,
+        language: String,
     ) -> Result<Self> {
         let conn = lancedb::connect(uri)
             .execute()
@@ -44,6 +47,19 @@ impl LanceDbInner {
                 .execute()
                 .await
                 .map_err(to_store_error)?;
+            let existing_schema = table.schema().await.map_err(to_store_error)?;
+            if existing_schema.field_with_name("lexical_text").is_err() {
+                table
+                    .add_columns(
+                        NewColumnTransform::SqlExpressions(vec![(
+                            "lexical_text".to_string(),
+                            "text".to_string(),
+                        )]),
+                        None,
+                    )
+                    .await
+                    .map_err(to_store_error)?;
+            }
             validate_schema(&table.schema().await.map_err(to_store_error)?, dim)?;
             table
         } else {
@@ -58,6 +74,7 @@ impl LanceDbInner {
             table,
             dim,
             indexing,
+            language,
         })
     }
 
@@ -67,7 +84,7 @@ impl LanceDbInner {
         }
         let docs = dedupe_documents(docs);
         let id_filter = id_in_filter(docs.iter().map(|doc| doc.id.as_str()));
-        let batch = docs_to_batch(&docs, self.dim)?;
+        let batch = docs_to_batch(&docs, self.dim, &self.language)?;
         self.table
             .delete(&id_filter)
             .await
@@ -177,10 +194,15 @@ impl LanceDbInner {
             return Ok(Vec::new());
         }
         let sql_filter = filter.as_ref().map(filter_to_sql).transpose()?;
+        let tokenized_text = crate::tokenizer::tokenize(&text, &self.language)?;
         let mut query = self
             .table
             .query()
-            .full_text_search(FullTextSearchQuery::new(text))
+            .full_text_search(
+                FullTextSearchQuery::new(tokenized_text)
+                    .with_column("lexical_text".to_string())
+                    .map_err(to_store_error)?,
+            )
             .limit(topk)
             .select(Select::columns(&[
                 "id",

@@ -71,8 +71,11 @@ pub fn create_vectorstore(config: &Config, store_path: &Path) -> Result<Box<dyn 
             let options = Some(&config.vectorstore.options);
             let dimension = lancedb_store::LanceDbStore::dimension_from_options(options)?;
             let indexing = lancedb_store::IndexingConfig::from_options(options)?;
-            Ok(Box::new(lancedb_store::LanceDbStore::open_with_indexing(
-                store_path, dimension, indexing,
+            Ok(Box::new(lancedb_store::LanceDbStore::open_with_language(
+                store_path,
+                dimension,
+                indexing,
+                &config.lexical.language,
             )?))
         }
         other => Err(MinSyncError::Config(format!(

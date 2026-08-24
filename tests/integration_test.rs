@@ -695,6 +695,45 @@ async fn test_lancedb_bm25_incremental_delete_and_korean_e2e() {
 }
 
 #[test]
+fn test_lancedb_language_specific_tokenizers_live_e2e() {
+    let cases = [
+        ("ko", "오늘저녁먹음", "저녁"),
+        ("ja", "関西国際空港限定トートバッグ", "空港"),
+        ("zh", "我们中出了一个叛徒", "叛徒"),
+        ("ar", "والكتاب في المدرسة", "كتاب"),
+    ];
+    for (language, content, query_text) in cases {
+        let store_dir = tempfile::tempdir().expect("create store tempdir");
+        let mut store =
+            LanceDbStore::open_with_language(store_dir.path(), 8, Default::default(), language)
+                .expect("create language-aware LanceDB store");
+        store
+            .upsert(&[minsync::vectorstore::Document {
+                id: format!("{language}-doc"),
+                embedding: vec![1.0; 8],
+                text: content.to_string(),
+                source_id: "source".to_string(),
+                path: format!("{language}.txt"),
+                chunk_schema_id: "schema".to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash".to_string(),
+                seen_token: "token".to_string(),
+            }])
+            .expect("upsert multilingual document");
+        store.flush().expect("build language-aware BM25 index");
+        let hits = store
+            .query_text(query_text, None, 3)
+            .expect("query language-aware BM25 index");
+        assert_eq!(
+            hits.first().map(|hit| hit.doc_id.as_str()),
+            Some(format!("{language}-doc").as_str()),
+            "{language} query did not match: {hits:?}"
+        );
+    }
+}
+
+#[test]
 fn test_watch_should_index_integration() {
     let root = std::path::Path::new("/project");
     let minsync_dir = root.join(".minsync");

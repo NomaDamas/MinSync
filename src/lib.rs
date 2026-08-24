@@ -10,6 +10,7 @@ pub mod normalize;
 pub mod query;
 pub mod state;
 pub mod sync;
+pub mod tokenizer;
 pub mod types;
 pub mod vectorstore;
 pub mod verify;

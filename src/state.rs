@@ -14,6 +14,12 @@ pub struct Cursor {
     pub chunk_schema_id: String,
     pub embedder_id: String,
     pub collection_path: String,
+    #[serde(default = "default_lexical_language")]
+    pub lexical_language: String,
+}
+
+fn default_lexical_language() -> String {
+    "simple".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,6 +154,7 @@ mod tests {
             chunk_schema_id: "schema-1".to_string(),
             embedder_id: "embedder-1".to_string(),
             collection_path: ".minsync/collection".to_string(),
+            lexical_language: "simple".to_string(),
         }
     }
 

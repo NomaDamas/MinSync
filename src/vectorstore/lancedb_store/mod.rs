@@ -51,6 +51,16 @@ impl LanceDbStore {
         dimension: usize,
         indexing: IndexingConfig,
     ) -> Result<Self> {
+        Self::open_with_language(path, dimension, indexing, "simple")
+    }
+
+    pub fn open_with_language(
+        path: &Path,
+        dimension: usize,
+        indexing: IndexingConfig,
+        language: &str,
+    ) -> Result<Self> {
+        crate::tokenizer::validate_language(language)?;
         let dim = if dimension == 0 {
             DEFAULT_DIMENSION
         } else {
@@ -64,7 +74,9 @@ impl LanceDbStore {
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
-        let worker = thread::spawn(move || run_worker(uri, dim, indexing, cmd_rx, init_tx));
+        let language = language.to_string();
+        let worker =
+            thread::spawn(move || run_worker(uri, dim, indexing, language, cmd_rx, init_tx));
 
         match init_rx.recv().map_err(to_store_error)? {
             Ok(()) => Ok(Self {

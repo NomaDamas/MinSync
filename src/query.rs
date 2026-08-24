@@ -240,6 +240,7 @@ mod tests {
             chunk_schema_id: "schema-1".to_string(),
             embedder_id: "mock".to_string(),
             collection_path: "store".to_string(),
+            lexical_language: "simple".to_string(),
         }
         .save(&minsync_dir.join("cursor.json"))
         .expect("save cursor");

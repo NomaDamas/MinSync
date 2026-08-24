@@ -12,7 +12,8 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
             force,
             embedder,
             chunker,
-        } => init(&cli.format, root, force, &embedder, &chunker),
+            language,
+        } => init(&cli.format, root, force, &embedder, &chunker, &language),
         Commands::Sync {
             full,
             dry_run,
@@ -48,9 +49,13 @@ fn init(
     force: bool,
     embedder: &str,
     chunker: &str,
+    language: &str,
 ) -> Result<()> {
     let ms = MinSync::new(root);
-    let config = ms.init(force, embedder, chunker)?;
+    crate::tokenizer::validate_language(language)?;
+    let mut config = ms.init(force, embedder, chunker)?;
+    config.lexical.language = language.to_string();
+    config.save(&ms.minsync_dir().join("config.toml"))?;
     match format {
         OutputFormat::Text => {
             println!("Initialized MinSync in .minsync/");
@@ -59,6 +64,7 @@ fn init(
             println!("  chunker:     {}", config.chunker.id);
             println!("  embedder:    {}", config.embedder.id);
             println!("  vectorstore: {}", config.vectorstore.id);
+            println!("  language:    {}", config.lexical.language);
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&config)?);

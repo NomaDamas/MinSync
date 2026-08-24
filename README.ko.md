@@ -62,11 +62,23 @@ minsync check                         # health check
 minsync verify --fix                  # consistency check 및 repair
 ```
 
+초기화할 때 BM25 tokenizer preset을 선택할 수 있습니다.
+
+```bash
+minsync init --language ko
+```
+
+지원 값은 `simple`, `ko`, `ja`, `zh`, `ar`, `multilingual`입니다.
+한국어와 일본어는 사전이 내장된 Lindera, 중국어는 `jieba-rs`, 아랍어는
+Discrawl PR #180을 따른 in-process light stemmer를 사용합니다.
+`[lexical].language`를 바꾸면 다음 sync에서 full rebuild가 수행됩니다.
+
 ## 동작 방식
 
 MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일의 변경 여부를 판단합니다. 변경된 파일은 한 번만 chunk로 나누며, 같은 stable chunk ID를 LanceDB의 vector 검색과 BM25 검색이 공유합니다. stale row는 mark-and-sweep으로 제거됩니다. vector 모드는 query를 embedding하고, BM25 모드는 embedding 요청 없이 LanceDB full-text search를 사용하며, hybrid 모드는 두 순위를 결정적인 RRF(`k=60`)로 결합합니다.
 
-BM25는 LanceDB 기본 FTS tokenizer를 사용합니다. 한국어와 혼합 언어 Unicode 텍스트를 검색할 수 있지만 한국어 형태소 분석 전용 tokenizer는 아닙니다.
+선택한 analyzer가 문서와 query를 같은 방식으로 `lexical_text`로 변환한
+뒤 LanceDB BM25 index에서 검색합니다.
 
 상태는 `.minsync/`에 저장됩니다.
 

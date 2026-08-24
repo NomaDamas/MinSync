@@ -26,6 +26,7 @@ fn bm25_cli_queries_live_lancedb_without_embedder_credentials() {
         chunk_schema_id: "recursive".to_string(),
         embedder_id: config.embedder.id.clone(),
         collection_path: config.collection.path.clone(),
+        lexical_language: config.lexical.language.clone(),
     }
     .save(&minsync_dir.join("cursor.json"))
     .expect("save cursor");
@@ -73,4 +74,19 @@ fn bm25_cli_queries_live_lancedb_without_embedder_credentials() {
         String::from_utf8_lossy(&output.stderr).is_empty(),
         "BM25 mode must not attempt an embedding request"
     );
+}
+
+#[test]
+fn init_cli_persists_multilingual_language_option() {
+    let root = tempfile::tempdir().expect("create workspace");
+    Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root.path())
+        .args(["init", "--language", "multilingual"])
+        .assert()
+        .success();
+
+    let config =
+        Config::load(&root.path().join(".minsync/config.toml")).expect("load initialized config");
+    assert_eq!(config.lexical.language, "multilingual");
 }

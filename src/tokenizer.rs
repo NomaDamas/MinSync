@@ -1,0 +1,162 @@
+use crate::error::{MinSyncError, Result};
+use jieba_rs::Jieba;
+use lindera::dictionary::load_dictionary;
+use lindera::mode::Mode;
+use lindera::mode::Penalty;
+use lindera::segmenter::Segmenter;
+use lindera::tokenizer::Tokenizer as LinderaTokenizer;
+use std::sync::OnceLock;
+
+pub const SUPPORTED_LANGUAGES: &[&str] = &["simple", "ko", "ja", "zh", "ar", "multilingual"];
+
+pub fn validate_language(language: &str) -> Result<()> {
+    if SUPPORTED_LANGUAGES.contains(&language) {
+        Ok(())
+    } else {
+        Err(MinSyncError::Config(format!(
+            "unsupported BM25 language {language:?}; use simple, ko, ja, zh, ar, or multilingual"
+        )))
+    }
+}
+
+pub fn tokenize(text: &str, language: &str) -> Result<String> {
+    validate_language(language)?;
+    match language {
+        "simple" => Ok(simple_tokens(text)),
+        "ko" => korean_tokens(text),
+        "ja" => japanese_tokens(text),
+        "zh" => Ok(chinese_tokens(text)),
+        "ar" => Ok(arabic_tokens(text)),
+        "multilingual" => Ok([
+            simple_tokens(text),
+            korean_tokens(text)?,
+            japanese_tokens(text)?,
+            chinese_tokens(text),
+            arabic_tokens(text),
+        ]
+        .join(" ")),
+        _ => unreachable!(),
+    }
+}
+
+fn simple_tokens(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| token.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn korean_tokens(text: &str) -> Result<String> {
+    static TOKENIZER: OnceLock<std::result::Result<LinderaTokenizer, String>> = OnceLock::new();
+    let tokenizer = TOKENIZER
+        .get_or_init(|| {
+            load_dictionary("embedded://ko-dic")
+                .map(|dictionary| {
+                    LinderaTokenizer::new(Segmenter::new(Mode::Normal, dictionary, None))
+                })
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|error| MinSyncError::Config(format!("initialize Korean tokenizer: {error}")))?;
+    let tokens = tokenizer
+        .tokenize(text)
+        .map_err(|error| MinSyncError::Config(format!("tokenize Korean text: {error}")))?;
+    Ok(tokens
+        .into_iter()
+        .map(|token| token.surface.to_string())
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn japanese_tokens(text: &str) -> Result<String> {
+    static TOKENIZER: OnceLock<std::result::Result<LinderaTokenizer, String>> = OnceLock::new();
+    let tokenizer = TOKENIZER
+        .get_or_init(|| {
+            load_dictionary("embedded://ipadic")
+                .map(|dictionary| {
+                    LinderaTokenizer::new(Segmenter::new(
+                        Mode::Decompose(Penalty::default()),
+                        dictionary,
+                        None,
+                    ))
+                })
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|error| MinSyncError::Config(format!("initialize Japanese tokenizer: {error}")))?;
+    let tokens = tokenizer
+        .tokenize(text)
+        .map_err(|error| MinSyncError::Config(format!("tokenize Japanese text: {error}")))?;
+    Ok(tokens
+        .into_iter()
+        .map(|token| token.surface.to_string())
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn chinese_tokens(text: &str) -> String {
+    static TOKENIZER: OnceLock<Jieba> = OnceLock::new();
+    TOKENIZER.get_or_init(Jieba::new).cut(text, false).join(" ")
+}
+
+fn arabic_tokens(text: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "وال", "فال", "بال", "كال", "لال", "ال", "لل", "و", "ف", "ب", "ك", "ل",
+    ];
+    const SUFFIXES: &[&str] = &["ها", "ان", "ات", "ون", "ين", "يه", "ية", "ه", "ة", "ي"];
+    let mut tokens = Vec::new();
+    for word in text.split(|c: char| !c.is_alphabetic()) {
+        if word.is_empty() {
+            continue;
+        }
+        let word = word.to_lowercase();
+        tokens.push(word.clone());
+        let mut stem = word;
+        for prefix in PREFIXES {
+            if let Some(rest) = stem.strip_prefix(prefix) {
+                if rest.chars().count() >= 2 {
+                    stem = rest.to_string();
+                    break;
+                }
+            }
+        }
+        for suffix in SUFFIXES {
+            if stem.ends_with(suffix) && stem.chars().count() > suffix.chars().count() + 1 {
+                stem.truncate(stem.len() - suffix.len());
+                break;
+            }
+        }
+        if !tokens.contains(&stem) {
+            tokens.push(stem);
+        }
+    }
+    tokens.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multilingual_presets_split_language_specific_words() {
+        assert!(tokenize("아버지가방에들어가신다", "ko")
+            .expect("Korean tokenize")
+            .contains("아버지"));
+        assert!(tokenize("関西国際空港限定トートバッグ", "ja")
+            .expect("Japanese tokenize")
+            .contains("関西"));
+        assert!(tokenize("我们中出了一个叛徒", "zh")
+            .expect("Chinese tokenize")
+            .contains("我们"));
+        assert!(tokenize("والكتاب في المدرسة", "ar")
+            .expect("Arabic tokenize")
+            .contains("كتاب"));
+    }
+
+    #[test]
+    fn language_validation_rejects_unknown_presets() {
+        assert!(validate_language("klingon").is_err());
+    }
+}

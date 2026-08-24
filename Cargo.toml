@@ -47,6 +47,8 @@ arrow-schema = "58.3.0"
 futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 lzma-sys = { version = "0.1", features = ["static"] }
+jieba-rs = "0.9.0"
+lindera = { version = "3.0.7", features = ["embed-ipadic", "embed-ko-dic"] }
 
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"

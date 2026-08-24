@@ -49,6 +49,8 @@ pub enum Commands {
         embedder: String,
         #[arg(long, default_value = "recursive")]
         chunker: String,
+        #[arg(long, default_value = "simple")]
+        language: String,
     },
     /// Sync files to vector index
     Sync {

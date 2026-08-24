@@ -90,10 +90,18 @@ pub(super) async fn maintain_index(table: &Table, indexing: &IndexingConfig) -> 
     let indices = table.list_indices().await.map_err(to_store_error)?;
     if !indices
         .iter()
-        .any(|index| index.columns.iter().any(|column| column == "text"))
+        .any(|index| index.columns.iter().any(|column| column == "lexical_text"))
     {
         table
-            .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
+            .create_index(
+                &["lexical_text"],
+                Index::FTS(
+                    FtsIndexBuilder::default()
+                        .stem(false)
+                        .remove_stop_words(false)
+                        .ascii_folding(false),
+                ),
+            )
             .execute()
             .await
             .map_err(to_store_error)?;
