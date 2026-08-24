@@ -1,7 +1,7 @@
 //! CLI command handlers. `main.rs` stays a thin binary: parse args, set up
 //! logging, dispatch here, and map errors to exit codes.
 
-use crate::cli::{Cli, Commands, OutputFormat};
+use crate::cli::{Cli, Commands, OutputFormat, QueryMode};
 use crate::error::Result;
 use crate::sync::MinSync;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
             )
             .await
         }
-        Commands::Query { text, k } => query(&cli.format, &minsync_dir, &text, k).await,
+        Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
         Commands::Status => status(&cli.format, &minsync_dir).await,
         Commands::Check => check(&cli.format, &minsync_dir).await,
         Commands::Verify { fix, all, sample } => {
@@ -136,21 +136,27 @@ async fn query(
     minsync_dir: &std::path::Path,
     text: &str,
     k: usize,
+    mode: QueryMode,
 ) -> Result<()> {
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
-    let embedder = crate::embedder::create_embedder(&config)?;
     let store_path = minsync_dir.join(&config.collection.path);
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
-
-    let results = crate::query::query(
-        minsync_dir,
-        text,
-        k,
-        embedder.as_ref(),
-        store.as_ref(),
-        None,
-    )
-    .await?;
+    let results = match mode {
+        QueryMode::Bm25 => crate::query::query_text(minsync_dir, text, k, store.as_ref(), None)?,
+        QueryMode::Vector | QueryMode::Hybrid => {
+            let embedder = crate::embedder::create_embedder(&config)?;
+            crate::query::query(
+                minsync_dir,
+                text,
+                k,
+                embedder.as_ref(),
+                store.as_ref(),
+                None,
+                mode,
+            )
+            .await?
+        }
+    };
 
     match format {
         OutputFormat::Text => {

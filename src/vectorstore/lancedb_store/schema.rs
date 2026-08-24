@@ -187,6 +187,30 @@ pub(super) fn batch_to_query_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> 
     Ok(hits)
 }
 
+pub(super) fn batch_to_fts_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> {
+    let ids = string_col(batch, "id")?;
+    let paths = string_col(batch, "path")?;
+    let headings = string_col(batch, "heading_path")?;
+    let chunk_types = string_col(batch, "chunk_type")?;
+    let texts = string_col(batch, "text")?;
+    let hashes = string_col(batch, "content_hash")?;
+    let scores = batch
+        .column_by_name("_score")
+        .ok_or_else(|| missing_column("_score"))?
+        .as_primitive::<Float32Type>();
+    Ok((0..batch.num_rows())
+        .map(|row| QueryHit {
+            doc_id: ids.value(row).to_string(),
+            path: paths.value(row).to_string(),
+            heading_path: headings.value(row).to_string(),
+            chunk_type: chunk_types.value(row).to_string(),
+            text: texts.value(row).to_string(),
+            score: scores.value(row),
+            content_hash: hashes.value(row).to_string(),
+        })
+        .collect())
+}
+
 pub(super) fn dedupe_documents(docs: Vec<Document>) -> Vec<Document> {
     let mut last_by_id = HashMap::new();
     for (index, doc) in docs.iter().enumerate() {

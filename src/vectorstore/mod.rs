@@ -51,6 +51,8 @@ pub trait VectorStore: Send + Sync {
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>>;
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize>;
     fn query(&self, vector: &[f32], filter: Option<&Filter>, topk: usize) -> Result<Vec<QueryHit>>;
+    fn query_text(&self, text: &str, filter: Option<&Filter>, topk: usize)
+        -> Result<Vec<QueryHit>>;
     fn flush(&mut self) -> Result<()>;
     fn doc_count(&self) -> usize;
     fn all_paths(&self) -> Vec<String>;

@@ -3,8 +3,8 @@
 use super::filters::{filter_to_sql, id_in_filter, sql_literal};
 use super::index::maintain_index;
 use super::schema::{
-    batch_to_documents, batch_to_query_hits, dedupe_documents, docs_to_batch, schema, string_col,
-    validate_schema, validate_vector,
+    batch_to_documents, batch_to_fts_hits, batch_to_query_hits, dedupe_documents, docs_to_batch,
+    schema, string_col, validate_schema, validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, Table};
@@ -161,6 +162,55 @@ impl LanceDbInner {
                 .score
                 .partial_cmp(&left.score)
                 .unwrap_or(Ordering::Equal)
+        });
+        hits.truncate(topk);
+        Ok(hits)
+    }
+
+    pub(super) async fn query_text(
+        &self,
+        text: String,
+        filter: Option<Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        if topk == 0 {
+            return Ok(Vec::new());
+        }
+        let sql_filter = filter.as_ref().map(filter_to_sql).transpose()?;
+        let mut query = self
+            .table
+            .query()
+            .full_text_search(FullTextSearchQuery::new(text))
+            .limit(topk)
+            .select(Select::columns(&[
+                "id",
+                "path",
+                "heading_path",
+                "chunk_type",
+                "text",
+                "content_hash",
+                "_score",
+            ]));
+        if let Some(sql) = sql_filter {
+            query = query.only_if(sql);
+        }
+        let batches: Vec<RecordBatch> = query
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut hits = Vec::new();
+        for batch in batches {
+            hits.extend(batch_to_fts_hits(&batch)?);
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
         });
         hits.truncate(topk);
         Ok(hits)

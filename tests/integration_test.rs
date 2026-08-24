@@ -1,6 +1,7 @@
 use minsync::chunker::chonkie::ChonkieChunker;
 use minsync::chunker::create_chunker;
 use minsync::chunker::recursive::RecursiveChunker;
+use minsync::cli::QueryMode;
 use minsync::config::Config;
 use minsync::embedder::tei::TeiEmbedder;
 use minsync::embedder::Embedder;
@@ -78,6 +79,7 @@ async fn test_full_workflow() {
         &embedder,
         &store,
         None,
+        QueryMode::Vector,
     )
     .await
     .expect("query succeeds");
@@ -313,6 +315,7 @@ async fn test_init_then_plain_sync_is_queryable() {
         &embedder,
         &store,
         None,
+        QueryMode::Vector,
     )
     .await
     .expect("query immediately after plain sync succeeds");
@@ -560,6 +563,7 @@ async fn test_recursive_chunker_end_to_end() {
         &embedder,
         &store,
         None,
+        QueryMode::Vector,
     )
     .await
     .expect("query succeeds");
@@ -595,6 +599,14 @@ async fn test_lancedb_backend_end_to_end() {
     assert!(result.chunks_added > 0);
     assert!(store.doc_count() > 0);
 
+    let bm25_hits = store
+        .query_text("apples", None, 5)
+        .expect("lancedb BM25 query succeeds");
+    assert!(
+        bm25_hits.iter().any(|hit| hit.text.contains("apples")),
+        "BM25 must retrieve the shared normalized chunk text"
+    );
+
     let query_results = query(
         &dir.path().join(".minsync"),
         "apples",
@@ -602,6 +614,7 @@ async fn test_lancedb_backend_end_to_end() {
         &embedder,
         &store,
         None,
+        QueryMode::Vector,
     )
     .await
     .expect("lancedb query succeeds");
@@ -622,6 +635,63 @@ async fn test_lancedb_backend_end_to_end() {
     assert_eq!(incremental.files_processed_paths, vec!["notes.txt"]);
     assert!(incremental.chunks_added + incremental.chunks_updated > 0);
     assert!(store.doc_count() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lancedb_bm25_incremental_delete_and_korean_e2e() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let store_dir = tempfile::tempdir().expect("create store tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = RecursiveChunker::new(128);
+    let embedder = MockEmbedder;
+    let mut store =
+        LanceDbStore::open_or_create(store_dir.path(), 8).expect("create lancedb store");
+
+    write_file(
+        &dir,
+        "korean.md",
+        "# 환불 정책\n\n한국어 환불 정책과 배송 안내입니다.",
+    );
+    write_file(&dir, "other.md", "unrelated lexical content");
+    sync.init(false, "openai:text-embedding-3-small", "recursive")
+        .expect("init succeeds");
+    sync.sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("initial live sync succeeds");
+
+    let first = store
+        .query_text("환불 정책", None, 5)
+        .expect("Korean BM25 query succeeds");
+    assert_eq!(first.len(), 1);
+    let stable_id = first[0].doc_id.clone();
+
+    write_file(
+        &dir,
+        "korean.md",
+        "# 환불 정책\n\n한국어 환불 정책과 배송 안내입니다. 교환 조건도 확인하세요.",
+    );
+    sync.sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("incremental live sync succeeds");
+    let modified = store
+        .query_text("교환 조건", None, 5)
+        .expect("updated BM25 query succeeds");
+    assert!(
+        modified.iter().any(|hit| hit.text.contains("교환 조건")),
+        "modified shared chunk must be searchable"
+    );
+
+    std::fs::remove_file(dir.path().join("korean.md")).expect("delete source");
+    sync.sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("delete live sync succeeds");
+    let deleted = store
+        .query_text("환불 정책", None, 5)
+        .expect("post-delete BM25 query succeeds");
+    assert!(
+        deleted.iter().all(|hit| hit.doc_id != stable_id),
+        "stale deleted chunk must leave lexical results"
+    );
 }
 
 #[test]
@@ -898,6 +968,7 @@ async fn test_tei_full_sync_and_query_pipeline() {
         &embedder,
         &store,
         None,
+        QueryMode::Vector,
     )
     .await
     .expect("tei query succeeds");

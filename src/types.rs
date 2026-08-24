@@ -36,6 +36,11 @@ pub struct QueryResult {
     pub score: f32,
     pub content_commit: String,
     pub rank: usize,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_rank: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

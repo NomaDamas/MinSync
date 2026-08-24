@@ -158,6 +158,20 @@ impl VectorStore for LanceDbStore {
         })
     }
 
+    fn query_text(
+        &self,
+        text: &str,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        self.request(|resp| Command::QueryText {
+            text: text.to_string(),
+            filter: filter.cloned(),
+            topk,
+            resp,
+        })
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.request(Command::Flush)
     }
@@ -508,9 +522,10 @@ mod tests {
         let docs: Vec<_> = (0..50).map(spread_doc).collect();
         store.upsert(&docs).expect("upsert docs");
         store.flush().expect("flush");
+        let indices = store.index_names().expect("list indices");
         assert!(
-            store.index_names().expect("list indices").is_empty(),
-            "no ANN index should exist below the row threshold"
+            indices.len() == 1 && indices[0].contains("text"),
+            "only the BM25 text index should exist below the ANN row threshold, got {indices:?}"
         );
     }
 
