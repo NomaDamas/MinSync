@@ -92,6 +92,8 @@ Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted
 `JAICHANGPARK/kiwi-rs` until a corrected crates.io release is available.
 On macOS/Linux, `bash scripts/install-kiwi.sh` downloads the matching official
 assets and prints the required environment variables.
+On Windows, run `powershell -ExecutionPolicy Bypass -File
+scripts/install-kiwi.ps1` and set the printed paths in the environment.
 
 ## How It Works
 

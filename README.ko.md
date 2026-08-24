@@ -80,6 +80,8 @@ in-process light stemmer를 사용합니다.
 전까지 MinSync는 `JAICHANGPARK/kiwi-rs`의 ABI 수정 commit을 고정합니다.
 macOS/Linux에서는 `bash scripts/install-kiwi.sh`가 공식 자산을 내려받고
 필요한 환경변수를 출력합니다.
+Windows에서는 `powershell -ExecutionPolicy Bypass -File
+scripts/install-kiwi.ps1`를 실행한 뒤 출력된 경로를 환경변수로 설정합니다.
 
 ## 동작 방식
 

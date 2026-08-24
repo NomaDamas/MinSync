@@ -53,5 +53,12 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test
+      - name: Test
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cargo test -- --test-threads=1
+          else
+            cargo test
+          fi
       - run: cargo build --release
