@@ -58,6 +58,36 @@ fn korean_tokens(text: &str) -> Result<String> {
         .join(" "))
 }
 
+#[cfg(windows)]
+fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
+    thread_local! {
+        // Kiwi's Windows native destructor can raise STATUS_ACCESS_VIOLATION
+        // during thread-local teardown. Keep one instance alive until process
+        // exit; the bounded leak avoids unloading native state prematurely.
+        static TOKENIZER: RefCell<Option<&'static Kiwi>> = const { RefCell::new(None) };
+    }
+    TOKENIZER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let kiwi = Kiwi::init().map_err(|error| {
+                MinSyncError::Config(format!("initialize Korean tokenizer: {error}"))
+            })?;
+            *slot = Some(Box::leak(Box::new(kiwi)));
+        }
+        slot.as_ref()
+            .expect("Kiwi initialized above")
+            .tokenize(text)
+            .map(|tokens| {
+                tokens
+                    .into_iter()
+                    .map(|token| (token.form, token.tag))
+                    .collect()
+            })
+            .map_err(|error| MinSyncError::Config(format!("tokenize Korean text: {error}")))
+    })
+}
+
+#[cfg(not(windows))]
 fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
     thread_local! {
         static TOKENIZER: RefCell<Option<Kiwi>> = const { RefCell::new(None) };
