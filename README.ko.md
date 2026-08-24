@@ -69,9 +69,17 @@ minsync init --language ko
 ```
 
 지원 값은 `simple`, `ko`, `ja`, `zh`, `ar`, `multilingual`입니다.
-한국어와 일본어는 사전이 내장된 Lindera, 중국어는 `jieba-rs`, 아랍어는
-Discrawl PR #180을 따른 in-process light stemmer를 사용합니다.
+한국어는 `kiwi-rs` Rust binding을 통한 Kiwi, 일본어는 사전이 내장된
+Lindera, 중국어는 `jieba-rs`, 아랍어는 Discrawl PR #180을 따른
+in-process light stemmer를 사용합니다.
 `[lexical].language`를 바꾸면 다음 sync에서 full rebuild가 수행됩니다.
+
+한국어 tokenizer에는 공식 Kiwi native library와 base model이 필요합니다.
+`KIWI_LIBRARY_PATH`는 `libkiwi`, `KIWI_MODEL_PATH`는 압축 해제한
+`models/cong/base`를 가리켜야 합니다. 수정된 crates.io release가 나오기
+전까지 MinSync는 `JAICHANGPARK/kiwi-rs`의 ABI 수정 commit을 고정합니다.
+macOS/Linux에서는 `bash scripts/install-kiwi.sh`가 공식 자산을 내려받고
+필요한 환경변수를 출력합니다.
 
 ## 동작 방식
 

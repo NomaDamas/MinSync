@@ -13,6 +13,7 @@ fn bm25_cli_queries_live_lancedb_without_embedder_credentials() {
     let source_id = "source-live-bm25";
     let mut config = Config::default_for(source_id);
     config.embedder.id = "openai:text-embedding-3-small".to_string();
+    config.lexical.language = "ko".to_string();
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(4));
     config.vectorstore.options = toml::Value::Table(options);
@@ -32,17 +33,18 @@ fn bm25_cli_queries_live_lancedb_without_embedder_credentials() {
     .expect("save cursor");
 
     let store_path = minsync_dir.join(&config.collection.path);
-    let mut store = LanceDbStore::open_or_create(&store_path, 4).expect("open LanceDB");
+    let mut store = LanceDbStore::open_with_language(&store_path, 4, Default::default(), "ko")
+        .expect("open Korean LanceDB");
     store
         .upsert(&[Document {
             id: "shared-chunk-id".to_string(),
             embedding: vec![1.0, 0.0, 0.0, 0.0],
-            text: "한국어 환불 정책과 mixed language refund policy".to_string(),
+            text: "오늘저녁먹음".to_string(),
             source_id: source_id.to_string(),
             path: "policy.md".to_string(),
             chunk_schema_id: "recursive".to_string(),
             chunk_type: "text".to_string(),
-            heading_path: "환불 정책".to_string(),
+            heading_path: "저녁 식사".to_string(),
             content_hash: "sha256:chunk".to_string(),
             seen_token: "live".to_string(),
         }])
@@ -54,7 +56,7 @@ fn bm25_cli_queries_live_lancedb_without_embedder_credentials() {
         .expect("find minsync binary")
         .current_dir(root.path())
         .env_remove("OPENAI_API_KEY")
-        .args(["--format", "json", "query", "환불 정책", "--mode", "bm25"])
+        .args(["--format", "json", "query", "저녁", "--mode", "bm25"])
         .output()
         .expect("run BM25 CLI");
 

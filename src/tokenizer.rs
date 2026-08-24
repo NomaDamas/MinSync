@@ -1,10 +1,12 @@
 use crate::error::{MinSyncError, Result};
 use jieba_rs::Jieba;
+use kiwi_rs::Kiwi;
 use lindera::dictionary::load_dictionary;
 use lindera::mode::Mode;
 use lindera::mode::Penalty;
 use lindera::segmenter::Segmenter;
 use lindera::tokenizer::Tokenizer as LinderaTokenizer;
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 pub const SUPPORTED_LANGUAGES: &[&str] = &["simple", "ko", "ja", "zh", "ar", "multilingual"];
@@ -49,25 +51,35 @@ fn simple_tokens(text: &str) -> String {
 }
 
 fn korean_tokens(text: &str) -> Result<String> {
-    static TOKENIZER: OnceLock<std::result::Result<LinderaTokenizer, String>> = OnceLock::new();
-    let tokenizer = TOKENIZER
-        .get_or_init(|| {
-            load_dictionary("embedded://ko-dic")
-                .map(|dictionary| {
-                    LinderaTokenizer::new(Segmenter::new(Mode::Normal, dictionary, None))
-                })
-                .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(|error| MinSyncError::Config(format!("initialize Korean tokenizer: {error}")))?;
-    let tokens = tokenizer
-        .tokenize(text)
-        .map_err(|error| MinSyncError::Config(format!("tokenize Korean text: {error}")))?;
-    Ok(tokens
+    Ok(korean_analysis(text)?
         .into_iter()
-        .map(|token| token.surface.to_string())
+        .map(|(form, _)| form)
         .collect::<Vec<_>>()
         .join(" "))
+}
+
+fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
+    thread_local! {
+        static TOKENIZER: RefCell<Option<Kiwi>> = const { RefCell::new(None) };
+    }
+    TOKENIZER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Kiwi::init().map_err(|error| {
+                MinSyncError::Config(format!("initialize Korean tokenizer: {error}"))
+            })?);
+        }
+        slot.as_ref()
+            .expect("Kiwi initialized above")
+            .tokenize(text)
+            .map(|tokens| {
+                tokens
+                    .into_iter()
+                    .map(|token| (token.form, token.tag))
+                    .collect()
+            })
+            .map_err(|error| MinSyncError::Config(format!("tokenize Korean text: {error}")))
+    })
 }
 
 fn japanese_tokens(text: &str) -> Result<String> {
@@ -158,5 +170,53 @@ mod tests {
     #[test]
     fn language_validation_rejects_unknown_presets() {
         assert!(validate_language("klingon").is_err());
+    }
+
+    #[test]
+    fn kiwi_matches_kiwipiepy_reference_forms_and_tags() {
+        let cases = [
+            (
+                "아버지가방에들어가신다",
+                vec![
+                    ("아버지", "NNG"),
+                    ("가", "JKS"),
+                    ("방", "NNG"),
+                    ("에", "JKB"),
+                    ("들어가", "VV"),
+                    ("시", "EP"),
+                    ("ᆫ다", "EF"),
+                ],
+            ),
+            (
+                "오늘저녁먹음",
+                vec![("오늘", "NNG"), ("저녁", "NNG"), ("먹", "VV"), ("음", "EF")],
+            ),
+            (
+                "서울맛집추천",
+                vec![("서울", "NNP"), ("맛집", "NNG"), ("추천", "NNG")],
+            ),
+            (
+                "환불정책과배송안내입니다",
+                vec![
+                    ("환불", "NNG"),
+                    ("정책", "NNG"),
+                    ("과", "JC"),
+                    ("배송", "NNG"),
+                    ("안내", "NNG"),
+                    ("이", "VCP"),
+                    ("ᆸ니다", "EF"),
+                ],
+            ),
+        ];
+        for (text, expected) in cases {
+            let actual = korean_analysis(text).expect("Kiwi analysis succeeds");
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|(form, tag)| (form.to_string(), tag.to_string()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

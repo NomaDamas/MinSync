@@ -2890,6 +2890,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiwi-rs"
+version = "2026.7.24"
+source = "git+https://github.com/JAICHANGPARK/kiwi-rs?rev=40f066b4e8cf18f7531cdec690d1c3fe080e7c63#40f066b4e8cf18f7531cdec690d1c3fe080e7c63"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3606,7 +3614,6 @@ dependencies = [
  "kanaria",
  "lindera-dictionary",
  "lindera-ipadic",
- "lindera-ko-dic",
  "log",
  "once_cell",
  "percent-encoding",
@@ -3660,20 +3667,6 @@ name = "lindera-ipadic"
 version = "3.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "130c598519a40bbfb762c4c06d6ad29315331eb4c154fcb2d1d6b46776cee7d9"
-dependencies = [
- "anyhow",
- "byteorder",
- "csv",
- "lindera-dictionary",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "lindera-ko-dic"
-version = "3.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c62860decd3abdfc4e15c1c254130e71bb083d471310e1ac7aefe68c5fb8fcc"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -3864,6 +3857,7 @@ dependencies = [
  "hex",
  "ignore",
  "jieba-rs",
+ "kiwi-rs",
  "lancedb",
  "lindera",
  "lzma-sys",

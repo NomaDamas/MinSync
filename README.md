@@ -81,9 +81,17 @@ minsync init --language ko
 ```
 
 Supported values are `simple`, `ko`, `ja`, `zh`, `ar`, and `multilingual`.
-Korean and Japanese use embedded Lindera dictionaries, Chinese uses `jieba-rs`,
-and Arabic uses an in-process light stemmer based on Discrawl PR #180.
+Korean uses Kiwi through the `kiwi-rs` Rust binding, Japanese uses an embedded
+Lindera dictionary, Chinese uses `jieba-rs`, and Arabic uses an in-process light
+stemmer based on Discrawl PR #180.
 Changing `[lexical].language` triggers a full rebuild on the next sync.
+
+Korean tokenization requires the official Kiwi native library and base model.
+Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted
+`models/cong/base` directory. MinSync pins the unreleased ABI fix from
+`JAICHANGPARK/kiwi-rs` until a corrected crates.io release is available.
+On macOS/Linux, `bash scripts/install-kiwi.sh` downloads the matching official
+assets and prints the required environment variables.
 
 ## How It Works
 
