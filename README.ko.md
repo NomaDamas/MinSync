@@ -82,6 +82,8 @@ macOS/Linux에서는 `bash scripts/install-kiwi.sh`가 공식 자산을 내려�
 필요한 환경변수를 출력합니다.
 Windows에서는 `powershell -ExecutionPolicy Bypass -File
 scripts/install-kiwi.ps1`를 실행한 뒤 출력된 경로를 환경변수로 설정합니다.
+Rust binding의 남은 `kiwi_config_t` ABI 차이가 upstream에서 해결될 때까지
+Windows CI는 공식 Kiwi 0.22.2 자산을 사용합니다.
 
 ## 동작 방식
 

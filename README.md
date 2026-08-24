@@ -94,6 +94,8 @@ On macOS/Linux, `bash scripts/install-kiwi.sh` downloads the matching official
 assets and prints the required environment variables.
 On Windows, run `powershell -ExecutionPolicy Bypass -File
 scripts/install-kiwi.ps1` and set the printed paths in the environment.
+The Windows CI uses the official Kiwi 0.22.2 assets until the remaining
+`kiwi_config_t` ABI differences in the Rust binding are resolved upstream.
 
 ## How It Works
 
