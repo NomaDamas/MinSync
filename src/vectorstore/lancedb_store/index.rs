@@ -2,6 +2,7 @@
 
 use super::{to_store_error, DISTANCE_TYPE, VECTOR_COLUMN};
 use crate::error::{MinSyncError, Result};
+use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::vector::IvfHnswSqIndexBuilder;
 use lancedb::index::Index;
 use lancedb::table::{OptimizeAction, OptimizeOptions};
@@ -86,10 +87,27 @@ fn parse_positive_usize(value: &toml::Value, key: &str) -> Result<usize> {
 /// unindexed delta into the existing index via an incremental `optimize`
 /// (no k-means retrain) once the delta grows large enough to hurt latency.
 pub(super) async fn maintain_index(table: &Table, indexing: &IndexingConfig) -> Result<()> {
-    let existing = table
-        .list_indices()
-        .await
-        .map_err(to_store_error)?
+    let indices = table.list_indices().await.map_err(to_store_error)?;
+    if !indices
+        .iter()
+        .any(|index| index.columns.iter().any(|column| column == "lexical_text"))
+    {
+        table
+            .create_index(
+                &["lexical_text"],
+                Index::FTS(
+                    FtsIndexBuilder::default()
+                        .stem(false)
+                        .remove_stop_words(false)
+                        .ascii_folding(false),
+                ),
+            )
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+    }
+
+    let existing = indices
         .into_iter()
         .find(|index| index.columns.iter().any(|column| column == VECTOR_COLUMN));
 

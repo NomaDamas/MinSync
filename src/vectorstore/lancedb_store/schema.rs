@@ -24,6 +24,7 @@ pub(super) fn schema(dim: usize) -> Result<SchemaRef> {
             false,
         ),
         Field::new("text", DataType::Utf8, false),
+        Field::new("lexical_text", DataType::Utf8, false),
         Field::new("source_id", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("chunk_schema_id", DataType::Utf8, false),
@@ -36,6 +37,14 @@ pub(super) fn schema(dim: usize) -> Result<SchemaRef> {
 
 pub(super) fn validate_schema(schema: &SchemaRef, dim: usize) -> Result<()> {
     validate_dimension(dim)?;
+    let lexical_text = schema
+        .field_with_name("lexical_text")
+        .map_err(to_store_error)?;
+    if lexical_text.data_type() != &DataType::Utf8 {
+        return Err(MinSyncError::VectorStore(
+            "LanceDB column lexical_text must be Utf8".into(),
+        ));
+    }
     for field_name in super::filters::FILTERABLE_FIELDS {
         let field = schema.field_with_name(field_name).map_err(to_store_error)?;
         if field.data_type() != &DataType::Utf8 {
@@ -65,7 +74,7 @@ pub(super) fn validate_schema(schema: &SchemaRef, dim: usize) -> Result<()> {
     }
 }
 
-pub(super) fn docs_to_batch(docs: &[Document], dim: usize) -> Result<RecordBatch> {
+pub(super) fn docs_to_batch(docs: &[Document], dim: usize, language: &str) -> Result<RecordBatch> {
     for doc in docs {
         validate_vector(
             &doc.embedding,
@@ -89,6 +98,11 @@ pub(super) fn docs_to_batch(docs: &[Document], dim: usize) -> Result<RecordBatch
             Arc::new(vectors),
             Arc::new(StringArray::from_iter_values(
                 docs.iter().map(|doc| doc.text.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                docs.iter()
+                    .map(|doc| crate::tokenizer::tokenize(&doc.text, language))
+                    .collect::<Result<Vec<_>>>()?,
             )),
             Arc::new(StringArray::from_iter_values(
                 docs.iter().map(|doc| doc.source_id.as_str()),
@@ -187,6 +201,30 @@ pub(super) fn batch_to_query_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> 
     Ok(hits)
 }
 
+pub(super) fn batch_to_fts_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> {
+    let ids = string_col(batch, "id")?;
+    let paths = string_col(batch, "path")?;
+    let headings = string_col(batch, "heading_path")?;
+    let chunk_types = string_col(batch, "chunk_type")?;
+    let texts = string_col(batch, "text")?;
+    let hashes = string_col(batch, "content_hash")?;
+    let scores = batch
+        .column_by_name("_score")
+        .ok_or_else(|| missing_column("_score"))?
+        .as_primitive::<Float32Type>();
+    Ok((0..batch.num_rows())
+        .map(|row| QueryHit {
+            doc_id: ids.value(row).to_string(),
+            path: paths.value(row).to_string(),
+            heading_path: headings.value(row).to_string(),
+            chunk_type: chunk_types.value(row).to_string(),
+            text: texts.value(row).to_string(),
+            score: scores.value(row),
+            content_hash: hashes.value(row).to_string(),
+        })
+        .collect())
+}
+
 pub(super) fn dedupe_documents(docs: Vec<Document>) -> Vec<Document> {
     let mut last_by_id = HashMap::new();
     for (index, doc) in docs.iter().enumerate() {
@@ -258,7 +296,7 @@ mod tests {
     fn test_docs_to_batch_roundtrip() {
         let docs = vec![doc("a", vec![1.0, 0.0]), doc("b", vec![0.5, 0.5])];
 
-        let batch = docs_to_batch(&docs, 2).expect("convert to batch");
+        let batch = docs_to_batch(&docs, 2, "simple").expect("convert to batch");
         let roundtripped = batch_to_documents(&batch).expect("convert back");
 
         assert_eq!(roundtripped.len(), docs.len());
@@ -280,7 +318,7 @@ mod tests {
     fn test_docs_to_batch_rejects_wrong_dimension() {
         let docs = vec![doc("a", vec![1.0, 0.0, 0.0])];
 
-        assert!(docs_to_batch(&docs, 2).is_err());
+        assert!(docs_to_batch(&docs, 2, "simple").is_err());
     }
 
     #[test]

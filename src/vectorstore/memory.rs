@@ -76,6 +76,48 @@ impl VectorStore for InMemoryStore {
         Ok(hits)
     }
 
+    fn query_text(
+        &self,
+        text: &str,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        let terms: Vec<String> = text
+            .split_whitespace()
+            .map(|term| term.to_lowercase())
+            .collect();
+        let mut hits: Vec<_> = self
+            .docs
+            .values()
+            .filter(|doc| filter.is_none_or(|active_filter| matches_filter(doc, active_filter)))
+            .filter_map(|doc| {
+                let haystack = doc.text.to_lowercase();
+                let matches = terms
+                    .iter()
+                    .filter(|term| haystack.contains(term.as_str()))
+                    .count();
+                (matches > 0).then(|| QueryHit {
+                    doc_id: doc.id.clone(),
+                    path: doc.path.clone(),
+                    heading_path: doc.heading_path.clone(),
+                    chunk_type: doc.chunk_type.clone(),
+                    text: doc.text.clone(),
+                    score: matches as f32,
+                    content_hash: doc.content_hash.clone(),
+                })
+            })
+            .collect();
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
+        hits.truncate(topk);
+        Ok(hits)
+    }
+
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }

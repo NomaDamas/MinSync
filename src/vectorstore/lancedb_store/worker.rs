@@ -21,6 +21,12 @@ pub(super) enum Command {
         topk: usize,
         resp: Resp<Vec<QueryHit>>,
     },
+    QueryText {
+        text: String,
+        filter: Option<Filter>,
+        topk: usize,
+        resp: Resp<Vec<QueryHit>>,
+    },
     Flush(Resp<()>),
     DocCount(Resp<usize>),
     AllPaths(Resp<Vec<String>>),
@@ -32,6 +38,7 @@ pub(super) fn run_worker(
     uri: String,
     dim: usize,
     indexing: IndexingConfig,
+    language: String,
     cmd_rx: mpsc::Receiver<Command>,
     init_tx: mpsc::Sender<Result<()>>,
 ) {
@@ -47,7 +54,7 @@ pub(super) fn run_worker(
         }
     };
 
-    let inner = match rt.block_on(LanceDbInner::open_or_create(&uri, dim, indexing)) {
+    let inner = match rt.block_on(LanceDbInner::open_or_create(&uri, dim, indexing, language)) {
         Ok(inner) => inner,
         Err(error) => {
             let _ = init_tx.send(Err(error));
@@ -75,6 +82,12 @@ pub(super) fn run_worker(
                 topk,
                 resp,
             } => send_response(resp, rt.block_on(inner.query(vector, filter, topk))),
+            Command::QueryText {
+                text,
+                filter,
+                topk,
+                resp,
+            } => send_response(resp, rt.block_on(inner.query_text(text, filter, topk))),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
             Command::DocCount(resp) => send_response(resp, rt.block_on(inner.doc_count())),
             Command::AllPaths(resp) => send_response(resp, rt.block_on(inner.all_paths())),

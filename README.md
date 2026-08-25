@@ -65,16 +65,44 @@ For local embeddings, use the TEI setup below.
 minsync init                          # initialize .minsync/
 minsync sync                          # index changed files incrementally
 minsync sync --full                   # rebuild from scratch
-minsync query "search text" --k 5     # semantic search
+minsync query "search text" --mode vector --k 5
+minsync query "exact terms" --mode bm25 --k 5
+minsync query "search text" --mode hybrid --k 5
 minsync watch                         # re-index on file changes
 minsync status                        # sync state
 minsync check                         # health check
 minsync verify --fix                  # consistency check + repair
 ```
 
+Select the BM25 tokenizer preset during initialization:
+
+```bash
+minsync init --language ko
+```
+
+Supported values are `simple`, `ko`, `ja`, `zh`, `ar`, and `multilingual`.
+Korean uses Kiwi through the `kiwi-rs` Rust binding, Japanese uses an embedded
+Lindera dictionary, Chinese uses `jieba-rs`, and Arabic uses an in-process light
+stemmer based on Discrawl PR #180.
+Changing `[lexical].language` triggers a full rebuild on the next sync.
+
+Korean tokenization requires the official Kiwi native library and base model.
+Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted
+`models/cong/base` directory. MinSync pins the unreleased ABI fix from
+`JAICHANGPARK/kiwi-rs` until a corrected crates.io release is available.
+On macOS/Linux, `bash scripts/install-kiwi.sh` downloads the matching official
+assets and prints the required environment variables.
+On Windows, run `powershell -ExecutionPolicy Bypass -File
+scripts/install-kiwi.ps1` and set the printed paths in the environment.
+The Windows CI uses the official Kiwi 0.22.2 assets until the remaining
+`kiwi_config_t` ABI differences in the Rust binding are resolved upstream.
+
 ## How It Works
 
-MinSync scans your directory, compares each text file to the manifest, chunks changed content, embeds those chunks, and stores vectors locally. Stale vectors are removed by mark-and-sweep. Querying embeds the query text and searches the local vector database.
+MinSync scans your directory, compares each text file to the manifest, chunks changed content once, and stores the same stable chunk IDs for vector and BM25 retrieval in LanceDB. Stale rows are removed by mark-and-sweep. Vector mode embeds the query, BM25 mode uses LanceDB full-text search without an embedding request, and hybrid mode combines both rankings with deterministic reciprocal rank fusion (RRF, `k=60`).
+
+The selected analyzer converts documents and queries into the shared
+`lexical_text` column before LanceDB BM25 indexing.
 
 State lives in `.minsync/`:
 

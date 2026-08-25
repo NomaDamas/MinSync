@@ -53,16 +53,44 @@ export OPENAI_API_KEY="sk-..."
 minsync init                          # .minsync/ 초기화
 minsync sync                          # 변경된 파일을 증분 index
 minsync sync --full                   # 처음부터 다시 빌드
-minsync query "search text" --k 5     # semantic search
+minsync query "검색어" --mode vector --k 5
+minsync query "정확한 단어" --mode bm25 --k 5
+minsync query "검색어" --mode hybrid --k 5
 minsync watch                         # 파일 변경 감시 후 re-index
 minsync status                        # sync 상태
 minsync check                         # health check
 minsync verify --fix                  # consistency check 및 repair
 ```
 
+초기화할 때 BM25 tokenizer preset을 선택할 수 있습니다.
+
+```bash
+minsync init --language ko
+```
+
+지원 값은 `simple`, `ko`, `ja`, `zh`, `ar`, `multilingual`입니다.
+한국어는 `kiwi-rs` Rust binding을 통한 Kiwi, 일본어는 사전이 내장된
+Lindera, 중국어는 `jieba-rs`, 아랍어는 Discrawl PR #180을 따른
+in-process light stemmer를 사용합니다.
+`[lexical].language`를 바꾸면 다음 sync에서 full rebuild가 수행됩니다.
+
+한국어 tokenizer에는 공식 Kiwi native library와 base model이 필요합니다.
+`KIWI_LIBRARY_PATH`는 `libkiwi`, `KIWI_MODEL_PATH`는 압축 해제한
+`models/cong/base`를 가리켜야 합니다. 수정된 crates.io release가 나오기
+전까지 MinSync는 `JAICHANGPARK/kiwi-rs`의 ABI 수정 commit을 고정합니다.
+macOS/Linux에서는 `bash scripts/install-kiwi.sh`가 공식 자산을 내려받고
+필요한 환경변수를 출력합니다.
+Windows에서는 `powershell -ExecutionPolicy Bypass -File
+scripts/install-kiwi.ps1`를 실행한 뒤 출력된 경로를 환경변수로 설정합니다.
+Rust binding의 남은 `kiwi_config_t` ABI 차이가 upstream에서 해결될 때까지
+Windows CI는 공식 Kiwi 0.22.2 자산을 사용합니다.
+
 ## 동작 방식
 
-MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일의 변경 여부를 판단합니다. 변경된 파일은 chunk로 나누고 embedding한 뒤 vector를 로컬에 저장합니다. stale vector는 mark-and-sweep으로 제거됩니다. Query 시에는 query text를 embedding하고 로컬 vector database에서 검색합니다.
+MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일의 변경 여부를 판단합니다. 변경된 파일은 한 번만 chunk로 나누며, 같은 stable chunk ID를 LanceDB의 vector 검색과 BM25 검색이 공유합니다. stale row는 mark-and-sweep으로 제거됩니다. vector 모드는 query를 embedding하고, BM25 모드는 embedding 요청 없이 LanceDB full-text search를 사용하며, hybrid 모드는 두 순위를 결정적인 RRF(`k=60`)로 결합합니다.
+
+선택한 analyzer가 문서와 query를 같은 방식으로 `lexical_text`로 변환한
+뒤 LanceDB BM25 index에서 검색합니다.
 
 상태는 `.minsync/`에 저장됩니다.
 

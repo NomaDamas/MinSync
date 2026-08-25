@@ -3,8 +3,8 @@
 use super::filters::{filter_to_sql, id_in_filter, sql_literal};
 use super::index::maintain_index;
 use super::schema::{
-    batch_to_documents, batch_to_query_hits, dedupe_documents, docs_to_batch, schema, string_col,
-    validate_schema, validate_vector,
+    batch_to_documents, batch_to_fts_hits, batch_to_query_hits, dedupe_documents, docs_to_batch,
+    schema, string_col, validate_schema, validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
@@ -13,7 +13,9 @@ use crate::error::Result;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::NewColumnTransform;
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, Table};
 use std::cmp::Ordering;
@@ -24,6 +26,7 @@ pub(super) struct LanceDbInner {
     table: Table,
     dim: usize,
     indexing: IndexingConfig,
+    language: String,
 }
 
 impl LanceDbInner {
@@ -31,6 +34,7 @@ impl LanceDbInner {
         uri: &str,
         dim: usize,
         indexing: IndexingConfig,
+        language: String,
     ) -> Result<Self> {
         let conn = lancedb::connect(uri)
             .execute()
@@ -43,6 +47,19 @@ impl LanceDbInner {
                 .execute()
                 .await
                 .map_err(to_store_error)?;
+            let existing_schema = table.schema().await.map_err(to_store_error)?;
+            if existing_schema.field_with_name("lexical_text").is_err() {
+                table
+                    .add_columns(
+                        NewColumnTransform::SqlExpressions(vec![(
+                            "lexical_text".to_string(),
+                            "text".to_string(),
+                        )]),
+                        None,
+                    )
+                    .await
+                    .map_err(to_store_error)?;
+            }
             validate_schema(&table.schema().await.map_err(to_store_error)?, dim)?;
             table
         } else {
@@ -57,6 +74,7 @@ impl LanceDbInner {
             table,
             dim,
             indexing,
+            language,
         })
     }
 
@@ -66,7 +84,7 @@ impl LanceDbInner {
         }
         let docs = dedupe_documents(docs);
         let id_filter = id_in_filter(docs.iter().map(|doc| doc.id.as_str()));
-        let batch = docs_to_batch(&docs, self.dim)?;
+        let batch = docs_to_batch(&docs, self.dim, &self.language)?;
         self.table
             .delete(&id_filter)
             .await
@@ -161,6 +179,60 @@ impl LanceDbInner {
                 .score
                 .partial_cmp(&left.score)
                 .unwrap_or(Ordering::Equal)
+        });
+        hits.truncate(topk);
+        Ok(hits)
+    }
+
+    pub(super) async fn query_text(
+        &self,
+        text: String,
+        filter: Option<Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        if topk == 0 {
+            return Ok(Vec::new());
+        }
+        let sql_filter = filter.as_ref().map(filter_to_sql).transpose()?;
+        let tokenized_text = crate::tokenizer::tokenize(&text, &self.language)?;
+        let mut query = self
+            .table
+            .query()
+            .full_text_search(
+                FullTextSearchQuery::new(tokenized_text)
+                    .with_column("lexical_text".to_string())
+                    .map_err(to_store_error)?,
+            )
+            .limit(topk)
+            .select(Select::columns(&[
+                "id",
+                "path",
+                "heading_path",
+                "chunk_type",
+                "text",
+                "content_hash",
+                "_score",
+            ]));
+        if let Some(sql) = sql_filter {
+            query = query.only_if(sql);
+        }
+        let batches: Vec<RecordBatch> = query
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut hits = Vec::new();
+        for batch in batches {
+            hits.extend(batch_to_fts_hits(&batch)?);
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
         });
         hits.truncate(topk);
         Ok(hits)

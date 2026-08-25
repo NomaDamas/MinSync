@@ -51,6 +51,16 @@ impl LanceDbStore {
         dimension: usize,
         indexing: IndexingConfig,
     ) -> Result<Self> {
+        Self::open_with_language(path, dimension, indexing, "simple")
+    }
+
+    pub fn open_with_language(
+        path: &Path,
+        dimension: usize,
+        indexing: IndexingConfig,
+        language: &str,
+    ) -> Result<Self> {
+        crate::tokenizer::validate_language(language)?;
         let dim = if dimension == 0 {
             DEFAULT_DIMENSION
         } else {
@@ -64,7 +74,9 @@ impl LanceDbStore {
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
-        let worker = thread::spawn(move || run_worker(uri, dim, indexing, cmd_rx, init_tx));
+        let language = language.to_string();
+        let worker =
+            thread::spawn(move || run_worker(uri, dim, indexing, language, cmd_rx, init_tx));
 
         match init_rx.recv().map_err(to_store_error)? {
             Ok(()) => Ok(Self {
@@ -152,6 +164,20 @@ impl VectorStore for LanceDbStore {
     fn query(&self, vector: &[f32], filter: Option<&Filter>, topk: usize) -> Result<Vec<QueryHit>> {
         self.request(|resp| Command::Query {
             vector: vector.to_vec(),
+            filter: filter.cloned(),
+            topk,
+            resp,
+        })
+    }
+
+    fn query_text(
+        &self,
+        text: &str,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        self.request(|resp| Command::QueryText {
+            text: text.to_string(),
             filter: filter.cloned(),
             topk,
             resp,
@@ -508,9 +534,10 @@ mod tests {
         let docs: Vec<_> = (0..50).map(spread_doc).collect();
         store.upsert(&docs).expect("upsert docs");
         store.flush().expect("flush");
+        let indices = store.index_names().expect("list indices");
         assert!(
-            store.index_names().expect("list indices").is_empty(),
-            "no ANN index should exist below the row threshold"
+            indices.len() == 1 && indices[0].contains("text"),
+            "only the BM25 text index should exist below the ANN row threshold, got {indices:?}"
         );
     }
 

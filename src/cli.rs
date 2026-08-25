@@ -22,6 +22,23 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum QueryMode {
+    Vector,
+    Bm25,
+    Hybrid,
+}
+
+impl QueryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Bm25 => "bm25",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize .minsync/ in current directory
@@ -32,6 +49,8 @@ pub enum Commands {
         embedder: String,
         #[arg(long, default_value = "recursive")]
         chunker: String,
+        #[arg(long, default_value = "simple")]
+        language: String,
     },
     /// Sync files to vector index
     Sync {
@@ -49,6 +68,8 @@ pub enum Commands {
         text: String,
         #[arg(long, short, default_value = "10")]
         k: usize,
+        #[arg(long, value_enum, default_value = "vector")]
+        mode: QueryMode,
     },
     /// Show sync status
     Status,

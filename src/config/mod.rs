@@ -10,7 +10,8 @@ use std::path::Path;
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config = toml::from_str(&content).map_err(MinSyncError::TomlParse)?;
+        let config: Self = toml::from_str(&content).map_err(MinSyncError::TomlParse)?;
+        crate::tokenizer::validate_language(&config.lexical.language)?;
         Ok(config)
     }
 
@@ -58,6 +59,7 @@ mod tests {
         assert_eq!(config.embedder.query_prefix, None);
         assert_eq!(config.embedder.passage_prefix, None);
         assert_eq!(config.vectorstore.id, "lancedb");
+        assert_eq!(config.lexical.language, "simple");
         assert_eq!(
             config.vectorstore.options["dimension"].as_integer(),
             Some(1536)
@@ -78,6 +80,19 @@ mod tests {
         let loaded = Config::load(&path).expect("load config");
 
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn test_config_load_rejects_unknown_lexical_language() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default_for("abcdef12-1234-4234-9234-123456789abc");
+        config.lexical.language = "klingon".to_string();
+        config.save(&path).expect("save invalid config fixture");
+
+        let error = Config::load(&path).expect_err("unknown language must fail");
+
+        assert!(error.to_string().contains("unsupported BM25 language"));
     }
 
     #[test]

@@ -28,6 +28,10 @@ impl MinSync {
         Self { root, minsync_dir }
     }
 
+    pub fn minsync_dir(&self) -> &std::path::Path {
+        &self.minsync_dir
+    }
+
     /// Initialize `.minsync/` with a default config and baseline manifest.
     pub fn init(&self, force: bool, embedder_id: &str, chunker_id: &str) -> Result<Config> {
         if self.minsync_dir.exists() && !force {
@@ -74,7 +78,12 @@ impl MinSync {
         // the `already_up_to_date` early return below is unreachable while
         // no cursor exists.
         let initial_sync = !cursor_path.exists();
-        let full = full || initial_sync;
+        let lexical_rebuild = if cursor_path.exists() {
+            Cursor::load(&cursor_path)?.lexical_language != config.lexical.language
+        } else {
+            false
+        };
+        let full = full || initial_sync || lexical_rebuild;
 
         if txn_path.exists() {
             Transaction::remove(&txn_path)?;
@@ -124,6 +133,12 @@ impl MinSync {
         let start = std::time::Instant::now();
         let mut result = empty_sync_result(false, false);
         result.initial_sync = initial_sync;
+        if lexical_rebuild {
+            result.chunks_deleted += store.delete_by_filter(&Filter::Eq(
+                "source_id".to_string(),
+                config.source_id.clone(),
+            ))?;
+        }
 
         for change in &changes {
             match change {
@@ -164,6 +179,7 @@ impl MinSync {
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
             collection_path: config.collection.path.clone(),
+            lexical_language: config.lexical.language.clone(),
         }
         .save(&cursor_path)?;
         new_manifest.save(&manifest_path)?;

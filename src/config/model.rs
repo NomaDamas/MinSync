@@ -11,7 +11,27 @@ pub struct Config {
     pub embedder: EmbedderConfig,
     pub vectorstore: VectorStoreConfig,
     #[serde(default)]
+    pub lexical: LexicalConfig,
+    #[serde(default)]
     pub normalize: NormalizeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LexicalConfig {
+    #[serde(default = "default_lexical_language")]
+    pub language: String,
+}
+
+fn default_lexical_language() -> String {
+    "simple".to_string()
+}
+
+impl Default for LexicalConfig {
+    fn default() -> Self {
+        Self {
+            language: default_lexical_language(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +182,7 @@ impl Config {
                 id: "lancedb".to_string(),
                 options: default_lancedb_options(),
             },
+            lexical: LexicalConfig::default(),
             normalize: NormalizeConfig::default(),
         }
     }
