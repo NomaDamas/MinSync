@@ -1,6 +1,6 @@
 [package]
 name = "minsync"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.91"
 description = "Manifest-based incremental vector DB indexing CLI for text files"
@@ -48,7 +48,7 @@ futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 lzma-sys = { version = "0.1", features = ["static"] }
 jieba-rs = "0.9.0"
-kiwi-rs = { package = "kiwi-rs-fixed", version = "2026.7.24" }
+kiwi-rs = "2026.8.26"
 lindera = { version = "3.0.7", features = ["embed-ipadic"] }
 
 [target.'cfg(not(windows))'.build-dependencies]

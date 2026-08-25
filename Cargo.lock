@@ -2890,10 +2890,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "kiwi-rs-fixed"
-version = "2026.7.24"
+name = "kiwi-rs"
+version = "2026.8.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd263749398983922aadc3b2c7bf1e26dcfd675ef15167c5f612c49bdd634f7"
+checksum = "97883bec2bd3cfa764d059aab950ef2c43feae05f1fe0004616e69b8ef993491"
 dependencies = [
  "regex",
 ]
@@ -3843,7 +3843,7 @@ dependencies = [
 
 [[package]]
 name = "minsync"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -3858,7 +3858,7 @@ dependencies = [
  "hex",
  "ignore",
  "jieba-rs",
- "kiwi-rs-fixed",
+ "kiwi-rs",
  "lancedb",
  "lindera",
  "lzma-sys",
