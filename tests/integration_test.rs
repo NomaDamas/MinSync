@@ -14,8 +14,16 @@ use minsync::vectorstore::lancedb_store::LanceDbStore;
 use minsync::vectorstore::memory::InMemoryStore;
 use minsync::vectorstore::{create_vectorstore, VectorStore};
 use minsync::verify::{status, verify};
-use minsync::watch::should_index;
+use minsync::watch::{
+    run_with_shutdown, should_index, WatchControl, WatchStartup, WatchStartupStatus,
+};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tempfile::TempDir;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{timeout, Duration};
 
 struct MockEmbedder;
 
@@ -58,6 +66,134 @@ fn write_file(dir: &TempDir, path: &str, content: &str) {
         std::fs::create_dir_all(parent).expect("create parent dir");
     }
     std::fs::write(path, content).expect("write file");
+}
+
+async fn next_watch_result(
+    receiver: &mut mpsc::UnboundedReceiver<minsync::types::SyncResult>,
+) -> minsync::types::SyncResult {
+    timeout(Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("watch event within timeout")
+        .expect("watch progress channel remains open")
+}
+
+#[tokio::test]
+async fn test_watch_real_filesystem_add_modify_delete() {
+    let (dir, sync, chunker, embedder, mut store) = fixture();
+    sync.init(false, "tei:test", "recursive")
+        .expect("init succeeds");
+    let root = dir.path().to_path_buf();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let watch_task = tokio::spawn(async move {
+        run_with_shutdown(
+            root,
+            &chunker,
+            &embedder,
+            &mut store,
+            Some(25),
+            WatchControl {
+                startup: WatchStartup::FailFast,
+                progress: Some(progress_tx),
+                startup_status: None,
+                shutdown: shutdown_rx,
+            },
+        )
+        .await
+    });
+
+    let initial = next_watch_result(&mut progress_rx).await;
+    assert!(initial.initial_sync);
+
+    write_file(&dir, "watch.md", "# first");
+    let added = next_watch_result(&mut progress_rx).await;
+    assert_eq!(added.files_added, 1);
+    assert_eq!(added.files_modified, 0);
+    assert_eq!(added.files_deleted, 0);
+
+    write_file(&dir, "watch.md", "# second");
+    let modified = next_watch_result(&mut progress_rx).await;
+    assert_eq!(modified.files_modified, 1);
+
+    std::fs::remove_file(dir.path().join("watch.md")).expect("delete watched file");
+    let deleted = next_watch_result(&mut progress_rx).await;
+    assert_eq!(deleted.files_deleted, 1);
+    assert_eq!(deleted.chunks_deleted, 1);
+
+    shutdown_tx.send(()).expect("signal watcher shutdown");
+    watch_task
+        .await
+        .expect("watch task joins")
+        .expect("watch exits");
+}
+
+#[tokio::test]
+async fn test_watch_resilient_startup_reports_failure_and_retries() {
+    let (dir, sync, chunker, _embedder, mut store) = fixture();
+    write_file(&dir, "pending.md", "requires embedding");
+    sync.init(false, "tei:test", "recursive")
+        .expect("init succeeds");
+    let root = dir.path().to_path_buf();
+    let flaky_embedder = FlakyEmbedder {
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let watch_task = tokio::spawn(async move {
+        run_with_shutdown(
+            root,
+            &chunker,
+            &flaky_embedder,
+            &mut store,
+            Some(25),
+            WatchControl {
+                startup: WatchStartup::ContinueOnSyncError,
+                progress: Some(progress_tx),
+                startup_status: Some(status_tx),
+                shutdown: shutdown_rx,
+            },
+        )
+        .await
+    });
+
+    let status = timeout(Duration::from_secs(10), status_rx.recv())
+        .await
+        .expect("startup status within timeout")
+        .expect("startup status remains open");
+    assert!(matches!(status, WatchStartupStatus::InitialSyncFailed(_)));
+
+    write_file(&dir, "pending.md", "retry succeeds");
+    let recovered = next_watch_result(&mut progress_rx).await;
+    assert_eq!(recovered.files_added, 1);
+    assert!(dir.path().join(".minsync/cursor.json").exists());
+
+    shutdown_tx.send(()).expect("signal watcher shutdown");
+    watch_task
+        .await
+        .expect("watch task joins")
+        .expect("watch exits");
+}
+
+struct FlakyEmbedder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Embedder for FlakyEmbedder {
+    fn id(&self) -> &str {
+        "flaky"
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(MinSyncError::Embedding("backend unavailable".to_string()))
+        } else {
+            Ok(texts.iter().map(|_| vec![0.0; 8]).collect())
+        }
+    }
 }
 
 #[tokio::test]
@@ -213,6 +349,9 @@ async fn test_sync_incremental_detects_new_file() {
     assert!(result.chunks_added > 0);
     assert_eq!(store.doc_count(), initial_count + result.chunks_added);
     assert_eq!(store.all_paths(), vec!["a.txt", "b.txt"]);
+    assert_eq!(result.files_added, 1);
+    assert_eq!(result.files_modified, 0);
+    assert_eq!(result.files_deleted, 0);
 }
 
 #[tokio::test]
@@ -234,6 +373,9 @@ async fn test_sync_incremental_detects_modification() {
     assert_eq!(result.files_processed_paths, vec!["a.txt"]);
     assert_eq!(store.all_paths(), vec!["a.txt"]);
     assert!(result.chunks_added + result.chunks_updated > 0);
+    assert_eq!(result.files_added, 0);
+    assert_eq!(result.files_modified, 1);
+    assert_eq!(result.files_deleted, 0);
 }
 
 #[tokio::test]
@@ -257,6 +399,9 @@ async fn test_sync_incremental_detects_deletion() {
     assert_eq!(result.files_processed_paths, vec!["a.txt"]);
     assert_eq!(result.chunks_deleted, initial_count);
     assert_eq!(store.doc_count(), 0);
+    assert_eq!(result.files_added, 0);
+    assert_eq!(result.files_modified, 0);
+    assert_eq!(result.files_deleted, 1);
 }
 
 #[tokio::test]
@@ -380,6 +525,9 @@ async fn test_sync_reports_embedding_stats() {
     assert_eq!(result.embedded_texts, result.chunks_added);
     assert!(result.estimated_tokens > 0);
     assert!(result.elapsed_seconds >= 0.0);
+    assert_eq!(result.files_added, 2);
+    assert_eq!(result.files_modified, 0);
+    assert_eq!(result.files_deleted, 0);
 }
 
 #[tokio::test]
@@ -401,6 +549,9 @@ async fn test_sync_stats_zeroed_when_up_to_date() {
     assert_eq!(result.embedding_api_calls, 0);
     assert_eq!(result.embedded_texts, 0);
     assert_eq!(result.estimated_tokens, 0);
+    assert_eq!(result.files_added, 0);
+    assert_eq!(result.files_modified, 0);
+    assert_eq!(result.files_deleted, 0);
 }
 
 #[tokio::test]

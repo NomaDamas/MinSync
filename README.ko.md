@@ -56,7 +56,8 @@ minsync sync --full                   # 처음부터 다시 빌드
 minsync query "검색어" --mode vector --k 5
 minsync query "정확한 단어" --mode bm25 --k 5
 minsync query "검색어" --mode hybrid --k 5
-minsync watch                         # 파일 변경 감시 후 re-index
+minsync watch                         # 초기 sync 후 파일 변경 감시 및 re-index
+minsync watch --watch-on-sync-error   # 초기 sync 오류 후에도 유지하며 재시도
 minsync status                        # sync 상태
 minsync check                         # health check
 minsync verify --fix                  # consistency check 및 repair
@@ -73,6 +74,17 @@ minsync init --language ko
 Lindera, 중국어는 `jieba-rs`, 아랍어는 Discrawl PR #180을 따른
 in-process light stemmer를 사용합니다.
 `[lexical].language`를 바꾸면 다음 sync에서 full rebuild가 수행됩니다.
+
+`minsync watch`는 filesystem event를 기다리기 전에 초기 sync를 수행합니다.
+기본값에서는 초기 embedding 또는 vector store 오류가 `minsync sync`와 같이
+즉시 종료됩니다. `--watch-on-sync-error`를 사용하면 watcher를 유지하면서
+이후 파일 event에서 다시 시도합니다. 오류는 로그에 남고, sync가 성공한 뒤에만
+cursor가 전진합니다.
+
+Sync 출력은 파일 단위 변경과 chunk 단위 저장 결과를 분리합니다.
+`files added/modified/deleted`는 원본 파일 변경을, `chunks
+inserted/reused/removed`는 content-addressed index row의 삽입·재사용·삭제를
+뜻합니다.
 
 한국어 tokenizer에는 공식 Kiwi native library와 base model이 필요합니다.
 `KIWI_LIBRARY_PATH`는 `libkiwi`, `KIWI_MODEL_PATH`는 압축 해제한

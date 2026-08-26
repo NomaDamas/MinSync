@@ -25,6 +25,35 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// Defers provider construction until an embedding request is made.
+///
+/// Watch mode uses this only with `--watch-on-sync-error`, allowing the
+/// watcher to remain alive while credentials or a local backend recover.
+pub struct DeferredEmbedder {
+    config: Config,
+}
+
+impl DeferredEmbedder {
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl Embedder for DeferredEmbedder {
+    fn id(&self) -> &str {
+        self.config
+            .embedder
+            .id
+            .split_once(':')
+            .map_or(self.config.embedder.id.as_str(), |(_, id)| id)
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        create_embedder(&self.config)?.embed(texts).await
+    }
+}
+
 /// Construct an [`Embedder`] implementation from the embedder id in `config`.
 ///
 /// Returns [`MinSyncError::Config`] when the id has no known provider prefix.

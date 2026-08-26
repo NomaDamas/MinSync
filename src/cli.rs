@@ -88,5 +88,8 @@ pub enum Commands {
     Watch {
         #[arg(long)]
         debounce_ms: Option<u64>,
+        /// Keep watching when the initial sync fails; later events retry sync.
+        #[arg(long)]
+        watch_on_sync_error: bool,
     },
 }

@@ -20,6 +20,9 @@ pub struct SyncResult {
     /// cursor.json existed (machine-readable readiness state).
     pub initial_sync: bool,
     pub files_processed_paths: Vec<String>,
+    pub files_added: usize,
+    pub files_modified: usize,
+    pub files_deleted: usize,
     pub elapsed_seconds: f64,
     pub embedding_api_calls: usize,
     pub embedded_texts: usize,
