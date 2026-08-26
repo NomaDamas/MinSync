@@ -71,10 +71,26 @@ fn write_file(dir: &TempDir, path: &str, content: &str) {
 async fn next_watch_result(
     receiver: &mut mpsc::UnboundedReceiver<minsync::types::SyncResult>,
 ) -> minsync::types::SyncResult {
-    timeout(Duration::from_secs(10), receiver.recv())
-        .await
-        .expect("watch event within timeout")
-        .expect("watch progress channel remains open")
+    next_watch_result_where(receiver, |_| true).await
+}
+
+async fn next_watch_result_where(
+    receiver: &mut mpsc::UnboundedReceiver<minsync::types::SyncResult>,
+    mut predicate: impl FnMut(&minsync::types::SyncResult) -> bool,
+) -> minsync::types::SyncResult {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let result = receiver
+                .recv()
+                .await
+                .expect("watch progress channel remains open");
+            if predicate(&result) {
+                return result;
+            }
+        }
+    })
+    .await
+    .expect("watch event within timeout")
 }
 
 #[tokio::test]
@@ -107,17 +123,19 @@ async fn test_watch_real_filesystem_add_modify_delete() {
     assert!(initial.initial_sync);
 
     write_file(&dir, "watch.md", "# first");
-    let added = next_watch_result(&mut progress_rx).await;
+    let added = next_watch_result_where(&mut progress_rx, |result| result.files_added == 1).await;
     assert_eq!(added.files_added, 1);
     assert_eq!(added.files_modified, 0);
     assert_eq!(added.files_deleted, 0);
 
     write_file(&dir, "watch.md", "# second");
-    let modified = next_watch_result(&mut progress_rx).await;
+    let modified =
+        next_watch_result_where(&mut progress_rx, |result| result.files_modified == 1).await;
     assert_eq!(modified.files_modified, 1);
 
     std::fs::remove_file(dir.path().join("watch.md")).expect("delete watched file");
-    let deleted = next_watch_result(&mut progress_rx).await;
+    let deleted =
+        next_watch_result_where(&mut progress_rx, |result| result.files_deleted == 1).await;
     assert_eq!(deleted.files_deleted, 1);
     assert_eq!(deleted.chunks_deleted, 1);
 
