@@ -49,7 +49,7 @@ impl Manifest {
     pub fn scan_with_baseline(
         root: &Path,
         source_id: &str,
-        baseline: Option<&Manifest>,
+        _baseline: Option<&Manifest>,
     ) -> Result<Self> {
         let mut manifest = Self::new(source_id);
         let walker = WalkBuilder::new(root)
@@ -79,13 +79,7 @@ impl Manifest {
                 .strip_prefix(root)
                 .map_err(|error| MinSyncError::Manifest(error.to_string()))?;
             let manifest_path = relative_path.to_string_lossy().replace('\\', "/");
-            let content_hash = match baseline
-                .and_then(|manifest| manifest.files.get(&manifest_path))
-                .filter(|entry| entry.size == metadata.len() && entry.mtime_ns == mtime_ns)
-            {
-                Some(entry) => entry.content_hash.clone(),
-                None => hash_file(path)?,
-            };
+            let content_hash = hash_file(path)?;
 
             manifest.files.insert(
                 manifest_path,
@@ -249,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_with_baseline_reuses_matching_metadata_hash() {
+    fn test_scan_with_baseline_always_uses_current_content_hash() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("a.txt");
         fs::write(&path, "alpha").expect("write file");
@@ -263,7 +257,10 @@ mod tests {
         let manifest = Manifest::scan_with_baseline(dir.path(), "source-1", Some(&baseline))
             .expect("scan with baseline");
 
-        assert_eq!(manifest.files["a.txt"].content_hash, "sha256:baseline");
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            prefixed_sha256(b"alpha")
+        );
     }
 
     #[test]
@@ -285,6 +282,38 @@ mod tests {
         assert_eq!(
             manifest.files["a.txt"].content_hash,
             prefixed_sha256(b"alpha beta")
+        );
+    }
+
+    #[test]
+    fn test_scan_with_baseline_rehashes_when_content_hash_is_stale() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "alpha").expect("write original file");
+        fs::write(&path, "bravo").expect("write same-size replacement");
+        let metadata = fs::metadata(&path).expect("read replacement metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("read replacement mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("replacement mtime after epoch")
+            .as_nanos();
+        let mut baseline = Manifest::new("source-1");
+        baseline.files.insert(
+            "a.txt".to_string(),
+            ManifestFileEntry {
+                size: metadata.len(),
+                mtime_ns,
+                content_hash: prefixed_sha256(b"alpha"),
+            },
+        );
+
+        let manifest = Manifest::scan_with_baseline(dir.path(), "source-1", Some(&baseline))
+            .expect("scan with baseline");
+
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            prefixed_sha256(b"bravo")
         );
     }
 

@@ -68,7 +68,8 @@ minsync sync --full                   # rebuild from scratch
 minsync query "search text" --mode vector --k 5
 minsync query "exact terms" --mode bm25 --k 5
 minsync query "search text" --mode hybrid --k 5
-minsync watch                         # re-index on file changes
+minsync watch                         # initial sync, then re-index on file changes
+minsync watch --watch-on-sync-error   # stay alive and retry after initial sync errors
 minsync status                        # sync state
 minsync check                         # health check
 minsync verify --fix                  # consistency check + repair
@@ -85,6 +86,17 @@ Korean uses Kiwi through the `kiwi-rs` Rust binding, Japanese uses an embedded
 Lindera dictionary, Chinese uses `jieba-rs`, and Arabic uses an in-process light
 stemmer based on Discrawl PR #180.
 Changing `[lexical].language` triggers a full rebuild on the next sync.
+
+`minsync watch` performs an initial sync before waiting for filesystem events.
+By default, an initial embedding or vector-store error stops the command,
+matching `minsync sync` fail-fast behavior. Use
+`--watch-on-sync-error` to keep the watcher alive and retry on later file
+events; failures remain visible in the log and the cursor advances only after
+a later sync succeeds.
+
+Sync output reports file-level changes separately from chunk-level storage
+effects: `files added/modified/deleted` describes source files, while
+`chunks inserted/reused/removed` describes content-addressed index rows.
 
 Korean tokenization requires the official Kiwi native library and base model.
 Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted

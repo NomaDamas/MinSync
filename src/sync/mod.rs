@@ -112,8 +112,23 @@ impl MinSync {
 
         if dry_run {
             let files_processed_paths = changes.iter().map(change_path).collect();
+            let files_added = changes
+                .iter()
+                .filter(|change| matches!(change, FileChange::Added(_)))
+                .count();
+            let files_modified = changes
+                .iter()
+                .filter(|change| matches!(change, FileChange::Modified(_)))
+                .count();
+            let files_deleted = changes
+                .iter()
+                .filter(|change| matches!(change, FileChange::Deleted(_)))
+                .count();
             return Ok(SyncResult {
                 files_processed_paths,
+                files_added,
+                files_modified,
+                files_deleted,
                 dry_run: true,
                 already_up_to_date: false,
                 initial_sync,
@@ -142,7 +157,19 @@ impl MinSync {
 
         for change in &changes {
             match change {
-                FileChange::Added(path) | FileChange::Modified(path) => {
+                FileChange::Added(path) => {
+                    result.files_added += 1;
+                    let context = SyncFileContext {
+                        config: &config,
+                        chunker,
+                        embedder,
+                        store,
+                        sync_token: &sync_token,
+                    };
+                    index_file(&self.root, path, context, &mut result).await?;
+                }
+                FileChange::Modified(path) => {
+                    result.files_modified += 1;
                     let context = SyncFileContext {
                         config: &config,
                         chunker,
@@ -153,6 +180,7 @@ impl MinSync {
                     index_file(&self.root, path, context, &mut result).await?;
                 }
                 FileChange::Deleted(path) => {
+                    result.files_deleted += 1;
                     let deleted = store.delete_by_filter(&Filter::And(vec![
                         Filter::Eq("source_id".to_string(), config.source_id.clone()),
                         Filter::Eq("path".to_string(), path.clone()),

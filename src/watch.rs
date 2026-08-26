@@ -25,7 +25,10 @@ use std::time::Duration;
 use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::DebounceEventResult;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use crate::chunker::Chunker;
 use crate::embedder::Embedder;
@@ -49,6 +52,32 @@ pub fn should_index(path: &Path, minsync_dir: &Path) -> bool {
         .any(|component| component.as_os_str() == ".git")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStartup {
+    FailFast,
+    ContinueOnSyncError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchStartupStatus {
+    InitialSyncSucceeded,
+    InitialSyncFailed(String),
+}
+
+pub struct WatchControl {
+    pub startup: WatchStartup,
+    pub progress: Option<mpsc::UnboundedSender<crate::types::SyncResult>>,
+    pub startup_status: Option<mpsc::UnboundedSender<WatchStartupStatus>>,
+    pub shutdown: oneshot::Receiver<()>,
+}
+
+struct WatchRuntime {
+    startup: WatchStartup,
+    progress: Option<mpsc::UnboundedSender<crate::types::SyncResult>>,
+    startup_status: Option<mpsc::UnboundedSender<WatchStartupStatus>>,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
 /// Run the file-watch loop until Ctrl-C.
 ///
 /// On any non-internal path change (or a debouncer rescan signal), this
@@ -61,6 +90,45 @@ pub async fn run(
     embedder: &dyn Embedder,
     store: &mut dyn VectorStore,
     debounce_ms: Option<u64>,
+    startup: WatchStartup,
+) -> Result<()> {
+    let runtime = WatchRuntime {
+        startup,
+        progress: None,
+        startup_status: None,
+        shutdown: Box::pin(async {
+            let _ = tokio::signal::ctrl_c().await;
+        }),
+    };
+    run_inner(root, chunker, embedder, store, debounce_ms, runtime).await
+}
+
+pub async fn run_with_shutdown(
+    root: PathBuf,
+    chunker: &dyn Chunker,
+    embedder: &dyn Embedder,
+    store: &mut dyn VectorStore,
+    debounce_ms: Option<u64>,
+    control: WatchControl,
+) -> Result<()> {
+    let runtime = WatchRuntime {
+        startup: control.startup,
+        progress: control.progress,
+        startup_status: control.startup_status,
+        shutdown: Box::pin(async {
+            let _ = control.shutdown.await;
+        }),
+    };
+    run_inner(root, chunker, embedder, store, debounce_ms, runtime).await
+}
+
+async fn run_inner(
+    root: PathBuf,
+    chunker: &dyn Chunker,
+    embedder: &dyn Embedder,
+    store: &mut dyn VectorStore,
+    debounce_ms: Option<u64>,
+    mut runtime: WatchRuntime,
 ) -> Result<()> {
     let minsync_dir = root.join(".minsync");
     let debounce = Duration::from_millis(debounce_ms.unwrap_or(500));
@@ -80,15 +148,30 @@ pub async fn run(
 
     let sync = MinSync::new(root.clone());
 
+    let initial = run_sync(&sync, chunker, embedder, store).await;
+    if let Ok(result) = initial.as_ref() {
+        if let Some(status) = &runtime.startup_status {
+            let _ = status.send(WatchStartupStatus::InitialSyncSucceeded);
+        }
+        if let Some(progress) = &runtime.progress {
+            let _ = progress.send(result.clone());
+        }
+    }
+    if let Err(error) = initial {
+        match runtime.startup {
+            WatchStartup::FailFast => return Err(error),
+            WatchStartup::ContinueOnSyncError => {
+                if let Some(status) = &runtime.startup_status {
+                    let _ = status.send(WatchStartupStatus::InitialSyncFailed(error.to_string()));
+                }
+                tracing::error!("initial watch sync failed; waiting for file changes: {error}");
+            }
+        }
+    }
+
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                match signal {
-                    Ok(()) => tracing::info!("ctrl-c received, stopping watch"),
-                    Err(error) => tracing::error!("failed to listen for ctrl-c: {error}"),
-                }
-                break;
-            }
+            _ = &mut runtime.shutdown => break,
             received = rx.recv() => {
                 let Some(result) = received else {
                     break;
@@ -109,7 +192,14 @@ pub async fn run(
                             if needs_rescan {
                                 tracing::info!("rescan requested, running incremental sync");
                             }
-                            run_sync(&sync, chunker, embedder, store).await;
+                            match run_sync(&sync, chunker, embedder, store).await {
+                                Ok(result) => {
+                                    if let Some(progress) = &runtime.progress {
+                                        let _ = progress.send(result);
+                                    }
+                                }
+                                Err(error) => tracing::error!("watch sync failed: {error}"),
+                            }
                         }
                     }
                     Err(errors) => {
@@ -126,33 +216,33 @@ pub async fn run(
     Ok(())
 }
 
-/// Run one incremental sync and log the outcome. Errors are logged (the watch
-/// loop keeps running) rather than propagated.
+/// Run one incremental sync and log the outcome.
 async fn run_sync(
     sync: &MinSync,
     chunker: &dyn Chunker,
     embedder: &dyn Embedder,
     store: &mut dyn VectorStore,
-) {
-    match sync
+) -> Result<crate::types::SyncResult> {
+    let result = sync
         .sync(chunker, embedder, store, false, false, false)
-        .await
+        .await?;
     {
-        Ok(result) => {
-            if result.already_up_to_date {
-                tracing::info!("watch sync: already up to date");
-            } else {
-                tracing::info!(
-                    "watch sync: {} files processed, {} added, {} updated, {} deleted",
-                    result.files_processed,
-                    result.chunks_added,
-                    result.chunks_updated,
-                    result.chunks_deleted,
-                );
-            }
+        if result.already_up_to_date {
+            tracing::info!("watch sync: already up to date");
+        } else {
+            tracing::info!(
+                "watch sync: {} files processed; files added {}, modified {}, deleted {}; chunks added {}, updated {}, deleted {}",
+                result.files_processed,
+                result.files_added,
+                result.files_modified,
+                result.files_deleted,
+                result.chunks_added,
+                result.chunks_updated,
+                result.chunks_deleted,
+            );
         }
-        Err(error) => tracing::error!("watch sync failed: {error}"),
     }
+    Ok(result)
 }
 
 #[cfg(test)]

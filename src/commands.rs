@@ -37,8 +37,18 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
         Commands::Verify { fix, all, sample } => {
             verify(&cli.format, root, &minsync_dir, fix, all, sample).await
         }
-        Commands::Watch { debounce_ms } => {
-            watch(&cli.format, root, &minsync_dir, debounce_ms).await
+        Commands::Watch {
+            debounce_ms,
+            watch_on_sync_error,
+        } => {
+            watch(
+                &cli.format,
+                root,
+                &minsync_dir,
+                debounce_ms,
+                watch_on_sync_error,
+            )
+            .await
         }
     }
 }
@@ -119,9 +129,12 @@ async fn sync(
                 }
                 println!("Sync complete:");
                 println!("  files processed: {}", result.files_processed);
-                println!("  chunks added:    {}", result.chunks_added);
-                println!("  chunks updated:  {}", result.chunks_updated);
-                println!("  chunks deleted:  {}", result.chunks_deleted);
+                println!("  files added:     {}", result.files_added);
+                println!("  files modified:  {}", result.files_modified);
+                println!("  files deleted:   {}", result.files_deleted);
+                println!("  chunks inserted: {}", result.chunks_added);
+                println!("  chunks reused:   {}", result.chunks_updated);
+                println!("  chunks removed:  {}", result.chunks_deleted);
                 println!();
                 println!("Sync Stats");
                 println!("  elapsed time:        {:.2}s", result.elapsed_seconds);
@@ -294,10 +307,15 @@ async fn watch(
     root: PathBuf,
     minsync_dir: &std::path::Path,
     debounce_ms: Option<u64>,
+    watch_on_sync_error: bool,
 ) -> Result<()> {
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let chunker = crate::chunker::create_chunker(&config)?;
-    let embedder = crate::embedder::create_embedder(&config)?;
+    let embedder: Box<dyn crate::embedder::Embedder> = if watch_on_sync_error {
+        Box::new(crate::embedder::DeferredEmbedder::new(config.clone()))
+    } else {
+        crate::embedder::create_embedder(&config)?
+    };
     let store_path = minsync_dir.join(&config.collection.path);
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
@@ -311,6 +329,11 @@ async fn watch(
         embedder.as_ref(),
         store.as_mut(),
         debounce_ms,
+        if watch_on_sync_error {
+            crate::watch::WatchStartup::ContinueOnSyncError
+        } else {
+            crate::watch::WatchStartup::FailFast
+        },
     )
     .await?;
     Ok(())
