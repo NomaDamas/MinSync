@@ -40,6 +40,10 @@ pub async fn query(
     }
 
     let filter = Filter::And(std::mem::take(&mut filters));
+    let index_state = match mode {
+        QueryMode::Bm25 => None,
+        QueryMode::Vector | QueryMode::Hybrid => store.index_state()?,
+    };
     let hits = match mode {
         QueryMode::Vector => {
             let query_vec = embedder.embed_query(text).await?;
@@ -80,6 +84,7 @@ pub async fn query(
             mode: mode.as_str().to_string(),
             vector_rank,
             bm25_rank,
+            index_state: index_state.clone(),
         })
         .collect())
 }
@@ -122,6 +127,7 @@ pub fn query_text(
             mode: QueryMode::Bm25.as_str().to_string(),
             vector_rank: None,
             bm25_rank: Some(i + 1),
+            index_state: None,
         })
         .collect())
 }

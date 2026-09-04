@@ -56,6 +56,7 @@ pub async fn verify(
     );
 
     let manifest = Manifest::scan(root, &config.source_id)?;
+    let index_state = store.index_state()?;
     let stale_paths = find_stale_paths(&manifest, store);
     basic_checks.insert("no_stale_paths".to_string(), stale_paths.is_empty());
 
@@ -89,6 +90,7 @@ pub async fn verify(
         all_passed: basic_checks.values().all(|passed| *passed),
         basic_checks,
         fixed,
+        index_state,
     })
 }
 

@@ -5,6 +5,7 @@
 use super::inner::LanceDbInner;
 use super::{to_store_error, IndexingConfig};
 use crate::error::Result;
+use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
 use std::sync::mpsc;
 
@@ -31,6 +32,7 @@ pub(super) enum Command {
     DocCount(Resp<usize>),
     AllPaths(Resp<Vec<String>>),
     IndexNames(Resp<Vec<String>>),
+    IndexState(Resp<IndexState>),
     Shutdown,
 }
 
@@ -92,6 +94,7 @@ pub(super) fn run_worker(
             Command::DocCount(resp) => send_response(resp, rt.block_on(inner.doc_count())),
             Command::AllPaths(resp) => send_response(resp, rt.block_on(inner.all_paths())),
             Command::IndexNames(resp) => send_response(resp, rt.block_on(inner.index_names())),
+            Command::IndexState(resp) => send_response(resp, rt.block_on(inner.index_state())),
             Command::Shutdown => break,
         }
     }

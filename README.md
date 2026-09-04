@@ -97,6 +97,30 @@ a later sync succeeds.
 Sync output reports file-level changes separately from chunk-level storage
 effects: `files added/modified/deleted` describes source files, while
 `chunks inserted/reused/removed` describes content-addressed index rows.
+JSON sync output also reports `files_checked`, `elapsed_seconds`,
+`freshness_check_only`, and `query_ready`. An unchanged incremental sync
+rehashes the workspace to preserve content-hash correctness, then returns
+without reading, chunking, embedding, writing, flushing, or rebuilding index
+rows; its elapsed time therefore measures freshness-check cost. Changed and
+full syncs include indexing and LanceDB maintenance in their elapsed time.
+For a local, credential-free comparison, run `cargo run --quiet -- sync
+--format json` twice, edit one tracked text file and run it again, then run
+`cargo run --quiet -- sync --full --format json`. Query process startup is
+outside this sync measurement.
+
+Run the checked-in credential-free scale benchmark with:
+
+```bash
+cargo test --test issue_41_benchmark -- --nocapture
+```
+
+It generates the same local corpus at 1x, 2x, 4x, and 8x, reports full,
+unchanged, and changed-file sync milliseconds, and reports p50/p95 for BM25,
+vector, and hybrid retrieval. The benchmark intentionally uses the in-memory
+store, so its query timings measure retrieval scaling separately from LanceDB
+index maintenance; the LanceDB ANN/FTS threshold and unindexed-delta behavior
+are covered by the live index tests. Timing values are observations, not a
+machine-specific latency SLO.
 
 Korean tokenization requires the official Kiwi native library and base model.
 Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted
