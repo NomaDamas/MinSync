@@ -48,6 +48,23 @@ fn ci_workflow_defines_required_multi_os_validation() {
 }
 
 #[test]
+fn release_workflow_smoke_tests_windows_watch_flag() {
+    let workflow = read_file(".github/workflows/release.yml");
+
+    for needle in [
+        "matrix.target == 'x86_64-pc-windows-msvc'",
+        "target/${{ matrix.target }}/release/minsync.exe",
+        "watch --watch-on-sync-error --help",
+        "--watch-on-sync-error",
+    ] {
+        assert!(
+            workflow.contains(needle),
+            "expected Windows release smoke test to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
 fn readme_documents_supported_ci_assumptions() {
     let readme = read_file("README.md");
 
