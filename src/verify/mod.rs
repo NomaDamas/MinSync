@@ -56,7 +56,6 @@ pub async fn verify(
     );
 
     let manifest = Manifest::scan(root, &config.source_id)?;
-    let index_state = store.index_state()?;
     let stale_paths = find_stale_paths(&manifest, store);
     basic_checks.insert("no_stale_paths".to_string(), stale_paths.is_empty());
 
@@ -69,6 +68,7 @@ pub async fn verify(
     } else {
         false
     };
+    let index_state = store.index_state()?;
 
     let mut sample_ok = true;
     for path in sample_paths(&manifest, sample) {
@@ -136,11 +136,78 @@ mod tests {
     use crate::sync::MinSync;
     use crate::types::SyncState;
     use crate::vectorstore::memory::InMemoryStore;
-    use crate::vectorstore::Document;
+    use crate::vectorstore::{Document, DocumentUpdate, QueryHit};
     use async_trait::async_trait;
     use tempfile::TempDir;
 
     struct MockEmbedder;
+
+    struct StateTrackingStore {
+        inner: InMemoryStore,
+        before_repair: crate::types::IndexState,
+        after_repair: crate::types::IndexState,
+        repaired: bool,
+    }
+
+    impl VectorStore for StateTrackingStore {
+        fn upsert(&mut self, docs: &[Document]) -> Result<()> {
+            self.inner.upsert(docs)
+        }
+
+        fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()> {
+            self.inner.update(updates)
+        }
+
+        fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
+            self.inner.fetch(ids)
+        }
+
+        fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
+            let deleted = self.inner.delete_by_filter(filter)?;
+            if deleted > 0 {
+                self.repaired = true;
+            }
+            Ok(deleted)
+        }
+
+        fn query(
+            &self,
+            vector: &[f32],
+            filter: Option<&Filter>,
+            topk: usize,
+        ) -> Result<Vec<QueryHit>> {
+            self.inner.query(vector, filter, topk)
+        }
+
+        fn query_text(
+            &self,
+            text: &str,
+            filter: Option<&Filter>,
+            topk: usize,
+        ) -> Result<Vec<QueryHit>> {
+            self.inner.query_text(text, filter, topk)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn doc_count(&self) -> usize {
+            self.inner.doc_count()
+        }
+
+        fn all_paths(&self) -> Vec<String> {
+            self.inner.all_paths()
+        }
+
+        fn index_state(&self) -> Result<Option<crate::types::IndexState>> {
+            Ok(Some(if self.repaired {
+                self.after_repair.clone()
+            } else {
+                self.before_repair.clone()
+            }))
+        }
+    }
 
     #[async_trait]
     impl Embedder for MockEmbedder {
@@ -333,5 +400,62 @@ mod tests {
         assert!(result.all_passed);
         assert!(result.fixed);
         assert_eq!(store.all_paths(), vec!["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_verify_fix_reports_post_repair_index_state() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+        let config = Config::load(&dir.path().join(".minsync/config.toml")).expect("load config");
+        store
+            .upsert(&[Document {
+                id: "stale".to_string(),
+                embedding: vec![0.0; 8],
+                text: "stale".to_string(),
+                source_id: config.source_id,
+                path: "deleted.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "stale".to_string(),
+                seen_token: "old".to_string(),
+            }])
+            .expect("upsert stale doc");
+
+        let before_repair = crate::types::IndexState {
+            fts_indexed: true,
+            ann_indexed: true,
+            unindexed_rows: Some(1),
+        };
+        let after_repair = crate::types::IndexState {
+            fts_indexed: true,
+            ann_indexed: true,
+            unindexed_rows: Some(0),
+        };
+        let mut tracking_store = StateTrackingStore {
+            inner: store,
+            before_repair: before_repair.clone(),
+            after_repair: after_repair.clone(),
+            repaired: false,
+        };
+
+        let result = verify(
+            &dir.path().join(".minsync"),
+            dir.path(),
+            &chunker,
+            &mut tracking_store,
+            true,
+            None,
+        )
+        .await
+        .expect("verify succeeds");
+
+        assert!(result.fixed);
+        assert_eq!(result.index_state, Some(after_repair));
     }
 }

@@ -40,10 +40,7 @@ pub async fn query(
     }
 
     let filter = Filter::And(std::mem::take(&mut filters));
-    let index_state = match mode {
-        QueryMode::Bm25 => None,
-        QueryMode::Vector | QueryMode::Hybrid => store.index_state()?,
-    };
+    let index_state = store.index_state()?;
     let hits = match mode {
         QueryMode::Vector => {
             let query_vec = embedder.embed_query(text).await?;
@@ -111,6 +108,7 @@ pub fn query_text(
         ));
     }
     let filter = Filter::And(vec![Filter::Eq("source_id".to_string(), cursor.source_id)]);
+    let index_state = store.index_state()?;
     Ok(store
         .query_text(text, Some(&filter), k)?
         .into_iter()
@@ -127,7 +125,7 @@ pub fn query_text(
             mode: QueryMode::Bm25.as_str().to_string(),
             vector_rank: None,
             bm25_rank: Some(i + 1),
-            index_state: None,
+            index_state: index_state.clone(),
         })
         .collect())
 }
@@ -229,6 +227,70 @@ mod tests {
 
         async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
             Ok(SENTINEL_QUERY_VEC.to_vec())
+        }
+    }
+
+    struct IndexedStore {
+        state: crate::types::IndexState,
+    }
+
+    impl VectorStore for IndexedStore {
+        fn upsert(&mut self, _docs: &[Document]) -> Result<()> {
+            Ok(())
+        }
+
+        fn update(&mut self, _updates: &[crate::vectorstore::DocumentUpdate]) -> Result<()> {
+            Ok(())
+        }
+
+        fn fetch(&self, _ids: &[String]) -> Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_by_filter(&mut self, _filter: &Filter) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn query(
+            &self,
+            _vector: &[f32],
+            _filter: Option<&Filter>,
+            _topk: usize,
+        ) -> Result<Vec<crate::vectorstore::QueryHit>> {
+            Ok(Vec::new())
+        }
+
+        fn query_text(
+            &self,
+            _text: &str,
+            _filter: Option<&Filter>,
+            _topk: usize,
+        ) -> Result<Vec<crate::vectorstore::QueryHit>> {
+            Ok(vec![crate::vectorstore::QueryHit {
+                doc_id: "bm25".to_string(),
+                path: "bm25.txt".to_string(),
+                heading_path: String::new(),
+                chunk_type: "text".to_string(),
+                text: "bm25 result".to_string(),
+                score: 1.0,
+                content_hash: "hash".to_string(),
+            }])
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn doc_count(&self) -> usize {
+            1
+        }
+
+        fn all_paths(&self) -> Vec<String> {
+            vec!["bm25.txt".to_string()]
+        }
+
+        fn index_state(&self) -> Result<Option<crate::types::IndexState>> {
+            Ok(Some(self.state.clone()))
         }
     }
 
@@ -384,6 +446,25 @@ mod tests {
         .expect("query succeeds");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_query_text_reports_index_state() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        write_query_state(&dir, "source-1");
+        let state = crate::types::IndexState {
+            fts_indexed: true,
+            ann_indexed: false,
+            unindexed_rows: None,
+        };
+        let store = IndexedStore {
+            state: state.clone(),
+        };
+
+        let results = query_text(&dir.path().join(".minsync"), "search text", 5, &store, None)
+            .expect("BM25 query succeeds");
+
+        assert_eq!(results[0].index_state, Some(state));
     }
 
     #[tokio::test]
