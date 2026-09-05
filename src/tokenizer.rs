@@ -7,7 +7,8 @@ use lindera::mode::Penalty;
 use lindera::segmenter::Segmenter;
 use lindera::tokenizer::Tokenizer as LinderaTokenizer;
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::ffi::CString;
+use std::sync::{Mutex, OnceLock};
 
 pub const SUPPORTED_LANGUAGES: &[&str] = &["simple", "ko", "ja", "zh", "ar", "multilingual"];
 
@@ -58,8 +59,12 @@ fn korean_tokens(text: &str) -> Result<String> {
         .join(" "))
 }
 
-#[cfg(windows)]
 fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
+    with_native_stderr_suppressed(|| korean_analysis_inner(text))
+}
+
+#[cfg(windows)]
+fn korean_analysis_inner(text: &str) -> Result<Vec<(String, String)>> {
     thread_local! {
         // Kiwi's Windows native destructor can raise STATUS_ACCESS_VIOLATION
         // during thread-local teardown. Keep one instance alive until process
@@ -88,7 +93,7 @@ fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
 }
 
 #[cfg(not(windows))]
-fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
+fn korean_analysis_inner(text: &str) -> Result<Vec<(String, String)>> {
     thread_local! {
         static TOKENIZER: RefCell<Option<Kiwi>> = const { RefCell::new(None) };
     }
@@ -110,6 +115,60 @@ fn korean_analysis(text: &str) -> Result<Vec<(String, String)>> {
             })
             .map_err(|error| MinSyncError::Config(format!("tokenize Korean text: {error}")))
     })
+}
+
+fn with_native_stderr_suppressed<T>(op: impl FnOnce() -> T) -> T {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(guard) = StderrRestore::silence() else {
+        return op();
+    };
+    let result = op();
+    drop(guard);
+    result
+}
+
+struct StderrRestore {
+    saved: i32,
+}
+
+impl StderrRestore {
+    fn silence() -> Option<Self> {
+        // SAFETY: dup copies the current stderr fd so Drop can restore it.
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if saved < 0 {
+            return None;
+        }
+        let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let Ok(path) = CString::new(null_path) else {
+            // SAFETY: saved is a valid duplicated fd from dup().
+            unsafe { libc::close(saved) };
+            return None;
+        };
+        // SAFETY: path is a valid C string for the platform discard device.
+        let null_fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+        if null_fd < 0 {
+            // SAFETY: saved is still the duplicated stderr fd.
+            unsafe { libc::close(saved) };
+            return None;
+        }
+        unsafe {
+            // SAFETY: null_fd is an open discard fd; STDERR_FILENO is process stderr.
+            libc::dup2(null_fd, libc::STDERR_FILENO);
+            libc::close(null_fd);
+        }
+        Some(Self { saved })
+    }
+}
+
+impl Drop for StderrRestore {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: saved is the original stderr fd duplicated in silence().
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
 }
 
 fn japanese_tokens(text: &str) -> Result<String> {

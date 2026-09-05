@@ -74,7 +74,8 @@ fn bm25_cli_queries_live_lancedb_without_embedder_credentials() {
     assert!(results[0].get("vector_rank").is_none());
     assert!(
         String::from_utf8_lossy(&output.stderr).is_empty(),
-        "BM25 mode must not attempt an embedding request"
+        "BM25 mode must not attempt an embedding request; stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
