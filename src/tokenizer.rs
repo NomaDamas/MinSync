@@ -134,8 +134,9 @@ struct StderrRestore {
 
 impl StderrRestore {
     fn silence() -> Option<Self> {
+        const STDERR_FD: i32 = 2;
         // SAFETY: dup copies the current stderr fd so Drop can restore it.
-        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        let saved = unsafe { libc::dup(STDERR_FD) };
         if saved < 0 {
             return None;
         }
@@ -154,7 +155,7 @@ impl StderrRestore {
         }
         unsafe {
             // SAFETY: null_fd is an open discard fd; STDERR_FILENO is process stderr.
-            libc::dup2(null_fd, libc::STDERR_FILENO);
+            libc::dup2(null_fd, STDERR_FD);
             libc::close(null_fd);
         }
         Some(Self { saved })
@@ -163,9 +164,10 @@ impl StderrRestore {
 
 impl Drop for StderrRestore {
     fn drop(&mut self) {
+        const STDERR_FD: i32 = 2;
         unsafe {
             // SAFETY: saved is the original stderr fd duplicated in silence().
-            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::dup2(self.saved, STDERR_FD);
             libc::close(self.saved);
         }
     }
