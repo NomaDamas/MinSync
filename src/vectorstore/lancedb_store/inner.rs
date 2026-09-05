@@ -10,6 +10,7 @@ use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
 };
 use crate::error::Result;
+use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
@@ -267,6 +268,30 @@ impl LanceDbInner {
             .into_iter()
             .map(|index| index.name)
             .collect())
+    }
+
+    pub(super) async fn index_state(&self) -> Result<IndexState> {
+        let indices = self.table.list_indices().await.map_err(to_store_error)?;
+        let fts_indexed = indices
+            .iter()
+            .any(|index| index.columns.iter().any(|column| column == "lexical_text"));
+        let ann = indices
+            .iter()
+            .find(|index| index.columns.iter().any(|column| column == VECTOR_COLUMN));
+        let unindexed_rows = match ann {
+            Some(index) => self
+                .table
+                .index_stats(&index.name)
+                .await
+                .map_err(to_store_error)?
+                .map(|stats| stats.num_unindexed_rows),
+            None => None,
+        };
+        Ok(IndexState {
+            fts_indexed,
+            ann_indexed: ann.is_some(),
+            unindexed_rows,
+        })
     }
 
     pub(super) async fn doc_count(&self) -> Result<usize> {

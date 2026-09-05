@@ -85,6 +85,29 @@ Sync 출력은 파일 단위 변경과 chunk 단위 저장 결과를 분리합�
 `files added/modified/deleted`는 원본 파일 변경을, `chunks
 inserted/reused/removed`는 content-addressed index row의 삽입·재사용·삭제를
 뜻합니다.
+JSON sync 출력에는 `files_checked`, `elapsed_seconds`,
+`freshness_check_only`, `query_ready`도 포함됩니다. 변경되지 않은 증분
+sync는 content hash 정확성을 위해 workspace를 다시 hash하지만, read,
+chunk, embedding, write, flush, index row rebuild는 수행하지 않고 반환합니다.
+따라서 이때 elapsed time은 freshness-check 비용을 뜻합니다. 변경 sync와
+full sync의 elapsed time에는 indexing과 LanceDB maintenance가 포함됩니다.
+Credential 없이 로컬에서 비교하려면 `cargo run --quiet -- sync --format json`을
+두 번 실행하고, 추적 중인 text 파일 하나를 수정해 다시 실행한 다음
+`cargo run --quiet -- sync --full --format json`을 실행하세요. Query process
+startup 비용은 이 sync 측정에 포함되지 않습니다.
+
+Credential 없이 실행할 수 있는 저장된 scale benchmark는 다음과 같습니다.
+
+```bash
+cargo test --test issue_41_benchmark -- --nocapture
+```
+
+이 benchmark는 동일한 local corpus를 1x, 2x, 4x, 8x로 생성하고 full,
+변경 없음, 파일 변경 sync의 millisecond와 BM25, vector, hybrid 검색의
+p50/p95를 출력합니다. Query scaling과 LanceDB index maintenance를
+분리하기 위해 query 측정은 의도적으로 in-memory store를 사용하며, LanceDB의
+ANN/FTS threshold와 unindexed delta 동작은 live index test가 검증합니다.
+측정값은 관찰 결과이며 machine-specific latency SLO가 아닙니다.
 
 한국어 tokenizer에는 공식 Kiwi native library와 base model이 필요합니다.
 `KIWI_LIBRARY_PATH`는 `libkiwi`, `KIWI_MODEL_PATH`는 압축 해제한

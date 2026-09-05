@@ -102,12 +102,17 @@ impl MinSync {
                 .unwrap_or_else(|| Manifest::new(&config.source_id))
         };
         let scan_baseline = if full { None } else { stored_manifest.as_ref() };
+        let start = std::time::Instant::now();
         let new_manifest =
             Manifest::scan_with_baseline(&self.root, &config.source_id, scan_baseline)?;
         let changes = Manifest::diff(&old_manifest, &new_manifest);
 
         if changes.is_empty() && !full {
-            return Ok(empty_sync_result(dry_run, true));
+            let mut result = empty_sync_result(dry_run, true);
+            result.files_checked = new_manifest.files.len();
+            result.query_ready = cursor_path.exists();
+            result.elapsed_seconds = start.elapsed().as_secs_f64();
+            return Ok(result);
         }
 
         if dry_run {
@@ -124,7 +129,7 @@ impl MinSync {
                 .iter()
                 .filter(|change| matches!(change, FileChange::Deleted(_)))
                 .count();
-            return Ok(SyncResult {
+            let mut result = SyncResult {
                 files_processed_paths,
                 files_added,
                 files_modified,
@@ -133,7 +138,10 @@ impl MinSync {
                 already_up_to_date: false,
                 initial_sync,
                 ..empty_sync_result(true, false)
-            });
+            };
+            result.files_checked = new_manifest.files.len();
+            result.elapsed_seconds = start.elapsed().as_secs_f64();
+            return Ok(result);
         }
 
         let sync_token = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -145,9 +153,10 @@ impl MinSync {
         )
         .save(&txn_path)?;
 
-        let start = std::time::Instant::now();
         let mut result = empty_sync_result(false, false);
         result.initial_sync = initial_sync;
+        result.files_checked = new_manifest.files.len();
+        result.query_ready = true;
         if lexical_rebuild {
             result.chunks_deleted += store.delete_by_filter(&Filter::Eq(
                 "source_id".to_string(),
@@ -475,6 +484,32 @@ mod tests {
 
         assert!(result.already_up_to_date);
         assert_eq!(result.files_processed, 0);
+        assert_eq!(result.files_checked, 1);
+        assert!(result.freshness_check_only);
+        assert!(result.query_ready);
+        assert!(result.elapsed_seconds > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_noop_reports_freshness_check_elapsed_time() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first sync succeeds");
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("no-op sync succeeds");
+
+        assert!(result.already_up_to_date);
+        assert!(
+            result.elapsed_seconds > 0.0,
+            "no-op sync must report freshness-check time"
+        );
     }
 
     #[tokio::test]

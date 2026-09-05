@@ -32,11 +32,13 @@ pub async fn check(
         let _ = store.doc_count();
         true
     };
+    let index_state = store.index_state()?;
 
     Ok(CheckResult {
         embedder_ok,
         vectorstore_ok,
         all_passed: embedder_ok && vectorstore_ok && errors.is_empty(),
         errors,
+        index_state,
     })
 }

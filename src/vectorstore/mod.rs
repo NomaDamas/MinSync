@@ -3,6 +3,7 @@ pub mod memory;
 pub mod similarity;
 
 use crate::error::Result;
+use crate::types::IndexState;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,9 @@ pub trait VectorStore: Send + Sync {
     fn flush(&mut self) -> Result<()>;
     fn doc_count(&self) -> usize;
     fn all_paths(&self) -> Vec<String>;
+    fn index_state(&self) -> Result<Option<IndexState>> {
+        Ok(None)
+    }
 }
 
 use crate::config::Config;

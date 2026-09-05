@@ -18,6 +18,7 @@ pub use filters::filter_to_sql;
 pub use index::IndexingConfig;
 
 use crate::error::{MinSyncError, Result};
+use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, VectorStore};
 use lancedb::DistanceType;
 use std::path::Path;
@@ -128,6 +129,10 @@ impl LanceDbStore {
         self.request(Command::IndexNames)
     }
 
+    pub fn index_state(&self) -> Result<IndexState> {
+        self.request(Command::IndexState)
+    }
+
     fn request<T>(&self, make: impl FnOnce(Resp<T>) -> Command) -> Result<T> {
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(make(resp_tx)).map_err(to_store_error)?;
@@ -206,6 +211,10 @@ impl VectorStore for LanceDbStore {
                 Vec::new()
             }
         }
+    }
+
+    fn index_state(&self) -> Result<Option<IndexState>> {
+        LanceDbStore::index_state(self).map(Some)
     }
 }
 
