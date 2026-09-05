@@ -128,6 +128,23 @@ State lives in `.minsync/`:
 
 Delete `.minsync/` to start fresh.
 
+### Freshness checks
+
+After the first completed sync, MinSync uses the persisted file metadata
+fingerprint as a conservative fast path. On Unix this fingerprint includes
+size, modification time, change time, device, and inode, so unchanged files
+reuse their manifest hash without reading their contents. A replacement that
+keeps the same size and restores the modification time still changes the
+fingerprint through the filesystem change time and is rehashed.
+
+Manifests written by older versions, platforms without the required metadata,
+and explicit `minsync sync --full` scans conservatively hash file contents.
+The fast path is not a second freshness owner: the manifest remains the only
+source of content hashes, and a fingerprint mismatch always falls back to
+SHA-256. Filesystem writers that mutate content after metadata is observed
+remain subject to the normal concurrent-write race; run `--full` when an
+authoritative rescan is required.
+
 ## Chunkers
 
 | id | Strategy | Boundary stability under edits |
