@@ -198,3 +198,22 @@ fn windows_ci_uses_setup_protoc_instead_of_vendored_protobuf_src() {
         "expected non-Windows builds to keep vendored protobuf-src"
     );
 }
+
+#[test]
+fn release_workflow_smokes_windows_cli_contract() {
+    let workflow = read_file(".github/workflows/release.yml");
+
+    for needle in [
+        "Smoke test Windows CLI contract",
+        "matrix.target == 'x86_64-pc-windows-msvc'",
+        "init --language simple --help",
+        "query alpha --mode $mode --help",
+        "query alpha --mode nope",
+        "possible values",
+    ] {
+        assert!(
+            workflow.contains(needle),
+            "expected Windows release smoke test to contain {needle:?}"
+        );
+    }
+}
