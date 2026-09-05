@@ -48,6 +48,19 @@ jobs:
 
       - run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Smoke test Windows watch flags
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/minsync.exe"
+          $output = & $exe watch --watch-on-sync-error --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows watch flag was rejected: $output"
+          }
+          if ($output -notmatch "--watch-on-sync-error") {
+            throw "Windows watch help omitted --watch-on-sync-error: $output"
+          }
+
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
