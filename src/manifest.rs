@@ -371,6 +371,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_scan_with_baseline_reuses_matching_fingerprint_without_hashing() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -387,6 +388,28 @@ mod tests {
         );
         assert_eq!(stats.files_rehashed, 0);
         assert_eq!(stats.bytes_hashed, 0);
+        assert_eq!(stats.files_examined, 1);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_scan_with_baseline_rehashes_when_fingerprint_unavailable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("a.txt"), "alpha").expect("write file");
+        let baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+
+        let (manifest, stats) =
+            Manifest::scan_with_baseline_stats(dir.path(), "source-1", Some(&baseline))
+                .expect("scan with baseline");
+
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            baseline.files["a.txt"].content_hash
+        );
+        assert!(baseline.files["a.txt"].fingerprint.is_none());
+        assert!(manifest.files["a.txt"].fingerprint.is_none());
+        assert_eq!(stats.files_rehashed, 1);
+        assert_eq!(stats.bytes_hashed, 5);
         assert_eq!(stats.files_examined, 1);
     }
 
