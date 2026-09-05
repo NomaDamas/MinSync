@@ -3860,6 +3860,7 @@ dependencies = [
  "jieba-rs",
  "kiwi-rs",
  "lancedb",
+ "libc",
  "lindera",
  "lzma-sys",
  "notify-debouncer-full",
