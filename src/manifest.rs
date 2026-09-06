@@ -23,6 +23,15 @@ pub struct ManifestFileEntry {
     pub size: u64,
     pub mtime_ns: u128,
     pub content_hash: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub files_examined: usize,
+    pub files_rehashed: usize,
+    pub bytes_hashed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,9 +58,18 @@ impl Manifest {
     pub fn scan_with_baseline(
         root: &Path,
         source_id: &str,
-        _baseline: Option<&Manifest>,
+        baseline: Option<&Manifest>,
     ) -> Result<Self> {
+        Self::scan_with_baseline_stats(root, source_id, baseline).map(|(manifest, _)| manifest)
+    }
+
+    pub fn scan_with_baseline_stats(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+    ) -> Result<(Self, ScanStats)> {
         let mut manifest = Self::new(source_id);
+        let mut stats = ScanStats::default();
         let walker = WalkBuilder::new(root)
             .add_custom_ignore_filename(".minsyncignore")
             .hidden(false)
@@ -68,6 +86,7 @@ impl Manifest {
                 continue;
             }
 
+            stats.files_examined += 1;
             let path = entry.path();
             let metadata = fs::metadata(path)?;
             let modified = metadata.modified()?;
@@ -79,7 +98,18 @@ impl Manifest {
                 .strip_prefix(root)
                 .map_err(|error| MinSyncError::Manifest(error.to_string()))?;
             let manifest_path = relative_path.to_string_lossy().replace('\\', "/");
-            let content_hash = hash_file(path)?;
+            let fingerprint = metadata_fingerprint(&metadata, mtime_ns);
+            let content_hash = match baseline
+                .and_then(|manifest| manifest.files.get(&manifest_path))
+                .filter(|entry| fingerprint.is_some() && entry.fingerprint == fingerprint)
+            {
+                Some(entry) => entry.content_hash.clone(),
+                None => {
+                    stats.files_rehashed += 1;
+                    stats.bytes_hashed += metadata.len();
+                    hash_file(path)?
+                }
+            };
 
             manifest.files.insert(
                 manifest_path,
@@ -87,11 +117,12 @@ impl Manifest {
                     size: metadata.len(),
                     mtime_ns,
                     content_hash,
+                    fingerprint,
                 },
             );
         }
 
-        Ok(manifest)
+        Ok((manifest, stats))
     }
 
     pub fn diff(old: &Manifest, new: &Manifest) -> Vec<FileChange> {
@@ -184,6 +215,26 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
+#[cfg(unix)]
+fn metadata_fingerprint(metadata: &fs::Metadata, mtime_ns: u128) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(format!(
+        "{}:{}:{}:{}:{}:{}",
+        metadata.len(),
+        mtime_ns,
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.dev(),
+        metadata.ino(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn metadata_fingerprint(_metadata: &fs::Metadata, _mtime_ns: u128) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +245,7 @@ mod tests {
             size: 1,
             mtime_ns: 1,
             content_hash: hash.to_string(),
+            fingerprint: None,
         }
     }
 
@@ -253,6 +305,11 @@ mod tests {
             .get_mut("a.txt")
             .expect("baseline entry")
             .content_hash = "sha256:baseline".to_string();
+        baseline
+            .files
+            .get_mut("a.txt")
+            .expect("baseline entry")
+            .fingerprint = None;
 
         let manifest = Manifest::scan_with_baseline(dir.path(), "source-1", Some(&baseline))
             .expect("scan with baseline");
@@ -290,23 +347,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("a.txt");
         fs::write(&path, "alpha").expect("write original file");
+        let mut baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
         fs::write(&path, "bravo").expect("write same-size replacement");
-        let metadata = fs::metadata(&path).expect("read replacement metadata");
-        let mtime_ns = metadata
+        let replacement_mtime_ns = fs::metadata(&path)
+            .expect("read replacement metadata")
             .modified()
             .expect("read replacement mtime")
             .duration_since(UNIX_EPOCH)
             .expect("replacement mtime after epoch")
             .as_nanos();
-        let mut baseline = Manifest::new("source-1");
-        baseline.files.insert(
-            "a.txt".to_string(),
-            ManifestFileEntry {
-                size: metadata.len(),
-                mtime_ns,
-                content_hash: prefixed_sha256(b"alpha"),
-            },
-        );
+        baseline
+            .files
+            .get_mut("a.txt")
+            .expect("baseline entry")
+            .mtime_ns = replacement_mtime_ns;
 
         let manifest = Manifest::scan_with_baseline(dir.path(), "source-1", Some(&baseline))
             .expect("scan with baseline");
@@ -315,6 +369,88 @@ mod tests {
             manifest.files["a.txt"].content_hash,
             prefixed_sha256(b"bravo")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_with_baseline_reuses_matching_fingerprint_without_hashing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("a.txt"), "alpha").expect("write file");
+        let baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+
+        let (manifest, stats) =
+            Manifest::scan_with_baseline_stats(dir.path(), "source-1", Some(&baseline))
+                .expect("scan with baseline");
+
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            baseline.files["a.txt"].content_hash
+        );
+        assert_eq!(stats.files_rehashed, 0);
+        assert_eq!(stats.bytes_hashed, 0);
+        assert_eq!(stats.files_examined, 1);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_scan_with_baseline_rehashes_when_fingerprint_unavailable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("a.txt"), "alpha").expect("write file");
+        let baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+
+        let (manifest, stats) =
+            Manifest::scan_with_baseline_stats(dir.path(), "source-1", Some(&baseline))
+                .expect("scan with baseline");
+
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            baseline.files["a.txt"].content_hash
+        );
+        assert!(baseline.files["a.txt"].fingerprint.is_none());
+        assert!(manifest.files["a.txt"].fingerprint.is_none());
+        assert_eq!(stats.files_rehashed, 1);
+        assert_eq!(stats.bytes_hashed, 5);
+        assert_eq!(stats.files_examined, 1);
+    }
+
+    #[test]
+    fn test_scan_with_baseline_rehashes_same_size_replacement() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "alpha").expect("write original file");
+        let baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+        let original_mtime = fs::metadata(&path)
+            .expect("read original metadata")
+            .modified()
+            .expect("read original mtime");
+        fs::write(&path, "bravo").expect("write replacement");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
+            .expect("restore original mtime");
+
+        let (manifest, stats) =
+            Manifest::scan_with_baseline_stats(dir.path(), "source-1", Some(&baseline))
+                .expect("scan replacement");
+
+        assert_eq!(
+            manifest.files["a.txt"].content_hash,
+            prefixed_sha256(b"bravo")
+        );
+        assert_eq!(stats.files_rehashed, 1);
+        assert_eq!(stats.bytes_hashed, 5);
+    }
+
+    #[test]
+    fn test_scan_without_baseline_rehashes_every_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("a.txt"), "alpha").expect("write a");
+        fs::write(dir.path().join("b.txt"), "bravo").expect("write b");
+
+        let (_manifest, stats) =
+            Manifest::scan_with_baseline_stats(dir.path(), "source-1", None).expect("full scan");
+
+        assert_eq!(stats.files_examined, 2);
+        assert_eq!(stats.files_rehashed, 2);
+        assert_eq!(stats.bytes_hashed, 10);
     }
 
     #[test]

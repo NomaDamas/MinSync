@@ -55,6 +55,7 @@ mod tests {
                     size: 0,
                     mtime_ns: 0,
                     content_hash: "hash".to_string(),
+                    fingerprint: None,
                 },
             );
         }

@@ -99,9 +99,10 @@ effects: `files added/modified/deleted` describes source files, while
 `chunks inserted/reused/removed` describes content-addressed index rows.
 JSON sync output also reports `files_checked`, `elapsed_seconds`,
 `freshness_check_only`, and `query_ready`. An unchanged incremental sync
-rehashes the workspace to preserve content-hash correctness, then returns
-without reading, chunking, embedding, writing, flushing, or rebuilding index
-rows; its elapsed time therefore measures freshness-check cost. Changed and
+uses a conservative metadata fingerprint to skip hashing unchanged files,
+then returns without reading, chunking, embedding, writing, flushing, or
+rebuilding index rows; its elapsed time therefore measures freshness-check
+cost. Changed and
 full syncs include indexing and LanceDB maintenance in their elapsed time.
 For a local, credential-free comparison, run `cargo run --quiet -- sync
 --format json` twice, edit one tracked text file and run it again, then run
@@ -151,6 +152,23 @@ State lives in `.minsync/`:
 | `lock` | process lock |
 
 Delete `.minsync/` to start fresh.
+
+### Freshness checks
+
+After the first completed sync, MinSync uses the persisted file metadata
+fingerprint as a conservative fast path. On Unix this fingerprint includes
+size, modification time, change time, device, and inode, so unchanged files
+reuse their manifest hash without reading their contents. A replacement that
+keeps the same size and restores the modification time still changes the
+fingerprint through the filesystem change time and is rehashed.
+
+Manifests written by older versions, platforms without the required metadata,
+and explicit `minsync sync --full` scans conservatively hash file contents.
+The fast path is not a second freshness owner: the manifest remains the only
+source of content hashes, and a fingerprint mismatch always falls back to
+SHA-256. Filesystem writers that mutate content after metadata is observed
+remain subject to the normal concurrent-write race; run `--full` when an
+authoritative rescan is required.
 
 ## Chunkers
 
