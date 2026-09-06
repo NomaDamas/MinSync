@@ -41,9 +41,11 @@ impl MinSync {
         let _lock = force
             .then(|| FileLock::acquire(&self.minsync_dir.join("lock"), false))
             .transpose()?;
-        if force {
-            self.reset_forced_state()?;
-        }
+        let reset_staging = if force {
+            Some(self.reset_forced_state()?)
+        } else {
+            None
+        };
         std::fs::create_dir_all(&self.minsync_dir)?;
         let source_id = uuid::Uuid::new_v4().to_string();
         let mut config = Config::default_for(&source_id);
@@ -52,28 +54,39 @@ impl MinSync {
 
         config.save(&self.minsync_dir.join("config.toml"))?;
         Manifest::scan(&self.root, &source_id)?.save(&self.minsync_dir.join("manifest.json"))?;
+        if let Some(staging) = reset_staging {
+            std::fs::remove_dir_all(staging)?;
+        }
 
         Ok(config)
     }
 
-    fn reset_forced_state(&self) -> Result<()> {
+    fn reset_forced_state(&self) -> Result<PathBuf> {
         let config_path = self.minsync_dir.join("config.toml");
-        if config_path.exists() {
-            let previous = Config::load(&config_path)?;
+        let previous = if config_path.exists() {
+            Some(Config::load(&config_path)?)
+        } else {
+            None
+        };
+        let staging = self
+            .minsync_dir
+            .join(format!(".reset-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&staging)?;
+
+        if let Some(previous) = previous {
             let previous_store =
                 collection_store_path(&self.minsync_dir, &previous.collection.path)?;
+            for state_file in ["cursor.json", "txn.json"] {
+                let path = self.minsync_dir.join(state_file);
+                if path.exists() {
+                    std::fs::rename(&path, staging.join(state_file))?;
+                }
+            }
             if previous_store.exists() {
-                std::fs::remove_dir_all(previous_store)?;
+                std::fs::rename(previous_store, staging.join("store"))?;
             }
         }
-
-        for state_file in ["cursor.json", "txn.json"] {
-            let path = self.minsync_dir.join(state_file);
-            if path.exists() {
-                std::fs::remove_file(path)?;
-            }
-        }
-        Ok(())
+        Ok(staging)
     }
 }
 
