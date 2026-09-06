@@ -80,7 +80,8 @@ pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
             .with_max_retries(settings.max_retries)
             .with_max_concurrent(settings.max_concurrent)
             .with_query_prefix(config.embedder.query_prefix.clone())
-            .with_passage_prefix(config.embedder.passage_prefix.clone());
+            .with_passage_prefix(config.embedder.passage_prefix.clone())
+            .with_truncate(settings.truncate);
         Ok(Box::new(embedder))
     } else {
         Err(MinSyncError::Config(format!("unknown embedder id: {id}")))

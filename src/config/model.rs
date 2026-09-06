@@ -89,6 +89,10 @@ pub struct EmbedderConfig {
     pub query_prefix: Option<String>,
     #[serde(default)]
     pub passage_prefix: Option<String>,
+    /// Ask TEI-compatible servers to truncate inputs at the model context.
+    /// Keep disabled by default so oversized content is surfaced explicitly.
+    #[serde(default)]
+    pub truncate: bool,
 }
 
 fn default_batch_size() -> usize {
@@ -177,6 +181,7 @@ impl Config {
                 base_url: None,
                 query_prefix: None,
                 passage_prefix: None,
+                truncate: false,
             },
             vectorstore: VectorStoreConfig {
                 id: "lancedb".to_string(),
