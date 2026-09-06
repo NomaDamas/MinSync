@@ -48,6 +48,31 @@ jobs:
 
       - run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Smoke test Windows CLI contract
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/minsync.exe"
+          $help = & $exe --help 2>&1
+          if ($LASTEXITCODE -ne 0 -or $help -notmatch "Usage:") { throw "top-level help failed" }
+          $init = & $exe init --language simple --help 2>&1
+          if ($LASTEXITCODE -ne 0 -or $init -notmatch "--language") { throw "init language flag failed" }
+          foreach ($mode in @("vector", "bm25", "hybrid")) {
+            $query = & $exe query alpha --mode $mode --help 2>&1
+            if ($LASTEXITCODE -ne 0 -or $query -notmatch "--mode") { throw "query mode $mode failed" }
+          }
+          $invalid = & $exe query alpha --mode nope 2>&1
+          if ($LASTEXITCODE -ne 2 -or $invalid -notmatch "possible values") {
+            throw "invalid query mode was not rejected as expected"
+          }
+          $output = & $exe watch --watch-on-sync-error --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows watch flag was rejected: $output"
+          }
+          if ($output -notmatch "--watch-on-sync-error") {
+            throw "Windows watch help omitted --watch-on-sync-error: $output"
+          }
+
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |

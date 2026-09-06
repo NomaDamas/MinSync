@@ -93,3 +93,23 @@ pub enum Commands {
         watch_on_sync_error: bool,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn watch_accepts_sync_error_recovery_flag() {
+        let cli = Cli::try_parse_from(["minsync", "watch", "--watch-on-sync-error"])
+            .expect("watch recovery flag is accepted");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Watch {
+                watch_on_sync_error: true,
+                ..
+            }
+        ));
+    }
+}

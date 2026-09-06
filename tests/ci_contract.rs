@@ -48,6 +48,23 @@ fn ci_workflow_defines_required_multi_os_validation() {
 }
 
 #[test]
+fn release_workflow_smoke_tests_windows_watch_flag() {
+    let workflow = read_file(".github/workflows/release.yml");
+
+    for needle in [
+        "matrix.target == 'x86_64-pc-windows-msvc'",
+        "target/${{ matrix.target }}/release/minsync.exe",
+        "watch --watch-on-sync-error --help",
+        "--watch-on-sync-error",
+    ] {
+        assert!(
+            workflow.contains(needle),
+            "expected Windows release smoke test to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
 fn readme_documents_supported_ci_assumptions() {
     let readme = read_file("README.md");
 
@@ -197,4 +214,23 @@ fn windows_ci_uses_setup_protoc_instead_of_vendored_protobuf_src() {
         manifest.contains("protobuf-src = \"2.1\""),
         "expected non-Windows builds to keep vendored protobuf-src"
     );
+}
+
+#[test]
+fn release_workflow_smokes_windows_cli_contract() {
+    let workflow = read_file(".github/workflows/release.yml");
+
+    for needle in [
+        "Smoke test Windows CLI contract",
+        "matrix.target == 'x86_64-pc-windows-msvc'",
+        "init --language simple --help",
+        "query alpha --mode $mode --help",
+        "query alpha --mode nope",
+        "possible values",
+    ] {
+        assert!(
+            workflow.contains(needle),
+            "expected Windows release smoke test to contain {needle:?}"
+        );
+    }
 }

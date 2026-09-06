@@ -27,6 +27,9 @@ pub struct SyncResult {
     pub embedding_api_calls: usize,
     pub embedded_texts: usize,
     pub estimated_tokens: usize,
+    pub files_checked: usize,
+    pub freshness_check_only: bool,
+    pub query_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,6 +47,15 @@ pub struct QueryResult {
     pub vector_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bm25_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_state: Option<IndexState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexState {
+    pub fts_indexed: bool,
+    pub ann_indexed: bool,
+    pub unindexed_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +84,7 @@ pub struct CheckResult {
     pub vectorstore_ok: bool,
     pub all_passed: bool,
     pub errors: Vec<String>,
+    pub index_state: Option<IndexState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +92,7 @@ pub struct VerifyResult {
     pub all_passed: bool,
     pub basic_checks: HashMap<String, bool>,
     pub fixed: bool,
+    pub index_state: Option<IndexState>,
 }
 
 #[cfg(test)]
