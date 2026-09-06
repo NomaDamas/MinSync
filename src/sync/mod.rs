@@ -15,7 +15,7 @@ use crate::types::SyncResult;
 use crate::vectorstore::{Filter, VectorStore};
 use indexer::{index_file, SyncFileContext};
 use result::{change_path, empty_sync_result};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 pub struct MinSync {
     root: PathBuf,
@@ -38,6 +38,14 @@ impl MinSync {
             return Err(MinSyncError::AlreadyInitialized);
         }
 
+        let _lock = force
+            .then(|| FileLock::acquire(&self.minsync_dir.join("lock"), false))
+            .transpose()?;
+        let reset_staging = if force {
+            Some(self.reset_forced_state()?)
+        } else {
+            None
+        };
         std::fs::create_dir_all(&self.minsync_dir)?;
         let source_id = uuid::Uuid::new_v4().to_string();
         let mut config = Config::default_for(&source_id);
@@ -46,10 +54,89 @@ impl MinSync {
 
         config.save(&self.minsync_dir.join("config.toml"))?;
         Manifest::scan(&self.root, &source_id)?.save(&self.minsync_dir.join("manifest.json"))?;
+        if let Some(staging) = reset_staging {
+            std::fs::remove_dir_all(staging)?;
+        }
 
         Ok(config)
     }
 
+    fn reset_forced_state(&self) -> Result<PathBuf> {
+        let config_path = self.minsync_dir.join("config.toml");
+        let previous = if config_path.exists() {
+            Some(Config::load(&config_path)?)
+        } else {
+            None
+        };
+        let staging = self
+            .minsync_dir
+            .join(format!(".reset-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&staging)?;
+
+        if let Some(previous) = previous {
+            let previous_store =
+                collection_store_path(&self.minsync_dir, &previous.collection.path)?;
+            for state_file in ["cursor.json", "txn.json"] {
+                let path = self.minsync_dir.join(state_file);
+                if path.exists() {
+                    std::fs::rename(&path, staging.join(state_file))?;
+                }
+            }
+            if previous_store.exists() {
+                std::fs::rename(previous_store, staging.join("store"))?;
+            }
+        }
+        Ok(staging)
+    }
+}
+
+pub(crate) fn collection_store_path(minsync_dir: &Path, configured_path: &str) -> Result<PathBuf> {
+    let base = minsync_dir.canonicalize()?;
+    let path = Path::new(configured_path);
+    let mut candidate = base.clone();
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                has_normal_component = true;
+                candidate.push(name);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(MinSyncError::Config(format!(
+                    "collection.path must stay inside .minsync/: {configured_path}"
+                )));
+            }
+        }
+
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(MinSyncError::Config(format!(
+                        "collection.path must stay inside .minsync/: {configured_path}"
+                    )));
+                }
+                let resolved = candidate.canonicalize()?;
+                if !resolved.starts_with(&base) {
+                    return Err(MinSyncError::Config(format!(
+                        "collection.path must stay inside .minsync/: {configured_path}"
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    if !has_normal_component {
+        return Err(MinSyncError::Config(
+            "collection.path must name a directory inside .minsync/".to_string(),
+        ));
+    }
+    Ok(base.join(path))
+}
+
+impl MinSync {
     /// Incrementally synchronize changed files into the supplied vector store.
     pub async fn sync(
         &self,
@@ -60,13 +147,25 @@ impl MinSync {
         dry_run: bool,
         wait_lock: bool,
     ) -> Result<SyncResult> {
+        let _lock = FileLock::acquire(&self.minsync_dir.join("lock"), wait_lock)?;
+        self.sync_locked(chunker, embedder, store, full, dry_run)
+            .await
+    }
+
+    pub(crate) async fn sync_locked(
+        &self,
+        chunker: &dyn Chunker,
+        embedder: &dyn Embedder,
+        store: &mut dyn VectorStore,
+        full: bool,
+        dry_run: bool,
+    ) -> Result<SyncResult> {
         let config_path = self.minsync_dir.join("config.toml");
         if !config_path.exists() {
             return Err(MinSyncError::NotInitialized);
         }
 
         let config = Config::load(&config_path)?;
-        let _lock = FileLock::acquire(&self.minsync_dir.join("lock"), wait_lock)?;
 
         let txn_path = self.minsync_dir.join("txn.json");
         let cursor_path = self.minsync_dir.join("cursor.json");
@@ -308,6 +407,122 @@ mod tests {
             .expect("force init succeeds");
 
         assert_ne!(first.source_id, second.source_id);
+    }
+
+    #[test]
+    fn test_init_force_removes_previous_store_and_cursor() {
+        let (dir, sync, _chunker, _embedder, _store) = fixture();
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
+        std::fs::create_dir_all(sync.minsync_dir.join("store"))
+            .expect("create previous vector store");
+        std::fs::write(sync.minsync_dir.join("store/data"), "stale")
+            .expect("write previous vector store data");
+        std::fs::write(sync.minsync_dir.join("cursor.json"), "{}").expect("write stale cursor");
+        std::fs::write(sync.minsync_dir.join("txn.json"), "{}").expect("write stale transaction");
+
+        sync.init(true, "openai:text-embedding-3-small", "recursive")
+            .expect("force init succeeds");
+
+        assert!(!dir.path().join(".minsync/store").exists());
+        assert!(!dir.path().join(".minsync/cursor.json").exists());
+        assert!(!dir.path().join(".minsync/txn.json").exists());
+    }
+
+    #[test]
+    fn test_init_force_allows_lancedb_dimension_change() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+        let mut first = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
+        first.vectorstore.options["dimension"] = toml::Value::Integer(4);
+        first
+            .save(&sync.minsync_dir.join("config.toml"))
+            .expect("save first dimension");
+        let store_path = sync.minsync_dir.join(&first.collection.path);
+        let store = crate::vectorstore::lancedb_store::LanceDbStore::open_or_create(&store_path, 4)
+            .expect("create first-dimension store");
+        drop(store);
+
+        let mut second = sync
+            .init(true, "openai:text-embedding-3-small", "recursive")
+            .expect("force init succeeds");
+        second.vectorstore.options["dimension"] = toml::Value::Integer(8);
+        second
+            .save(&sync.minsync_dir.join("config.toml"))
+            .expect("save second dimension");
+        let reopened = crate::vectorstore::lancedb_store::LanceDbStore::open_or_create(
+            &sync.minsync_dir.join(&second.collection.path),
+            8,
+        )
+        .expect("open second-dimension store");
+
+        assert_eq!(reopened.dimension(), 8);
+        assert_eq!(reopened.doc_count(), 0);
+    }
+
+    #[test]
+    fn test_init_force_rejects_collection_path_outside_minsync() {
+        let (dir, sync, _chunker, _embedder, _store) = fixture();
+        let mut first = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
+        first.collection.path = "../outside".to_string();
+        first
+            .save(&sync.minsync_dir.join("config.toml"))
+            .expect("save unsafe collection path");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        std::fs::write(outside.join("data"), "keep").expect("write outside data");
+
+        let error = sync
+            .init(true, "openai:text-embedding-3-small", "recursive")
+            .expect_err("unsafe collection path must fail");
+
+        assert!(error.to_string().contains("must stay inside .minsync"));
+        assert!(outside.join("data").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_init_force_rejects_intermediate_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, sync, _chunker, _embedder, _store) = fixture();
+        let mut first = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
+        first.collection.path = "escape/store".to_string();
+        first
+            .save(&sync.minsync_dir.join("config.toml"))
+            .expect("save symlink path");
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("store")).expect("create outside store");
+        std::fs::write(outside.join("store/data"), "keep").expect("write outside data");
+        symlink(&outside, sync.minsync_dir.join("escape")).expect("create escape symlink");
+
+        let error = sync
+            .init(true, "openai:text-embedding-3-small", "recursive")
+            .expect_err("symlink collection path must fail");
+
+        assert!(error.to_string().contains("must stay inside .minsync"));
+        assert!(outside.join("store/data").exists());
+    }
+
+    #[test]
+    fn test_init_force_respects_workspace_lock() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
+        let _lock =
+            FileLock::acquire(&sync.minsync_dir.join("lock"), false).expect("hold workspace lock");
+
+        let error = sync
+            .init(true, "openai:text-embedding-3-small", "recursive")
+            .expect_err("force init must reject a locked workspace");
+
+        assert!(matches!(error, MinSyncError::LockFailed));
     }
 
     #[test]
