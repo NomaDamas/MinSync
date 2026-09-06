@@ -87,8 +87,9 @@ inserted/reused/removed`는 content-addressed index row의 삽입·재사용·�
 뜻합니다.
 JSON sync 출력에는 `files_checked`, `elapsed_seconds`,
 `freshness_check_only`, `query_ready`도 포함됩니다. 변경되지 않은 증분
-sync는 content hash 정확성을 위해 workspace를 다시 hash하지만, read,
-chunk, embedding, write, flush, index row rebuild는 수행하지 않고 반환합니다.
+sync는 보수적인 metadata fingerprint로 변경 없는 파일의 재해시를 건너뛴 뒤,
+read, chunk, embedding, write, flush, index row rebuild는 수행하지 않고
+반환합니다.
 따라서 이때 elapsed time은 freshness-check 비용을 뜻합니다. 변경 sync와
 full sync의 elapsed time에는 indexing과 LanceDB maintenance가 포함됩니다.
 Credential 없이 로컬에서 비교하려면 `cargo run --quiet -- sync --format json`을

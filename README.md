@@ -99,9 +99,10 @@ effects: `files added/modified/deleted` describes source files, while
 `chunks inserted/reused/removed` describes content-addressed index rows.
 JSON sync output also reports `files_checked`, `elapsed_seconds`,
 `freshness_check_only`, and `query_ready`. An unchanged incremental sync
-rehashes the workspace to preserve content-hash correctness, then returns
-without reading, chunking, embedding, writing, flushing, or rebuilding index
-rows; its elapsed time therefore measures freshness-check cost. Changed and
+uses a conservative metadata fingerprint to skip hashing unchanged files,
+then returns without reading, chunking, embedding, writing, flushing, or
+rebuilding index rows; its elapsed time therefore measures freshness-check
+cost. Changed and
 full syncs include indexing and LanceDB maintenance in their elapsed time.
 For a local, credential-free comparison, run `cargo run --quiet -- sync
 --format json` twice, edit one tracked text file and run it again, then run
