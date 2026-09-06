@@ -15,6 +15,7 @@ pub struct TeiEmbedder {
     retry: RetryPolicy,
     query_prefix: Option<String>,
     passage_prefix: Option<String>,
+    truncate: bool,
     client: reqwest::Client,
 }
 
@@ -22,7 +23,7 @@ pub struct TeiEmbedder {
 struct EmbedRequest {
     inputs: Vec<String>,
     normalize: bool,
-    truncate: Option<()>,
+    truncate: Option<bool>,
 }
 
 impl TeiEmbedder {
@@ -39,6 +40,7 @@ impl TeiEmbedder {
             retry: RetryPolicy::default(),
             query_prefix: None,
             passage_prefix: None,
+            truncate: false,
             client: build_client(DEFAULT_REQUEST_TIMEOUT),
         }
     }
@@ -74,6 +76,11 @@ impl TeiEmbedder {
         self
     }
 
+    pub fn with_truncate(mut self, truncate: bool) -> Self {
+        self.truncate = truncate;
+        self
+    }
+
     async fn embed_inputs(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let expected_count = inputs.len();
         self.retry
@@ -81,7 +88,7 @@ impl TeiEmbedder {
                 let request = EmbedRequest {
                     inputs: inputs.clone(),
                     normalize: true,
-                    truncate: None,
+                    truncate: self.truncate.then_some(true),
                 };
 
                 let response = self
@@ -259,18 +266,50 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/embed"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("the input length exceeds the context length"),
+            )
+            .expect(1)
             .mount(&server)
             .await;
 
-        let embedder = fast_retry_embedder(&server.uri(), 0);
+        let embedder = fast_retry_embedder(&server.uri(), 3);
         let texts = vec!["hello".to_string()];
 
         let error = embedder.embed(&texts).await.unwrap_err();
 
         assert!(matches!(error, MinSyncError::Embedding(_)));
-        assert!(error.to_string().contains("TEI API error 500"));
-        assert!(error.to_string().contains("server error"));
+        assert!(error
+            .to_string()
+            .contains("chunk exceeds the embedding model's context"));
+        assert!(error.to_string().contains("chunker.options.max_chunk_size"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_option_is_sent_to_tei() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/embed"))
+            .and(body_json(json!({
+                "inputs": ["hello"],
+                "normalize": true,
+                "truncate": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([[0.1]])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let embedder = TeiEmbedder::new("intfloat/multilingual-e5-small", &server.uri(), 10)
+            .with_truncate(true);
+
+        assert_eq!(
+            embedder.embed(&["hello".to_string()]).await.unwrap(),
+            vec![vec![0.1]]
+        );
     }
 
     #[tokio::test]

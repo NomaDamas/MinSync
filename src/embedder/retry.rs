@@ -81,11 +81,25 @@ impl RetryPolicy {
 /// non-success statuses (auth, validation) are fatal.
 pub fn classify_status(status: reqwest::StatusCode, provider: &str, body: &str) -> RequestError {
     let message = format!("{provider} API error {status}: {body}");
+    if is_context_length_error(body) {
+        return RequestError::Fatal(format!(
+            "chunk exceeds the embedding model's context; \
+             lower `chunker.options.max_chunk_size` or set `embedder.truncate = true` \
+             ({message})"
+        ));
+    }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         RequestError::Retryable(message)
     } else {
         RequestError::Fatal(message)
     }
+}
+
+fn is_context_length_error(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("context length")
+        || body.contains("input length exceeds")
+        || body.contains("must have less than")
 }
 
 /// Classify a request transport error: connection failures and timeouts are
@@ -185,6 +199,20 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.to_string().contains("401 unauthorized"));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_context_length_server_error_is_fatal() {
+        let error = classify_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "TEI",
+            "the input length exceeds the context length",
+        );
+
+        assert!(matches!(error, RequestError::Fatal(message) if
+            message.contains("chunk exceeds the embedding model's context") &&
+            message.contains("chunker.options.max_chunk_size") &&
+            message.contains("embedder.truncate")));
     }
 
     #[tokio::test]
