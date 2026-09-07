@@ -38,6 +38,9 @@ impl MinSync {
             return Err(MinSyncError::AlreadyInitialized);
         }
 
+        if force {
+            std::fs::create_dir_all(&self.minsync_dir)?;
+        }
         let _lock = force
             .then(|| FileLock::acquire(&self.minsync_dir.join("lock"), false))
             .transpose()?;
@@ -123,7 +126,7 @@ pub(crate) fn collection_store_path(minsync_dir: &Path, configured_path: &str) -
                     )));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -523,6 +526,34 @@ mod tests {
             .expect_err("force init must reject a locked workspace");
 
         assert!(matches!(error, MinSyncError::LockFailed));
+    }
+
+    #[test]
+    fn test_init_force_creates_missing_workspace_before_locking() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+
+        sync.init(true, "openai:text-embedding-3-small", "recursive")
+            .expect("force init succeeds in a new workspace");
+    }
+
+    #[test]
+    fn test_init_force_rejects_parent_escape_after_missing_component() {
+        let (dir, sync, _chunker, _embedder, _store) = fixture();
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("first init succeeds");
+        let mut config =
+            Config::load(&sync.minsync_dir.join("config.toml")).expect("load initial config");
+        config.collection.path = "missing/../../outside".to_string();
+        config
+            .save(&sync.minsync_dir.join("config.toml"))
+            .expect("save unsafe collection path");
+
+        let error = sync
+            .init(true, "openai:text-embedding-3-small", "recursive")
+            .expect_err("parent escape after missing component must fail");
+
+        assert!(error.to_string().contains("must stay inside .minsync"));
+        assert!(!dir.path().join("outside").exists());
     }
 
     #[test]
