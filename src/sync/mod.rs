@@ -76,18 +76,18 @@ impl MinSync {
             .join(format!(".reset-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&staging)?;
 
-        if let Some(previous) = previous {
-            let previous_store =
-                collection_store_path(&self.minsync_dir, &previous.collection.path)?;
-            for state_file in ["cursor.json", "txn.json"] {
-                let path = self.minsync_dir.join(state_file);
-                if path.exists() {
-                    std::fs::rename(&path, staging.join(state_file))?;
-                }
+        for state_file in ["cursor.json", "txn.json"] {
+            let path = self.minsync_dir.join(state_file);
+            if path.exists() {
+                std::fs::rename(&path, staging.join(state_file))?;
             }
-            if previous_store.exists() {
-                std::fs::rename(previous_store, staging.join("store"))?;
-            }
+        }
+        let previous_store_path = previous
+            .map(|config| config.collection.path)
+            .unwrap_or_else(|| "store".to_string());
+        let previous_store = collection_store_path(&self.minsync_dir, &previous_store_path)?;
+        if previous_store.exists() {
+            std::fs::rename(previous_store, staging.join("store"))?;
         }
         Ok(staging)
     }
@@ -554,6 +554,23 @@ mod tests {
 
         assert!(error.to_string().contains("must stay inside .minsync"));
         assert!(!dir.path().join("outside").exists());
+    }
+
+    #[test]
+    fn test_init_force_resets_partial_workspace_without_config() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+        std::fs::create_dir_all(sync.minsync_dir.join("store")).expect("create stale vector store");
+        std::fs::write(sync.minsync_dir.join("store/data"), "stale")
+            .expect("write stale vector store data");
+        std::fs::write(sync.minsync_dir.join("cursor.json"), "{}").expect("write stale cursor");
+        std::fs::write(sync.minsync_dir.join("txn.json"), "{}").expect("write stale transaction");
+
+        sync.init(true, "openai:text-embedding-3-small", "recursive")
+            .expect("force init succeeds");
+
+        assert!(!sync.minsync_dir.join("store").exists());
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+        assert!(!sync.minsync_dir.join("txn.json").exists());
     }
 
     #[test]
