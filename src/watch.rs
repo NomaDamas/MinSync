@@ -92,6 +92,7 @@ pub async fn run(
     debounce_ms: Option<u64>,
     startup: WatchStartup,
 ) -> Result<()> {
+    let _lock = crate::state::FileLock::acquire(&root.join(".minsync/lock"), false)?;
     let runtime = WatchRuntime {
         startup,
         progress: None,
@@ -100,7 +101,26 @@ pub async fn run(
             let _ = tokio::signal::ctrl_c().await;
         }),
     };
-    run_inner(root, chunker, embedder, store, debounce_ms, runtime).await
+    run_inner(root, chunker, embedder, store, debounce_ms, runtime, true).await
+}
+
+pub(crate) async fn run_locked(
+    root: PathBuf,
+    chunker: &dyn Chunker,
+    embedder: &dyn Embedder,
+    store: &mut dyn VectorStore,
+    debounce_ms: Option<u64>,
+    startup: WatchStartup,
+) -> Result<()> {
+    let runtime = WatchRuntime {
+        startup,
+        progress: None,
+        startup_status: None,
+        shutdown: Box::pin(async {
+            let _ = tokio::signal::ctrl_c().await;
+        }),
+    };
+    run_inner(root, chunker, embedder, store, debounce_ms, runtime, true).await
 }
 
 pub async fn run_with_shutdown(
@@ -111,6 +131,7 @@ pub async fn run_with_shutdown(
     debounce_ms: Option<u64>,
     control: WatchControl,
 ) -> Result<()> {
+    let _lock = crate::state::FileLock::acquire(&root.join(".minsync/lock"), false)?;
     let runtime = WatchRuntime {
         startup: control.startup,
         progress: control.progress,
@@ -119,7 +140,7 @@ pub async fn run_with_shutdown(
             let _ = control.shutdown.await;
         }),
     };
-    run_inner(root, chunker, embedder, store, debounce_ms, runtime).await
+    run_inner(root, chunker, embedder, store, debounce_ms, runtime, true).await
 }
 
 async fn run_inner(
@@ -129,6 +150,7 @@ async fn run_inner(
     store: &mut dyn VectorStore,
     debounce_ms: Option<u64>,
     mut runtime: WatchRuntime,
+    lock_held: bool,
 ) -> Result<()> {
     let minsync_dir = root.join(".minsync");
     let debounce = Duration::from_millis(debounce_ms.unwrap_or(500));
@@ -148,7 +170,7 @@ async fn run_inner(
 
     let sync = MinSync::new(root.clone());
 
-    let initial = run_sync(&sync, chunker, embedder, store).await;
+    let initial = run_sync(&sync, chunker, embedder, store, lock_held).await;
     if let Ok(result) = initial.as_ref() {
         if let Some(status) = &runtime.startup_status {
             let _ = status.send(WatchStartupStatus::InitialSyncSucceeded);
@@ -192,7 +214,7 @@ async fn run_inner(
                             if needs_rescan {
                                 tracing::info!("rescan requested, running incremental sync");
                             }
-                            match run_sync(&sync, chunker, embedder, store).await {
+                            match run_sync(&sync, chunker, embedder, store, lock_held).await {
                                 Ok(result) => {
                                     if let Some(progress) = &runtime.progress {
                                         let _ = progress.send(result);
@@ -222,10 +244,15 @@ async fn run_sync(
     chunker: &dyn Chunker,
     embedder: &dyn Embedder,
     store: &mut dyn VectorStore,
+    lock_held: bool,
 ) -> Result<crate::types::SyncResult> {
-    let result = sync
-        .sync(chunker, embedder, store, false, false, false)
-        .await?;
+    let result = if lock_held {
+        sync.sync_locked(chunker, embedder, store, false, false)
+            .await?
+    } else {
+        sync.sync(chunker, embedder, store, false, false, false)
+            .await?
+    };
     {
         if result.already_up_to_date {
             tracing::info!("watch sync: already up to date");

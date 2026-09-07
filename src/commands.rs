@@ -93,24 +93,24 @@ async fn sync(
     wait: bool,
     batch_size: Option<usize>,
 ) -> Result<()> {
+    let ms = MinSync::new(root.clone());
+    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), wait)?;
     let mut config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     if let Some(bs) = batch_size {
         config.embedder.batch_size = bs;
     }
     let chunker = crate::chunker::create_chunker(&config)?;
     let embedder = crate::embedder::create_embedder(&config)?;
-    let store_path = minsync_dir.join(&config.collection.path);
+    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
-    let ms = MinSync::new(root);
     let result = ms
-        .sync(
+        .sync_locked(
             chunker.as_ref(),
             embedder.as_ref(),
             store.as_mut(),
             full,
             dry_run,
-            wait,
         )
         .await?;
 
@@ -157,8 +157,9 @@ async fn query(
     k: usize,
     mode: QueryMode,
 ) -> Result<()> {
+    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
-    let store_path = minsync_dir.join(&config.collection.path);
+    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
     let results = match mode {
         QueryMode::Bm25 => crate::query::query_text(minsync_dir, text, k, store.as_ref(), None)?,
@@ -229,9 +230,10 @@ async fn status(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<
 }
 
 async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> {
+    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let embedder = crate::embedder::create_embedder(&config)?;
-    let store_path = minsync_dir.join(&config.collection.path);
+    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
     let result = crate::verify::check(minsync_dir, embedder.as_ref(), store.as_ref()).await?;
@@ -269,9 +271,10 @@ async fn verify(
     all: bool,
     sample: usize,
 ) -> Result<()> {
+    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let chunker = crate::chunker::create_chunker(&config)?;
-    let store_path = minsync_dir.join(&config.collection.path);
+    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
     let sample_count = if all { None } else { Some(sample) };
 
@@ -309,6 +312,7 @@ async fn watch(
     debounce_ms: Option<u64>,
     watch_on_sync_error: bool,
 ) -> Result<()> {
+    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let chunker = crate::chunker::create_chunker(&config)?;
     let embedder: Box<dyn crate::embedder::Embedder> = if watch_on_sync_error {
@@ -316,14 +320,14 @@ async fn watch(
     } else {
         crate::embedder::create_embedder(&config)?
     };
-    let store_path = minsync_dir.join(&config.collection.path);
+    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
     if let OutputFormat::Text = format {
         println!("Watching {} for changes...", root.display());
     }
 
-    crate::watch::run(
+    crate::watch::run_locked(
         root,
         chunker.as_ref(),
         embedder.as_ref(),
