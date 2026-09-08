@@ -2,6 +2,7 @@
 //! logging, dispatch here, and map errors to exit codes.
 
 use crate::cli::{Cli, Commands, OutputFormat, QueryMode};
+use crate::error::MinSyncError;
 use crate::error::Result;
 use crate::sync::MinSync;
 use std::path::PathBuf;
@@ -93,6 +94,7 @@ async fn sync(
     wait: bool,
     batch_size: Option<usize>,
 ) -> Result<()> {
+    require_initialized(minsync_dir)?;
     let ms = MinSync::new(root.clone());
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), wait)?;
     let mut config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
@@ -157,6 +159,7 @@ async fn query(
     k: usize,
     mode: QueryMode,
 ) -> Result<()> {
+    require_initialized(minsync_dir)?;
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
@@ -230,6 +233,7 @@ async fn status(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<
 }
 
 async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> {
+    require_initialized(minsync_dir)?;
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let embedder = crate::embedder::create_embedder(&config)?;
@@ -271,6 +275,7 @@ async fn verify(
     all: bool,
     sample: usize,
 ) -> Result<()> {
+    require_initialized(minsync_dir)?;
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let chunker = crate::chunker::create_chunker(&config)?;
@@ -302,7 +307,13 @@ async fn verify(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
-    Ok(())
+    if result.all_passed {
+        Ok(())
+    } else {
+        Err(MinSyncError::Other(
+            "verification failed — run `minsync verify --fix` to repair".to_string(),
+        ))
+    }
 }
 
 async fn watch(
@@ -312,6 +323,7 @@ async fn watch(
     debounce_ms: Option<u64>,
     watch_on_sync_error: bool,
 ) -> Result<()> {
+    require_initialized(minsync_dir)?;
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let chunker = crate::chunker::create_chunker(&config)?;
@@ -340,5 +352,12 @@ async fn watch(
         },
     )
     .await?;
+    Ok(())
+}
+
+fn require_initialized(minsync_dir: &std::path::Path) -> Result<()> {
+    if !minsync_dir.join("config.toml").exists() {
+        return Err(MinSyncError::NotInitialized);
+    }
     Ok(())
 }
