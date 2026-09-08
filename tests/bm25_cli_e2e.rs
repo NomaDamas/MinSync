@@ -93,3 +93,63 @@ fn init_cli_persists_multilingual_language_option() {
         Config::load(&root.path().join(".minsync/config.toml")).expect("load initialized config");
     assert_eq!(config.lexical.language, "multilingual");
 }
+
+#[test]
+fn uninitialized_commands_report_not_initialized() {
+    let root = tempfile::tempdir().expect("create workspace");
+
+    for args in [
+        vec!["query", "alpha", "--mode", "bm25"],
+        vec!["check"],
+        vec!["verify"],
+        vec!["watch"],
+    ] {
+        let output = Command::cargo_bin("minsync")
+            .expect("find minsync binary")
+            .current_dir(root.path())
+            .args(&args)
+            .output()
+            .expect("run command");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "command {:?} should fail with a user error",
+            args
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not initialized"),
+            "command {:?} should explain initialization requirement; stderr={stderr:?}",
+            args
+        );
+        assert!(
+            !root.path().join(".minsync/lock").exists(),
+            "command {:?} should not create state in an uninitialized workspace",
+            args
+        );
+    }
+}
+
+#[test]
+fn verify_failure_returns_nonzero_exit_code() {
+    let root = tempfile::tempdir().expect("create workspace");
+    Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root.path())
+        .args(["init"])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root.path())
+        .args(["--format", "json", "verify"])
+        .output()
+        .expect("run verify");
+
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse verification result");
+    assert_eq!(result["all_passed"], false);
+}
