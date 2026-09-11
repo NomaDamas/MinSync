@@ -54,6 +54,15 @@ impl MinSync {
         let mut config = Config::default_for(&source_id);
         config.embedder.id = embedder_id.to_string();
         config.chunker.id = chunker_id.to_string();
+        if embedder_id != crate::config::DEFAULT_EMBEDDER_ID {
+            // The EmbeddingGemma prompts from the default config only apply to
+            // the default model.
+            config.embedder.query_prefix = None;
+            config.embedder.passage_prefix = None;
+        }
+        if let Some(dimension) = crate::config::known_embedding_dimension(embedder_id) {
+            config.vectorstore.options["dimension"] = toml::Value::Integer(dimension as i64);
+        }
 
         config.save(&self.minsync_dir.join("config.toml"))?;
         Manifest::scan(&self.root, &source_id)?.save(&self.minsync_dir.join("manifest.json"))?;
@@ -385,6 +394,61 @@ mod tests {
         assert!(sync.minsync_dir.join("config.toml").exists());
         assert!(sync.minsync_dir.join("manifest.json").exists());
         assert_eq!(config.version, 1);
+    }
+
+    #[test]
+    fn test_init_applies_embeddinggemma_defaults() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+
+        let config = sync
+            .init(false, crate::config::DEFAULT_EMBEDDER_ID, "recursive")
+            .expect("init succeeds");
+
+        assert_eq!(config.embedder.id, "tei:google/embeddinggemma-300m");
+        assert_eq!(
+            config.embedder.query_prefix.as_deref(),
+            Some(crate::config::EMBEDDINGGEMMA_QUERY_PREFIX)
+        );
+        assert_eq!(
+            config.embedder.passage_prefix.as_deref(),
+            Some(crate::config::EMBEDDINGGEMMA_PASSAGE_PREFIX)
+        );
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(768)
+        );
+    }
+
+    #[test]
+    fn test_init_maps_known_embedder_dimension_and_clears_prefixes() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+
+        let config = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(1536)
+        );
+        assert_eq!(config.embedder.query_prefix, None);
+        assert_eq!(config.embedder.passage_prefix, None);
+    }
+
+    #[test]
+    fn test_init_unknown_embedder_keeps_default_dimension() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+
+        let config = sync
+            .init(false, "tei:custom/model", "recursive")
+            .expect("init succeeds");
+
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(768)
+        );
+        assert_eq!(config.embedder.query_prefix, None);
+        assert_eq!(config.embedder.passage_prefix, None);
     }
 
     #[test]

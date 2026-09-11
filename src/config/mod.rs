@@ -50,24 +50,49 @@ mod tests {
         assert_eq!(config.chunker.id, "recursive");
         assert_eq!(config.chunker.options.max_chunk_size, 4096);
         assert_eq!(config.chunker.options.delimiters, "\n.?!");
-        assert_eq!(config.embedder.id, "openai:text-embedding-3-small");
+        assert_eq!(config.embedder.id, DEFAULT_EMBEDDER_ID);
         assert_eq!(config.embedder.batch_size, 64);
         assert_eq!(config.embedder.max_concurrent, 1);
         assert_eq!(config.embedder.max_retries, 3);
         assert_eq!(config.embedder.timeout_seconds, 60);
         assert_eq!(config.embedder.base_url, None);
-        assert_eq!(config.embedder.query_prefix, None);
-        assert_eq!(config.embedder.passage_prefix, None);
+        assert_eq!(
+            config.embedder.query_prefix.as_deref(),
+            Some(EMBEDDINGGEMMA_QUERY_PREFIX)
+        );
+        assert_eq!(
+            config.embedder.passage_prefix.as_deref(),
+            Some(EMBEDDINGGEMMA_PASSAGE_PREFIX)
+        );
         assert_eq!(config.vectorstore.id, "lancedb");
         assert_eq!(config.lexical.language, "simple");
         assert_eq!(
             config.vectorstore.options["dimension"].as_integer(),
-            Some(1536)
+            Some(768)
         );
         assert!(config.normalize.strip_trailing_whitespace);
         assert!(config.normalize.normalize_newlines);
         assert!(!config.normalize.collapse_whitespace);
         assert!(!config.normalize.strip_frontmatter);
+    }
+
+    #[test]
+    fn test_known_embedding_dimension() {
+        assert_eq!(known_embedding_dimension(DEFAULT_EMBEDDER_ID), Some(768));
+        assert_eq!(
+            known_embedding_dimension("openai:text-embedding-3-small"),
+            Some(1536)
+        );
+        assert_eq!(
+            known_embedding_dimension("openai:text-embedding-3-large"),
+            Some(3072)
+        );
+        assert_eq!(
+            known_embedding_dimension("tei:intfloat/multilingual-e5-small"),
+            Some(384)
+        );
+        assert_eq!(known_embedding_dimension("tei:BAAI/bge-m3"), Some(1024));
+        assert_eq!(known_embedding_dimension("tei:custom/model"), None);
     }
 
     #[test]

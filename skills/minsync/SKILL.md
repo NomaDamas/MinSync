@@ -62,6 +62,16 @@ node_modules/
 
 ## Choose Embeddings
 
+Local EmbeddingGemma (default, no API key):
+
+```bash
+export HF_TOKEN="hf_..."   # after accepting https://huggingface.co/google/embeddinggemma-300m terms
+text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
+minsync init
+```
+
+The default config already carries the EmbeddingGemma retrieval prompts and `dimension = 768`.
+
 OpenAI:
 
 ```bash
@@ -69,7 +79,7 @@ export OPENAI_API_KEY="sk-..."
 minsync init --embedder openai:text-embedding-3-small
 ```
 
-Local TEI:
+Other TEI models, for example e5-small:
 
 ```bash
 text-embeddings-router --model-id intfloat/multilingual-e5-small --port 8080 --dtype float32
@@ -115,7 +125,7 @@ Use this checklist when adding an embedding provider or model family:
 6. Document the model dimension and tell agents to update `[vectorstore.options].dimension`, then run `minsync sync --full`.
 7. Add tests for prefix stripping, batching, retryable errors, fatal errors, timeout retry, and query/document prefix behavior.
 
-The default embedder is `openai:text-embedding-3-small` with dimension `1536`. TEI models are supported with ids like `tei:intfloat/multilingual-e5-small` and `tei:BAAI/bge-m3`.
+The default embedder is `tei:google/embeddinggemma-300m` with dimension `768`, served by a local TEI-compatible server with no API key. OpenAI is supported with ids like `openai:text-embedding-3-small`, and other TEI models with ids like `tei:intfloat/multilingual-e5-small` and `tei:BAAI/bge-m3`.
 
 For a longer implementation checklist, read `docs/EXTENDING.md` in the MinSync repository.
 
@@ -144,6 +154,6 @@ Run `minsync sync` after edits. It re-embeds only changed chunks and sweeps stal
 ## Troubleshooting
 
 - `not initialized`: run `minsync init`.
-- `OPENAI_API_KEY` missing: export it or use TEI.
+- Embedding request fails: make sure the local TEI server is running for the default embedder, or export `OPENAI_API_KEY` when using an `openai:` embedder.
 - Vector dimension mismatch: set `[vectorstore.options].dimension` to the embedder dimension and run `minsync sync --full`.
 - Binary files appear empty: this is expected; MinSync only reads UTF-8 text.

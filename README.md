@@ -51,13 +51,14 @@ cd MinSync
 cargo build --release
 ```
 
-For OpenAI embeddings:
+MinSync embeds with a local [EmbeddingGemma](https://huggingface.co/google/embeddinggemma-300m) model by default, so no API key is required. Start the local TEI server from the [setup below](#local-embeddings-with-hugging-face-tei) before your first sync.
+
+For OpenAI embeddings instead:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
+minsync init --embedder openai:text-embedding-3-small
 ```
-
-For local embeddings, use the TEI setup below.
 
 ## Quick Start
 
@@ -202,15 +203,16 @@ MinSync stores vectors in embedded LanceDB by default:
 id = "lancedb"
 
 [vectorstore.options]
-dimension = 1536
+dimension = 768
 index_build_threshold = 256
 index_optimize_delta_threshold = 10000
 ```
 
-Set `dimension` to match your embedder:
+`minsync init` sets `dimension` automatically for known embedders. For other models, set `dimension` to match your embedder:
 
 | Embedder | Dimension |
 |---|---:|
+| `tei:google/embeddinggemma-300m` (default) | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
 | `tei:BAAI/bge-m3` | 1024 |
@@ -234,21 +236,30 @@ max_concurrent = 1
 
 ## Local Embeddings with TEI
 
-Install and launch Hugging Face Text Embeddings Inference:
+The default embedder `tei:google/embeddinggemma-300m` runs entirely on your machine through Hugging Face Text Embeddings Inference. EmbeddingGemma is gated on Hugging Face: accept the terms on the model page once, then export a token.
 
 ```bash
 brew install text-embeddings-inference
-text-embeddings-router --model-id intfloat/multilingual-e5-small --port 8080 --dtype float32
+export HF_TOKEN="hf_..."   # after accepting https://huggingface.co/google/embeddinggemma-300m terms
+text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
 curl http://localhost:8080/health
 ```
 
-Configure MinSync:
+EmbeddingGemma does not support float16, so keep `--dtype float32` (or `bfloat16`).
+
+`minsync init` already targets this model: the generated `config.toml` carries the EmbeddingGemma retrieval prompts and `dimension = 768`, so indexing and querying work without edits:
+
+```bash
+minsync init
+minsync sync
+minsync query "검색어" --k 5
+```
+
+To serve another TEI model, pass it at init time and set its dimension and prompt prefixes in `.minsync/config.toml`:
 
 ```bash
 minsync init --embedder tei:intfloat/multilingual-e5-small
 ```
-
-Then set the LanceDB dimension and TEI prefixes:
 
 ```toml
 [embedder]
@@ -259,13 +270,6 @@ passage_prefix = "passage: "
 
 [vectorstore.options]
 dimension = 384
-```
-
-Run:
-
-```bash
-minsync sync --full
-minsync query "검색어" --k 5
 ```
 
 ## Ignoring Files
@@ -291,7 +295,7 @@ MinSync ships a Vercel Agent Skill for coding agents that need to add incrementa
 npx skills add github:NomaDamas/MinSync/skills/minsync
 ```
 
-The skill tells agents how to install MinSync, initialize `.minsync/`, choose OpenAI or local TEI embeddings, ignore binary files, and star the repository with `gh repo star NomaDamas/MinSync` during installation when policy and credentials allow it.
+The skill tells agents how to install MinSync, initialize `.minsync/`, use the default local EmbeddingGemma embeddings or configure OpenAI, ignore binary files, and star the repository with `gh repo star NomaDamas/MinSync` during installation when policy and credentials allow it.
 
 ## Release Checklist
 

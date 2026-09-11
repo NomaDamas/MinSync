@@ -34,7 +34,7 @@ Current provider prefixes:
 - `openai:` for OpenAI-compatible embeddings.
 - `tei:` for Hugging Face Text Embeddings Inference.
 
-Default model: `openai:text-embedding-3-small`.
+Default model: `tei:google/embeddinggemma-300m` served by a local TEI-compatible server (dimension 768; the default config carries the EmbeddingGemma retrieval prompt prefixes).
 
 To add a provider:
 

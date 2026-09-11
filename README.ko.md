@@ -39,13 +39,14 @@ cd MinSync
 cargo build --release
 ```
 
+MinSync는 기본적으로 로컬 [EmbeddingGemma](https://huggingface.co/google/embeddinggemma-300m) 모델로 embedding하므로 API key가 필요 없습니다. 첫 sync 전에 아래 [TEI 설정](#tei로-로컬-embedding-사용하기)대로 로컬 TEI 서버를 실행하세요.
+
 OpenAI embedding을 사용할 경우:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
+minsync init --embedder openai:text-embedding-3-small
 ```
-
-로컬 embedding은 아래 TEI 설정을 참고하세요.
 
 ## 빠른 시작
 
@@ -172,15 +173,16 @@ MinSync는 기본적으로 embedded LanceDB에 vector를 저장합니다.
 id = "lancedb"
 
 [vectorstore.options]
-dimension = 1536
+dimension = 768
 index_build_threshold = 256
 index_optimize_delta_threshold = 10000
 ```
 
-사용하는 embedder에 맞게 `dimension`을 설정하세요.
+`minsync init`은 알려진 embedder에 대해 `dimension`을 자동으로 설정합니다. 다른 모델을 사용할 경우 embedder에 맞게 `dimension`을 설정하세요.
 
 | Embedder | Dimension |
 |---|---:|
+| `tei:google/embeddinggemma-300m` (기본값) | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
 | `tei:BAAI/bge-m3` | 1024 |
@@ -204,21 +206,30 @@ max_concurrent = 1
 
 ## TEI로 로컬 Embedding 사용하기
 
-Hugging Face Text Embeddings Inference를 설치하고 실행합니다.
+기본 embedder `tei:google/embeddinggemma-300m`은 Hugging Face Text Embeddings Inference를 통해 전체가 로컬 머신에서 실행됩니다. EmbeddingGemma는 Hugging Face에서 gated 모델이므로 모델 페이지에서 약관에 한 번 동의한 뒤 token을 export하세요.
 
 ```bash
 brew install text-embeddings-inference
-text-embeddings-router --model-id intfloat/multilingual-e5-small --port 8080 --dtype float32
+export HF_TOKEN="hf_..."   # https://huggingface.co/google/embeddinggemma-300m 약관 동의 후
+text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
 curl http://localhost:8080/health
 ```
 
-MinSync 설정:
+EmbeddingGemma는 float16을 지원하지 않으므로 `--dtype float32`(또는 `bfloat16`)를 유지하세요.
+
+`minsync init`은 이미 이 모델을 대상으로 합니다. 생성되는 `config.toml`에 EmbeddingGemma retrieval prompt와 `dimension = 768`이 포함되어 있어 수정 없이 indexing과 query가 동작합니다.
+
+```bash
+minsync init
+minsync sync
+minsync query "검색어" --k 5
+```
+
+다른 TEI 모델을 사용하려면 init 시점에 id를 넘기고 `.minsync/config.toml`에서 dimension과 prompt prefix를 설정하세요.
 
 ```bash
 minsync init --embedder tei:intfloat/multilingual-e5-small
 ```
-
-`.minsync/config.toml`:
 
 ```toml
 [embedder]
@@ -229,13 +240,6 @@ passage_prefix = "passage: "
 
 [vectorstore.options]
 dimension = 384
-```
-
-실행:
-
-```bash
-minsync sync --full
-minsync query "검색어" --k 5
 ```
 
 ## Ignoring Files

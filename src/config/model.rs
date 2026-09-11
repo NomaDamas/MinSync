@@ -111,8 +111,32 @@ fn default_timeout_seconds() -> u64 {
     60
 }
 
+/// Default embedder: Google EmbeddingGemma served by a local
+/// TEI-compatible server, so fresh indexes need no API credentials.
+pub const DEFAULT_EMBEDDER_ID: &str = "tei:google/embeddinggemma-300m";
+
+/// EmbeddingGemma retrieval prompt for queries (see the model card).
+pub const EMBEDDINGGEMMA_QUERY_PREFIX: &str = "task: search result | query: ";
+
+/// EmbeddingGemma retrieval prompt for documents without a title.
+pub const EMBEDDINGGEMMA_PASSAGE_PREFIX: &str = "title: none | text: ";
+
+/// Known embedding output dimension for embedder ids MinSync recognizes.
+/// Unknown models return `None`; set `[vectorstore.options].dimension`
+/// manually for those.
+pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
+    match embedder_id {
+        "tei:google/embeddinggemma-300m" => Some(768),
+        "openai:text-embedding-3-small" | "openai:text-embedding-ada-002" => Some(1536),
+        "openai:text-embedding-3-large" => Some(3072),
+        "tei:intfloat/multilingual-e5-small" => Some(384),
+        "tei:BAAI/bge-m3" => Some(1024),
+        _ => None,
+    }
+}
+
 /// For `vectorstore.id = "lancedb"`, `options.dimension` sets the embedding
-/// dimension (default 1536 for `openai:text-embedding-3-small`).
+/// dimension (default 768 for `tei:google/embeddinggemma-300m`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VectorStoreConfig {
     pub id: String,
@@ -126,7 +150,7 @@ fn default_vectorstore_options() -> toml::Value {
 
 fn default_lancedb_options() -> toml::Value {
     let mut table = toml::map::Map::new();
-    table.insert("dimension".to_string(), toml::Value::Integer(1536));
+    table.insert("dimension".to_string(), toml::Value::Integer(768));
     toml::Value::Table(table)
 }
 
@@ -173,14 +197,14 @@ impl Config {
                 options: ChunkerOptions::default(),
             },
             embedder: EmbedderConfig {
-                id: "openai:text-embedding-3-small".to_string(),
+                id: DEFAULT_EMBEDDER_ID.to_string(),
                 batch_size: default_batch_size(),
                 max_concurrent: default_max_concurrent(),
                 max_retries: default_max_retries(),
                 timeout_seconds: default_timeout_seconds(),
                 base_url: None,
-                query_prefix: None,
-                passage_prefix: None,
+                query_prefix: Some(EMBEDDINGGEMMA_QUERY_PREFIX.to_string()),
+                passage_prefix: Some(EMBEDDINGGEMMA_PASSAGE_PREFIX.to_string()),
                 truncate: false,
             },
             vectorstore: VectorStoreConfig {
