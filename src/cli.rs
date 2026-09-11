@@ -45,7 +45,7 @@ pub enum Commands {
     Init {
         #[arg(long)]
         force: bool,
-        #[arg(long, default_value = "openai:text-embedding-3-small")]
+        #[arg(long, default_value = crate::config::DEFAULT_EMBEDDER_ID)]
         embedder: String,
         #[arg(long, default_value = "recursive")]
         chunker: String,
