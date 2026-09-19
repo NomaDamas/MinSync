@@ -1,3 +1,4 @@
+pub mod native;
 pub mod openai;
 pub mod retry;
 pub mod tei;
@@ -83,6 +84,8 @@ pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
             .with_passage_prefix(config.embedder.passage_prefix.clone())
             .with_truncate(settings.truncate);
         Ok(Box::new(embedder))
+    } else if id.starts_with("native:") {
+        Ok(Box::new(native::NativeEmbedder::from_config(settings)?))
     } else {
         Err(MinSyncError::Config(format!("unknown embedder id: {id}")))
     }
@@ -189,5 +192,45 @@ mod factory_tests {
 
         let embedder = result.expect("create openai embedder with key set");
         assert_eq!(embedder.id(), "text-embedding-3-small");
+    }
+
+    #[test]
+    fn test_create_embedder_native_constructs_without_http_or_key() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "native:Qwen/Qwen3-Embedding-0.6B".to_string();
+        config.embedder.base_url = None;
+
+        let embedder =
+            create_embedder(&config).expect("native embedder constructs without TEI or API key");
+        assert_eq!(embedder.id(), "Qwen/Qwen3-Embedding-0.6B");
+    }
+
+    #[test]
+    fn test_create_embedder_native_rejects_empty_model() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "native:".to_string();
+
+        let result = create_embedder(&config);
+        assert!(matches!(result, Err(MinSyncError::Config(_))));
+    }
+
+    #[test]
+    fn test_create_embedder_native_rejects_invalid_device() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "native:Qwen/Qwen3-Embedding-0.6B".to_string();
+        config.embedder.device = Some("tpu".to_string());
+
+        let result = create_embedder(&config);
+        assert!(matches!(result, Err(MinSyncError::Config(_))));
+    }
+
+    #[test]
+    fn test_create_embedder_native_rejects_invalid_dtype() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "native:Qwen/Qwen3-Embedding-0.6B".to_string();
+        config.embedder.dtype = Some("fp64".to_string());
+
+        let result = create_embedder(&config);
+        assert!(matches!(result, Err(MinSyncError::Config(_))));
     }
 }

@@ -51,6 +51,24 @@ jieba-rs = "0.9.0"
 kiwi-rs = "2026.8.26"
 libc = "0.2"
 lindera = { version = "3.0.7", features = ["embed-ipadic"] }
+fastembed = { version = "7.0.1", default-features = false, features = [
+    "qwen3",
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
+candle-core = "0.11.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fastembed = { version = "7.0.1", default-features = false, features = ["metal"] }
+candle-core = { version = "0.11.0", features = ["metal"] }
+
+# candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
+# float16x8_t which now requires the unstable stdarch_neon_f16 feature.
+# huggingface/candle#3845 gates those types behind target_feature="fp16".
+[patch.crates-io]
+candle-core = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
 
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"

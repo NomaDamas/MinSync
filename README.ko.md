@@ -39,7 +39,7 @@ cd MinSync
 cargo build --release
 ```
 
-MinSync는 기본적으로 로컬 [EmbeddingGemma](https://huggingface.co/google/embeddinggemma-300m) 모델로 embedding하므로 API key가 필요 없습니다. 첫 sync 전에 아래 [TEI 설정](#tei로-로컬-embedding-사용하기)대로 로컬 TEI 서버를 실행하세요.
+MinSync는 기본적으로 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)를 프로세스 안에서 embedding합니다. API key, TEI 서버, Hugging Face 게이트가 필요 없습니다. 첫 `minsync sync`에서 모델을 로컬 캐시로 받습니다.
 
 OpenAI embedding을 사용할 경우:
 
@@ -173,7 +173,7 @@ MinSync는 기본적으로 embedded LanceDB에 vector를 저장합니다.
 id = "lancedb"
 
 [vectorstore.options]
-dimension = 768
+dimension = 1024
 index_build_threshold = 256
 index_optimize_delta_threshold = 10000
 ```
@@ -182,7 +182,8 @@ index_optimize_delta_threshold = 10000
 
 | Embedder | Dimension |
 |---|---:|
-| `tei:google/embeddinggemma-300m` (기본값) | 768 |
+| `native:Qwen/Qwen3-Embedding-0.6B` (기본값) | 1024 |
+| `tei:google/embeddinggemma-300m` | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
 | `tei:BAAI/bge-m3` | 1024 |
@@ -204,26 +205,35 @@ max_concurrent = 1
 
 `base_url`은 OpenAI-compatible gateway에도 사용할 수 있습니다.
 
-## TEI로 로컬 Embedding 사용하기
+## 로컬 Embedding
 
-기본 embedder `tei:google/embeddinggemma-300m`은 Hugging Face Text Embeddings Inference를 통해 전체가 로컬 머신에서 실행됩니다. EmbeddingGemma는 Hugging Face에서 gated 모델이므로 모델 페이지에서 약관에 한 번 동의한 뒤 token을 export하세요.
+기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)(candle)로 프로세스 안에서 실행됩니다. `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
 
-```bash
-brew install text-embeddings-inference
-export HF_TOKEN="hf_..."   # https://huggingface.co/google/embeddinggemma-300m 약관 동의 후
-text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
-curl http://localhost:8080/health
-```
-
-EmbeddingGemma는 float16을 지원하지 않으므로 `--dtype float32`(또는 `bfloat16`)를 유지하세요.
-
-`minsync init`은 이미 이 모델을 대상으로 합니다. 생성되는 `config.toml`에 EmbeddingGemma retrieval prompt와 `dimension = 768`이 포함되어 있어 수정 없이 indexing과 query가 동작합니다.
+첫 embedding 호출이 Apache-2.0 모델을 Hugging Face Hub에서 `~/.cache/minsync/models`로 받습니다. `config.toml`의 `model_cache_dir`, `FASTEMBED_CACHE_DIR`, `HF_HOME`으로 경로를 바꿀 수 있습니다. 이후 실행은 캐시에서 로드합니다.
 
 ```bash
 minsync init
 minsync sync
 minsync query "검색어" --k 5
 ```
+
+768차원 TEI 인덱스는 1024차원 벡터와 섞으면 안 됩니다. embedder를 바꾼 뒤에는 전체를 다시 임베딩하세요.
+
+```bash
+minsync sync --full
+```
+
+`openai:`와 `tei:`는 그대로 사용할 수 있습니다. 로컬 TEI + EmbeddingGemma를 유지하려면:
+
+```bash
+brew install text-embeddings-inference
+export HF_TOKEN="hf_..."   # https://huggingface.co/google/embeddinggemma-300m 약관 동의 후
+text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
+curl http://localhost:8080/health
+minsync init --embedder tei:google/embeddinggemma-300m
+```
+
+EmbeddingGemma는 float16을 지원하지 않으므로 `--dtype float32`(또는 `bfloat16`)를 유지하세요. `minsync init --embedder tei:google/embeddinggemma-300m`은 Gemma retrieval prefix와 `dimension = 768`을 씁니다.
 
 다른 TEI 모델을 사용하려면 init 시점에 id를 넘기고 `.minsync/config.toml`에서 dimension과 prompt prefix를 설정하세요.
 

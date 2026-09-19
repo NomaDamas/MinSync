@@ -31,10 +31,11 @@ If the backend has asynchronous APIs, hide that behind a synchronous `VectorStor
 
 Current provider prefixes:
 
+- `native:` for in-process fastembed-rs / candle embeddings.
 - `openai:` for OpenAI-compatible embeddings.
 - `tei:` for Hugging Face Text Embeddings Inference.
 
-Default model: `tei:google/embeddinggemma-300m` served by a local TEI-compatible server (dimension 768; the default config carries the EmbeddingGemma retrieval prompt prefixes).
+Default model: `native:Qwen/Qwen3-Embedding-0.6B` (dimension 1024, no query/passage prefixes). `openai:` and `tei:` stay first-class for operator-configured endpoints.
 
 To add a provider:
 
@@ -62,5 +63,5 @@ Before handing off an extension:
 1. Run `cargo fmt --all -- --check`.
 2. Run `cargo clippy --all-targets --all-features -- -D warnings`.
 3. Run `cargo test`.
-4. Run one real CLI smoke test with `minsync init`, `minsync sync`, and `minsync query` when credentials or a local TEI server are available.
+4. Run one real CLI smoke test with `minsync init`, `minsync sync`, and `minsync query`. The native default needs no API key or TEI server; `openai:` / `tei:` still need credentials or a local server.
 5. Update `skills/minsync/SKILL.md` when agent operating rules change.

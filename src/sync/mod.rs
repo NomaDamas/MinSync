@@ -54,9 +54,12 @@ impl MinSync {
         let mut config = Config::default_for(&source_id);
         config.embedder.id = embedder_id.to_string();
         config.chunker.id = chunker_id.to_string();
-        if embedder_id != crate::config::DEFAULT_EMBEDDER_ID {
-            // The EmbeddingGemma prompts from the default config only apply to
-            // the default model.
+        if embedder_id == crate::config::EMBEDDINGGEMMA_ID {
+            config.embedder.query_prefix =
+                Some(crate::config::EMBEDDINGGEMMA_QUERY_PREFIX.to_string());
+            config.embedder.passage_prefix =
+                Some(crate::config::EMBEDDINGGEMMA_PASSAGE_PREFIX.to_string());
+        } else {
             config.embedder.query_prefix = None;
             config.embedder.passage_prefix = None;
         }
@@ -397,14 +400,30 @@ mod tests {
     }
 
     #[test]
-    fn test_init_applies_embeddinggemma_defaults() {
+    fn test_init_applies_native_qwen3_defaults() {
         let (_dir, sync, _chunker, _embedder, _store) = fixture();
 
         let config = sync
             .init(false, crate::config::DEFAULT_EMBEDDER_ID, "recursive")
             .expect("init succeeds");
 
-        assert_eq!(config.embedder.id, "tei:google/embeddinggemma-300m");
+        assert_eq!(config.embedder.id, "native:Qwen/Qwen3-Embedding-0.6B");
+        assert_eq!(config.embedder.query_prefix, None);
+        assert_eq!(config.embedder.passage_prefix, None);
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn test_init_embeddinggemma_keeps_prefixes_and_dimension() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+
+        let config = sync
+            .init(false, "tei:google/embeddinggemma-300m", "recursive")
+            .expect("init succeeds");
+
         assert_eq!(
             config.embedder.query_prefix.as_deref(),
             Some(crate::config::EMBEDDINGGEMMA_QUERY_PREFIX)
@@ -445,7 +464,7 @@ mod tests {
 
         assert_eq!(
             config.vectorstore.options["dimension"].as_integer(),
-            Some(768)
+            Some(1024)
         );
         assert_eq!(config.embedder.query_prefix, None);
         assert_eq!(config.embedder.passage_prefix, None);
