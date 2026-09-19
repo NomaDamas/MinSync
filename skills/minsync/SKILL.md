@@ -62,15 +62,21 @@ node_modules/
 
 ## Choose Embeddings
 
-Local EmbeddingGemma (default, no API key):
+In-process Qwen3 (default, no API key, no TEI server):
+
+```bash
+minsync init
+```
+
+The default config uses `native:Qwen/Qwen3-Embedding-0.6B` with `dimension = 1024` and empty prefixes. The first embedding call downloads the model into `~/.cache/minsync/models`.
+
+Local TEI EmbeddingGemma:
 
 ```bash
 export HF_TOKEN="hf_..."   # after accepting https://huggingface.co/google/embeddinggemma-300m terms
 text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
-minsync init
+minsync init --embedder tei:google/embeddinggemma-300m
 ```
-
-The default config already carries the EmbeddingGemma retrieval prompts and `dimension = 768`.
 
 OpenAI:
 
@@ -125,7 +131,7 @@ Use this checklist when adding an embedding provider or model family:
 6. Document the model dimension and tell agents to update `[vectorstore.options].dimension`, then run `minsync sync --full`.
 7. Add tests for prefix stripping, batching, retryable errors, fatal errors, timeout retry, and query/document prefix behavior.
 
-The default embedder is `tei:google/embeddinggemma-300m` with dimension `768`, served by a local TEI-compatible server with no API key. OpenAI is supported with ids like `openai:text-embedding-3-small`, and other TEI models with ids like `tei:intfloat/multilingual-e5-small` and `tei:BAAI/bge-m3`.
+The default embedder is `native:Qwen/Qwen3-Embedding-0.6B` with dimension `1024`, loaded in-process via fastembed-rs. OpenAI is supported with ids like `openai:text-embedding-3-small`. TEI models use ids like `tei:google/embeddinggemma-300m`, `tei:intfloat/multilingual-e5-small`, and `tei:BAAI/bge-m3`.
 
 For a longer implementation checklist, read `docs/EXTENDING.md` in the MinSync repository.
 

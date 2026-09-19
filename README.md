@@ -23,7 +23,7 @@ MinSync is a manifest-based incremental vector database indexing CLI for text fi
 - [Chunkers](#chunkers)
 - [Vector store](#vector-store)
 - [Embedding network reliability](#embedding-network-reliability)
-- [Local embeddings with Hugging Face TEI](#local-embeddings-no-openai--hugging-face-tei)
+- [Local embeddings](#local-embeddings)
 - [.minsyncignore](#minsyncignore)
 - [Development](#development)
 
@@ -51,7 +51,7 @@ cd MinSync
 cargo build --release
 ```
 
-MinSync embeds with a local [EmbeddingGemma](https://huggingface.co/google/embeddinggemma-300m) model by default, so no API key is required. Start the local TEI server from the [setup below](#local-embeddings-with-hugging-face-tei) before your first sync.
+MinSync embeds in-process with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) by default. No API key, TEI server, or Hugging Face gate is required. The first `minsync sync` downloads the model into the local cache.
 
 For OpenAI embeddings instead:
 
@@ -203,7 +203,7 @@ MinSync stores vectors in embedded LanceDB by default:
 id = "lancedb"
 
 [vectorstore.options]
-dimension = 768
+dimension = 1024
 index_build_threshold = 256
 index_optimize_delta_threshold = 10000
 ```
@@ -212,7 +212,8 @@ index_optimize_delta_threshold = 10000
 
 | Embedder | Dimension |
 |---|---:|
-| `tei:google/embeddinggemma-300m` (default) | 768 |
+| `native:Qwen/Qwen3-Embedding-0.6B` (default) | 1024 |
+| `tei:google/embeddinggemma-300m` | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
 | `tei:BAAI/bge-m3` | 1024 |
@@ -234,26 +235,35 @@ max_concurrent = 1
 
 `base_url` also works for OpenAI-compatible gateways.
 
-## Local Embeddings with TEI
+## Local Embeddings
 
-The default embedder `tei:google/embeddinggemma-300m` runs entirely on your machine through Hugging Face Text Embeddings Inference. EmbeddingGemma is gated on Hugging Face: accept the terms on the model page once, then export a token.
+The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process through [fastembed-rs](https://github.com/Anush008/fastembed-rs) (candle). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
 
-```bash
-brew install text-embeddings-inference
-export HF_TOKEN="hf_..."   # after accepting https://huggingface.co/google/embeddinggemma-300m terms
-text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
-curl http://localhost:8080/health
-```
-
-EmbeddingGemma does not support float16, so keep `--dtype float32` (or `bfloat16`).
-
-`minsync init` already targets this model: the generated `config.toml` carries the EmbeddingGemma retrieval prompts and `dimension = 768`, so indexing and querying work without edits:
+The first embedding call downloads the Apache-2.0 model via Hugging Face Hub into `~/.cache/minsync/models` (override with `model_cache_dir` in `config.toml`, `FASTEMBED_CACHE_DIR`, or `HF_HOME`). Later runs load from cache.
 
 ```bash
 minsync init
 minsync sync
 minsync query "검색어" --k 5
 ```
+
+Existing indexes built with a 768-d TEI model must not mix 1024-d vectors. Switch embedders, then rebuild:
+
+```bash
+minsync sync --full
+```
+
+`openai:` and `tei:` remain first-class. To keep using a local TEI server with EmbeddingGemma:
+
+```bash
+brew install text-embeddings-inference
+export HF_TOKEN="hf_..."   # after accepting https://huggingface.co/google/embeddinggemma-300m terms
+text-embeddings-router --model-id google/embeddinggemma-300m --port 8080 --dtype float32
+curl http://localhost:8080/health
+minsync init --embedder tei:google/embeddinggemma-300m
+```
+
+EmbeddingGemma does not support float16, so keep `--dtype float32` (or `bfloat16`). `minsync init --embedder tei:google/embeddinggemma-300m` writes the Gemma retrieval prefixes and `dimension = 768`.
 
 To serve another TEI model, pass it at init time and set its dimension and prompt prefixes in `.minsync/config.toml`:
 

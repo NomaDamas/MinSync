@@ -93,6 +93,20 @@ pub struct EmbedderConfig {
     /// Keep disabled by default so oversized content is surfaced explicitly.
     #[serde(default)]
     pub truncate: bool,
+    /// Native embedder device: `auto`, `cpu`, `metal`, or `cuda`.
+    /// Ignored by `openai:` / `tei:` providers.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Native embedder dtype: `f32`, `f16`, or `bf16`.
+    /// Ignored by `openai:` / `tei:` providers.
+    #[serde(default)]
+    pub dtype: Option<String>,
+    /// Native tokenizer max length in tokens. Ignored by `openai:` / `tei:`.
+    #[serde(default)]
+    pub max_length: Option<usize>,
+    /// Directory for cached native model files. Ignored by `openai:` / `tei:`.
+    #[serde(default)]
+    pub model_cache_dir: Option<String>,
 }
 
 fn default_batch_size() -> usize {
@@ -111,9 +125,13 @@ fn default_timeout_seconds() -> u64 {
     60
 }
 
-/// Default embedder: Google EmbeddingGemma served by a local
-/// TEI-compatible server, so fresh indexes need no API credentials.
-pub const DEFAULT_EMBEDDER_ID: &str = "tei:google/embeddinggemma-300m";
+/// Default embedder: in-process Qwen3 via fastembed-rs, so a fresh index
+/// works with no API key, TEI server, or Hugging Face gate.
+pub const DEFAULT_EMBEDDER_ID: &str = "native:Qwen/Qwen3-Embedding-0.6B";
+
+/// Local TEI EmbeddingGemma id. `minsync init --embedder` of this value
+/// still writes the Gemma retrieval prefixes and dimension 768.
+pub const EMBEDDINGGEMMA_ID: &str = "tei:google/embeddinggemma-300m";
 
 /// EmbeddingGemma retrieval prompt for queries (see the model card).
 pub const EMBEDDINGGEMMA_QUERY_PREFIX: &str = "task: search result | query: ";
@@ -126,6 +144,7 @@ pub const EMBEDDINGGEMMA_PASSAGE_PREFIX: &str = "title: none | text: ";
 /// manually for those.
 pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
     match embedder_id {
+        "native:Qwen/Qwen3-Embedding-0.6B" => Some(1024),
         "tei:google/embeddinggemma-300m" => Some(768),
         "openai:text-embedding-3-small" | "openai:text-embedding-ada-002" => Some(1536),
         "openai:text-embedding-3-large" => Some(3072),
@@ -136,7 +155,7 @@ pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
 }
 
 /// For `vectorstore.id = "lancedb"`, `options.dimension` sets the embedding
-/// dimension (default 768 for `tei:google/embeddinggemma-300m`).
+/// dimension (default 1024 for `native:Qwen/Qwen3-Embedding-0.6B`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VectorStoreConfig {
     pub id: String,
@@ -150,7 +169,7 @@ fn default_vectorstore_options() -> toml::Value {
 
 fn default_lancedb_options() -> toml::Value {
     let mut table = toml::map::Map::new();
-    table.insert("dimension".to_string(), toml::Value::Integer(768));
+    table.insert("dimension".to_string(), toml::Value::Integer(1024));
     toml::Value::Table(table)
 }
 
@@ -203,9 +222,13 @@ impl Config {
                 max_retries: default_max_retries(),
                 timeout_seconds: default_timeout_seconds(),
                 base_url: None,
-                query_prefix: Some(EMBEDDINGGEMMA_QUERY_PREFIX.to_string()),
-                passage_prefix: Some(EMBEDDINGGEMMA_PASSAGE_PREFIX.to_string()),
+                query_prefix: None,
+                passage_prefix: None,
                 truncate: false,
+                device: None,
+                dtype: None,
+                max_length: None,
+                model_cache_dir: None,
             },
             vectorstore: VectorStoreConfig {
                 id: "lancedb".to_string(),
