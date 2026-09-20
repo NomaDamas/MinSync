@@ -41,6 +41,7 @@ pub(super) fn run_worker(
     dim: usize,
     indexing: IndexingConfig,
     language: String,
+    read_only: bool,
     cmd_rx: mpsc::Receiver<Command>,
     init_tx: mpsc::Sender<Result<()>>,
 ) {
@@ -56,7 +57,7 @@ pub(super) fn run_worker(
         }
     };
 
-    let inner = match rt.block_on(LanceDbInner::open_or_create(&uri, dim, indexing, language)) {
+    let inner = match rt.block_on(LanceDbInner::open(&uri, dim, indexing, language, read_only)) {
         Ok(inner) => inner,
         Err(error) => {
             let _ = init_tx.send(Err(error));

@@ -160,10 +160,14 @@ async fn query(
     mode: QueryMode,
 ) -> Result<()> {
     require_initialized(minsync_dir)?;
-    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
+    // No writer lock here: querying only reads. LanceDB gives snapshot
+    // isolation (the table pins the latest version at open time) and the
+    // read-only store never creates or migrates anything, so search stays
+    // available while a sync holds the lock. Results may lag the in-flight
+    // sync; they are always consistent.
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
-    let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
+    let store = crate::vectorstore::create_vectorstore_readonly(&config, &store_path)?;
     let results = match mode {
         QueryMode::Bm25 => crate::query::query_text(minsync_dir, text, k, store.as_ref(), None)?,
         QueryMode::Vector | QueryMode::Hybrid => {

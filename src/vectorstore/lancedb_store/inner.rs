@@ -9,7 +9,7 @@ use super::schema::{
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
 };
-use crate::error::Result;
+use crate::error::{MinSyncError, Result};
 use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
 use arrow_array::RecordBatch;
@@ -31,11 +31,20 @@ pub(super) struct LanceDbInner {
 }
 
 impl LanceDbInner {
-    pub(super) async fn open_or_create(
+    /// Open the table for writing (creating it and applying schema
+    /// migrations when needed) or, with `read_only`, for concurrent reads
+    /// alongside a running sync.
+    ///
+    /// Read-only mode never writes: a missing table is [`MinSyncError::NeverSynced`]
+    /// instead of `create_empty_table`, and a pre-`lexical_text` table is an
+    /// error instead of an in-place `add_columns` migration. Both cases are
+    /// resolved by running a sync, which holds the writer lock.
+    pub(super) async fn open(
         uri: &str,
         dim: usize,
         indexing: IndexingConfig,
         language: String,
+        read_only: bool,
     ) -> Result<Self> {
         let conn = lancedb::connect(uri)
             .execute()
@@ -48,8 +57,18 @@ impl LanceDbInner {
                 .execute()
                 .await
                 .map_err(to_store_error)?;
-            let existing_schema = table.schema().await.map_err(to_store_error)?;
-            if existing_schema.field_with_name("lexical_text").is_err() {
+            if table
+                .schema()
+                .await
+                .map_err(to_store_error)?
+                .field_with_name("lexical_text")
+                .is_err()
+            {
+                if read_only {
+                    return Err(MinSyncError::VectorStore(
+                        "index predates lexical search — run `minsync sync` once to migrate".into(),
+                    ));
+                }
                 table
                     .add_columns(
                         NewColumnTransform::SqlExpressions(vec![(
@@ -63,6 +82,8 @@ impl LanceDbInner {
             }
             validate_schema(&table.schema().await.map_err(to_store_error)?, dim)?;
             table
+        } else if read_only {
+            return Err(MinSyncError::NeverSynced);
         } else {
             conn.create_empty_table(TABLE_NAME, schema(dim)?)
                 .execute()
@@ -248,10 +269,16 @@ impl LanceDbInner {
             .await
             .map_err(to_store_error)?;
         maintain_index(&self.table, &self.indexing).await?;
+        // Keep recent versions alive long enough for lock-free concurrent
+        // readers (`minsync query` no longer takes the writer lock): a reader
+        // pins the latest version at open time, so pruning only versions older
+        // than this window guarantees an in-flight query's files survive.
+        // `delete_unverified: false` never deletes files Lance could not
+        // verify as unreferenced.
         self.table
             .optimize(OptimizeAction::Prune {
-                older_than: Some(chrono::Duration::zero()),
-                delete_unverified: Some(true),
+                older_than: Some(chrono::Duration::minutes(10)),
+                delete_unverified: Some(false),
                 error_if_tagged_old_versions: None,
             })
             .await

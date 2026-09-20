@@ -61,6 +61,29 @@ impl LanceDbStore {
         indexing: IndexingConfig,
         language: &str,
     ) -> Result<Self> {
+        Self::open(path, dimension, indexing, language, false)
+    }
+
+    /// Open the store for read-only queries. Never creates the table or
+    /// applies schema migrations, so it is safe to run concurrently with a
+    /// sync holding the writer lock: Lance versions are immutable snapshots,
+    /// and a query pins the latest version at open time.
+    pub fn open_readonly(
+        path: &Path,
+        dimension: usize,
+        indexing: IndexingConfig,
+        language: &str,
+    ) -> Result<Self> {
+        Self::open(path, dimension, indexing, language, true)
+    }
+
+    fn open(
+        path: &Path,
+        dimension: usize,
+        indexing: IndexingConfig,
+        language: &str,
+        read_only: bool,
+    ) -> Result<Self> {
         crate::tokenizer::validate_language(language)?;
         let dim = if dimension == 0 {
             DEFAULT_DIMENSION
@@ -76,8 +99,9 @@ impl LanceDbStore {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
         let language = language.to_string();
-        let worker =
-            thread::spawn(move || run_worker(uri, dim, indexing, language, cmd_rx, init_tx));
+        let worker = thread::spawn(move || {
+            run_worker(uri, dim, indexing, language, read_only, cmd_rx, init_tx)
+        });
 
         match init_rx.recv().map_err(to_store_error)? {
             Ok(()) => Ok(Self {
@@ -474,6 +498,58 @@ mod tests {
             ])
             .expect("upsert docs");
         assert_eq!(store.all_paths(), vec!["a.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn test_readonly_open_missing_table_errors() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let result =
+            LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default(), "simple");
+        assert!(
+            matches!(result, Err(crate::error::MinSyncError::NeverSynced)),
+            "read-only open on a missing table must report NeverSynced"
+        );
+    }
+
+    #[test]
+    fn test_readonly_query_runs_alongside_writer() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut writer = LanceDbStore::open_or_create(dir.path(), 4).expect("create writer store");
+        writer
+            .upsert(&[doc("a", "a.txt", "token", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("upsert doc");
+        writer.flush().expect("flush writer");
+
+        // A second, read-only connection must open and query while the writer
+        // connection stays open — this is the `minsync query` during
+        // `minsync sync` scenario.
+        let reader =
+            LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default(), "simple")
+                .expect("open read-only store alongside writer");
+        let hits = reader
+            .query(&[1.0, 0.0, 0.0, 0.0], None, 1)
+            .expect("query through read-only store");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "a");
+
+        // Writes committed after the reader opened do not break the reader's
+        // pinned snapshot, even across a compact+prune flush.
+        writer
+            .upsert(&[doc("b", "b.txt", "token", vec![0.0, 1.0, 0.0, 0.0])])
+            .expect("upsert second doc");
+        writer.flush().expect("flush second write");
+        let hits = reader
+            .query(&[1.0, 0.0, 0.0, 0.0], None, 1)
+            .expect("reader still queries after writer flush");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "a");
+
+        // A freshly opened reader sees the new state.
+        drop(reader);
+        let reader =
+            LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default(), "simple")
+                .expect("reopen read-only store");
+        assert_eq!(reader.doc_count(), 2);
     }
 
     #[test]
