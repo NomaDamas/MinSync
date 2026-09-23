@@ -70,17 +70,45 @@ use std::path::Path;
 ///
 /// Returns [`MinSyncError::Config`] when the id is unknown.
 pub fn create_vectorstore(config: &Config, store_path: &Path) -> Result<Box<dyn VectorStore>> {
+    create_vectorstore_with_mode(config, store_path, false)
+}
+
+/// Construct a read-only [`VectorStore`] for querying. Unlike
+/// [`create_vectorstore`], this never creates the table or migrates its
+/// schema, so it is safe to use without the writer lock while a sync runs.
+pub fn create_vectorstore_readonly(
+    config: &Config,
+    store_path: &Path,
+) -> Result<Box<dyn VectorStore>> {
+    create_vectorstore_with_mode(config, store_path, true)
+}
+
+fn create_vectorstore_with_mode(
+    config: &Config,
+    store_path: &Path,
+    read_only: bool,
+) -> Result<Box<dyn VectorStore>> {
     match config.vectorstore.id.as_str() {
         "lancedb" => {
             let options = Some(&config.vectorstore.options);
             let dimension = lancedb_store::LanceDbStore::dimension_from_options(options)?;
             let indexing = lancedb_store::IndexingConfig::from_options(options)?;
-            Ok(Box::new(lancedb_store::LanceDbStore::open_with_language(
-                store_path,
-                dimension,
-                indexing,
-                &config.lexical.language,
-            )?))
+            let store = if read_only {
+                lancedb_store::LanceDbStore::open_readonly(
+                    store_path,
+                    dimension,
+                    indexing,
+                    &config.lexical.language,
+                )?
+            } else {
+                lancedb_store::LanceDbStore::open_with_language(
+                    store_path,
+                    dimension,
+                    indexing,
+                    &config.lexical.language,
+                )?
+            };
+            Ok(Box::new(store))
         }
         other => Err(MinSyncError::Config(format!(
             "unknown vectorstore id: {other}"
