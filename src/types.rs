@@ -14,6 +14,7 @@ pub struct SyncResult {
     pub chunks_added: usize,
     pub chunks_updated: usize,
     pub chunks_deleted: usize,
+    pub chunks_truncated: usize,
     pub dry_run: bool,
     pub already_up_to_date: bool,
     /// True when this run performed the initial full sync because no
