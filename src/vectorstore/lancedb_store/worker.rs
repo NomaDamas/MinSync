@@ -7,6 +7,7 @@ use super::{to_store_error, IndexingConfig};
 use crate::error::Result;
 use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
+use std::collections::HashMap;
 use std::sync::mpsc;
 
 pub(super) type Resp<T> = mpsc::Sender<Result<T>>;
@@ -15,6 +16,7 @@ pub(super) enum Command {
     Upsert(Vec<Document>, Resp<()>),
     Update(Vec<DocumentUpdate>, Resp<()>),
     Fetch(Vec<String>, Resp<Vec<Document>>),
+    FetchEmbeddingsByContentHash(Vec<String>, Resp<HashMap<String, Vec<f32>>>),
     Delete(Filter, Resp<usize>),
     Query {
         vector: Vec<f32>,
@@ -76,6 +78,10 @@ pub(super) fn run_worker(
                 send_response(resp, rt.block_on(inner.update(updates)))
             }
             Command::Fetch(ids, resp) => send_response(resp, rt.block_on(inner.fetch(ids))),
+            Command::FetchEmbeddingsByContentHash(hashes, resp) => send_response(
+                resp,
+                rt.block_on(inner.fetch_embeddings_by_content_hash(hashes)),
+            ),
             Command::Delete(filter, resp) => {
                 send_response(resp, rt.block_on(inner.delete_by_filter(filter)));
             }

@@ -48,11 +48,15 @@ fn validate_filter_field(field: &str) -> Result<&str> {
 }
 
 pub(super) fn id_in_filter<'a>(ids: impl Iterator<Item = &'a str>) -> String {
-    let values = ids
-        .map(|id| format!("'{}'", escape_sql_literal(id)))
+    column_in_filter("id", ids)
+}
+
+pub(super) fn column_in_filter<'a>(column: &str, values: impl Iterator<Item = &'a str>) -> String {
+    let values = values
+        .map(|value| format!("'{}'", escape_sql_literal(value)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("id IN ({values})")
+    format!("{column} IN ({values})")
 }
 
 pub(super) fn sql_literal(value: &str) -> String {

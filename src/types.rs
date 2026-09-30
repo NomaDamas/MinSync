@@ -26,6 +26,10 @@ pub struct SyncResult {
     pub elapsed_seconds: f64,
     pub embedding_api_calls: usize,
     pub embedded_texts: usize,
+    /// New chunks whose vector was reused from an identical chunk (same
+    /// content hash) instead of being embedded again.
+    #[serde(default)]
+    pub embeddings_reused: usize,
     pub estimated_tokens: usize,
     pub files_checked: usize,
     pub freshness_check_only: bool,

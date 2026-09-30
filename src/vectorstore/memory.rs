@@ -44,6 +44,24 @@ impl VectorStore for InMemoryStore {
         Ok(())
     }
 
+    fn fetch_embeddings_by_content_hash(
+        &self,
+        content_hashes: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        let wanted: HashSet<&str> = content_hashes.iter().map(String::as_str).collect();
+        let mut found = HashMap::new();
+        for doc in self.docs.values() {
+            if wanted.contains(doc.content_hash.as_str())
+                && doc.embedding.iter().all(|value| value.is_finite())
+            {
+                found
+                    .entry(doc.content_hash.clone())
+                    .or_insert_with(|| doc.embedding.clone());
+            }
+        }
+        Ok(found)
+    }
+
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
         Ok(ids
             .iter()

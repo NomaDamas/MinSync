@@ -13,7 +13,7 @@ use crate::manifest::{FileChange, Manifest};
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::SyncResult;
 use crate::vectorstore::{Filter, VectorStore};
-use indexer::{index_file, SyncFileContext};
+use indexer::{flush_window, prepare_file, EmbedWindow, SyncFileContext};
 use result::{change_path, empty_sync_result};
 use std::path::{Component, Path, PathBuf};
 
@@ -278,29 +278,33 @@ impl MinSync {
             ))?;
         }
 
+        let mut window = EmbedWindow::default();
         for change in &changes {
             match change {
-                FileChange::Added(path) => {
-                    result.files_added += 1;
+                FileChange::Added(path) | FileChange::Modified(path) => {
+                    if matches!(change, FileChange::Added(_)) {
+                        result.files_added += 1;
+                    } else {
+                        result.files_modified += 1;
+                    }
                     let context = SyncFileContext {
                         config: &config,
                         chunker,
                         embedder,
-                        store,
+                        store: &mut *store,
                         sync_token: &sync_token,
                     };
-                    index_file(&self.root, path, context, &mut result).await?;
-                }
-                FileChange::Modified(path) => {
-                    result.files_modified += 1;
-                    let context = SyncFileContext {
-                        config: &config,
-                        chunker,
-                        embedder,
-                        store,
-                        sync_token: &sync_token,
-                    };
-                    index_file(&self.root, path, context, &mut result).await?;
+                    prepare_file(&self.root, path, context, &mut window, &mut result)?;
+                    if window.is_full() {
+                        let context = SyncFileContext {
+                            config: &config,
+                            chunker,
+                            embedder,
+                            store: &mut *store,
+                            sync_token: &sync_token,
+                        };
+                        flush_window(context, &mut window, &mut result).await?;
+                    }
                 }
                 FileChange::Deleted(path) => {
                     result.files_deleted += 1;
@@ -314,6 +318,14 @@ impl MinSync {
                 }
             }
         }
+        let context = SyncFileContext {
+            config: &config,
+            chunker,
+            embedder,
+            store: &mut *store,
+            sync_token: &sync_token,
+        };
+        flush_window(context, &mut window, &mut result).await?;
 
         if full {
             result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
@@ -914,6 +926,154 @@ mod tests {
         assert!(message.contains("bad.txt"), "{message}");
         assert!(message.contains("chunk 0"), "{message}");
         assert_eq!(store.doc_count(), 0);
+    }
+
+    /// Records every `embed` call so tests can assert batching and dedup.
+    #[derive(Default)]
+    struct RecordingEmbedder {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingEmbedder {
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        fn id(&self) -> &str {
+            "recording"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.to_vec());
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    fn init_openai(sync: &MinSync) {
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+    }
+
+    #[tokio::test]
+    async fn test_sync_embeds_identical_files_once() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        std::fs::write(dir.path().join("a.txt"), body).expect("write a");
+        std::fs::write(dir.path().join("copy-of-a.txt"), body).expect("write copy");
+        init_openai(&sync);
+        let embedder = RecordingEmbedder::default();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+
+        let per_file = result.chunks_added / 2;
+        assert!(
+            per_file > 1,
+            "fixture must chunk each file into several pieces"
+        );
+        assert_eq!(result.embedded_texts, per_file);
+        assert_eq!(result.embeddings_reused, per_file);
+        assert_eq!(
+            result.embedded_texts + result.embeddings_reused,
+            result.chunks_added
+        );
+        assert_eq!(embedder.calls().len(), 1, "one window, one embed call");
+        assert_eq!(store.doc_count(), result.chunks_added);
+        assert!(store
+            .all_embeddings()
+            .iter()
+            .all(|embedding| embedding.iter().all(|value| value.is_finite())));
+    }
+
+    #[tokio::test]
+    async fn test_sync_reuses_stored_embeddings_for_later_copies() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        std::fs::write(dir.path().join("a.txt"), body).expect("write a");
+        init_openai(&sync);
+        let embedder = RecordingEmbedder::default();
+        let first = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first sync succeeds");
+
+        std::fs::write(dir.path().join("later-copy.txt"), body).expect("write copy");
+        let second = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("second sync succeeds");
+
+        assert_eq!(second.files_added, 1);
+        assert_eq!(second.chunks_added, first.chunks_added);
+        assert_eq!(second.embedded_texts, 0);
+        assert_eq!(second.embeddings_reused, first.chunks_added);
+        assert_eq!(second.embedding_api_calls, 0);
+        assert_eq!(
+            embedder.calls().len(),
+            1,
+            "the copy must not call the embedder"
+        );
+        assert_eq!(store.doc_count(), first.chunks_added * 2);
+    }
+
+    #[tokio::test]
+    async fn test_sync_batches_across_files_longest_first() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "short one").expect("write a");
+        std::fs::write(
+            dir.path().join("b.txt"),
+            "a considerably longer paragraph of words that spans far more characters",
+        )
+        .expect("write b");
+        std::fs::write(dir.path().join("c.txt"), "medium sized text here").expect("write c");
+        init_openai(&sync);
+        let embedder = RecordingEmbedder::default();
+
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 1, "small files share one embed call");
+        let lengths: Vec<usize> = calls[0].iter().map(String::len).collect();
+        let mut sorted = lengths.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            lengths, sorted,
+            "texts must reach the embedder longest first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_flushes_window_when_full() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        let files = crate::sync::indexer::EMBED_WINDOW_CHUNKS + 5;
+        for index in 0..files {
+            std::fs::write(
+                dir.path().join(format!("f{index:04}.txt")),
+                format!("unique body {index}"),
+            )
+            .expect("write file");
+        }
+        init_openai(&sync);
+        let embedder = RecordingEmbedder::default();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].len() >= crate::sync::indexer::EMBED_WINDOW_CHUNKS);
+        assert_eq!(result.embedded_texts, files);
+        assert_eq!(result.files_processed, files);
+        assert_eq!(store.doc_count(), files);
     }
 
     #[tokio::test]

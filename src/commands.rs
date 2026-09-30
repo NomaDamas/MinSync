@@ -142,6 +142,7 @@ async fn sync(
                 println!("  elapsed time:        {:.2}s", result.elapsed_seconds);
                 println!("  embedding API calls: {}", result.embedding_api_calls);
                 println!("  embedded texts:      {}", result.embedded_texts);
+                println!("  embeddings reused:   {}", result.embeddings_reused);
                 println!("  estimated tokens:    {}", result.estimated_tokens);
             }
         }

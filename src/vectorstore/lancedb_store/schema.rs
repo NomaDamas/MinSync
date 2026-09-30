@@ -170,6 +170,26 @@ pub(super) fn batch_to_documents(batch: &RecordBatch) -> Result<Vec<Document>> {
     Ok(docs)
 }
 
+pub(super) fn batch_to_hash_embeddings(batch: &RecordBatch) -> Result<Vec<(String, Vec<f32>)>> {
+    let hashes = string_col(batch, "content_hash")?;
+    let vectors = batch
+        .column_by_name(VECTOR_COLUMN)
+        .ok_or_else(|| missing_column(VECTOR_COLUMN))?
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| MinSyncError::VectorStore("vector column has unexpected type".into()))?;
+    Ok((0..batch.num_rows())
+        .map(|row| {
+            let vector = vectors
+                .value(row)
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            (hashes.value(row).to_string(), vector)
+        })
+        .collect())
+}
+
 pub(super) fn batch_to_query_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> {
     let ids = string_col(batch, "id")?;
     let paths = string_col(batch, "path")?;
