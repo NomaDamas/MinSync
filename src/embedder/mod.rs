@@ -13,6 +13,14 @@ pub trait Embedder: Send + Sync {
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
+    async fn count_truncated(&self, _texts: &[String]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn max_length(&self) -> Option<usize> {
+        None
+    }
+
     async fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed(&[text.to_string()]).await?;
         results

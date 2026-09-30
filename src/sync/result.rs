@@ -17,6 +17,7 @@ pub(super) fn empty_sync_result(dry_run: bool, already_up_to_date: bool) -> Sync
         chunks_added: 0,
         chunks_updated: 0,
         chunks_deleted: 0,
+        chunks_truncated: 0,
         dry_run,
         already_up_to_date,
         initial_sync: false,

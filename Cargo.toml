@@ -56,6 +56,10 @@ fastembed = { version = "7.0.1", default-features = false, features = [
     "hf-hub-rustls-tls",
     "ort-download-binaries-rustls-tls",
 ] }
+hf-hub = { version = "0.5.0", default-features = false, features = [
+    "rustls-tls",
+] }
+tokenizers = "0.23.2"
 candle-core = "0.11.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]

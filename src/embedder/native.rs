@@ -6,11 +6,28 @@ use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
 use candle_core::{DType, Device};
 use fastembed::Qwen3TextEmbedding;
+use hf_hub::api::sync::ApiBuilder;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tokio::sync::OnceCell;
 
 const DEFAULT_MAX_LENGTH: usize = 2048;
+
+#[cfg(test)]
+#[test]
+fn tokenized_length_detects_qwen3_limit() {
+    let tokenizer = test_tokenizer();
+    let text = "a ".repeat(DEFAULT_MAX_LENGTH);
+    assert!(tokenized_length(&tokenizer, &text) >= DEFAULT_MAX_LENGTH);
+}
+
+#[cfg(test)]
+#[test]
+fn tokenized_length_short_control_stays_below_limit() {
+    let tokenizer = test_tokenizer();
+    assert!(tokenized_length(&tokenizer, "short control text") < DEFAULT_MAX_LENGTH);
+}
 
 /// Upper bound on the attention-score tensor (`batch x heads x seq x seq`)
 /// materialized per forward pass. On Metal, a tensor above 4 GiB makes the
@@ -49,6 +66,7 @@ pub struct NativeEmbedder {
     query_prefix: Option<String>,
     passage_prefix: Option<String>,
     inner: OnceCell<Arc<Mutex<Qwen3TextEmbedding>>>,
+    tokenizer: OnceCell<Tokenizer>,
 }
 
 impl NativeEmbedder {
@@ -64,7 +82,80 @@ impl NativeEmbedder {
             query_prefix: settings.query_prefix.clone(),
             passage_prefix: settings.passage_prefix.clone(),
             inner: OnceCell::new(),
+            tokenizer: OnceCell::new(),
         })
+    }
+
+    async fn tokenizer(&self) -> Result<&Tokenizer> {
+        self.tokenizer
+            .get_or_try_init(|| async {
+                let repo = self.model_id.clone();
+                let cache_dir = self.cache_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    apply_cache_dir(cache_dir.as_deref());
+                    let api = if std::env::var_os("HF_HOME").is_some() {
+                        ApiBuilder::from_env()
+                    } else {
+                        ApiBuilder::new().with_cache_dir(PathBuf::from(fastembed::get_cache_dir()))
+                    }
+                    .with_progress(false)
+                    .build()
+                    .map_err(|error| {
+                        MinSyncError::Embedding(format!(
+                            "native tokenizer API initialization failed: {error}"
+                        ))
+                    })?;
+                    let path = api.model(repo).get("tokenizer.json").map_err(|error| {
+                        MinSyncError::Embedding(format!("native tokenizer load failed: {error}"))
+                    })?;
+                    let mut tokenizer = Tokenizer::from_file(path).map_err(|error| {
+                        MinSyncError::Embedding(format!("native tokenizer parse failed: {error}"))
+                    })?;
+                    let _ = tokenizer.with_padding(Some(PaddingParams {
+                        strategy: PaddingStrategy::BatchLongest,
+                        direction: tokenizers::PaddingDirection::Left,
+                        ..Default::default()
+                    }));
+                    Ok(tokenizer)
+                })
+                .await
+                .map_err(|error| {
+                    MinSyncError::Embedding(format!("native tokenizer join failed: {error}"))
+                })?
+            })
+            .await
+    }
+
+    async fn count_truncated_texts(&self, texts: &[String]) -> Result<usize> {
+        let texts: Vec<String> = texts
+            .iter()
+            .map(|text| match &self.passage_prefix {
+                Some(prefix) => format!("{prefix}{text}"),
+                None => text.clone(),
+            })
+            .collect();
+        let candidates: Vec<_> = texts
+            .iter()
+            // Qwen3's byte-level BPE cannot produce more tokens than UTF-8
+            // bytes; this gate avoids tokenizing clearly short chunks while
+            // retaining multibyte text as a conservative candidate.
+            .filter(|text| text.len() >= self.max_length)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let tokenizer = self.tokenizer().await?;
+        candidates
+            .iter()
+            .map(|text| {
+                tokenizer
+                    .encode(text.as_str(), true)
+                    .map(|encoding| usize::from(encoding.len() >= self.max_length))
+                    .map_err(|error| {
+                        MinSyncError::Embedding(format!("native tokenizer encode failed: {error}"))
+                    })
+            })
+            .sum()
     }
 
     async fn model(&self) -> Result<Arc<Mutex<Qwen3TextEmbedding>>> {
@@ -148,6 +239,14 @@ impl Embedder for NativeEmbedder {
         &self.model_id
     }
 
+    async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
+        self.count_truncated_texts(texts).await
+    }
+
+    fn max_length(&self) -> Option<usize> {
+        Some(self.max_length)
+    }
+
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let inputs = texts
             .iter()
@@ -220,6 +319,36 @@ fn parse_native_model_id(id: &str) -> Result<&str> {
         ));
     }
     Ok(model)
+}
+
+#[cfg(test)]
+fn tokenized_length(tokenizer: &Tokenizer, text: &str) -> usize {
+    tokenizer
+        .encode(text, true)
+        .expect("Qwen3 tokenizer encodes unit test input")
+        .len()
+}
+
+#[cfg(test)]
+fn test_tokenizer() -> Tokenizer {
+    Tokenizer::from_bytes(
+        br#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[UNK]": 0, "a": 1},
+                "unk_token": "[UNK]"
+            }
+        }"#,
+    )
+    .expect("build test tokenizer")
 }
 
 fn parse_device(value: Option<&str>) -> Result<NativeDevice> {

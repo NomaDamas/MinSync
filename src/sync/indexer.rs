@@ -42,6 +42,24 @@ pub(super) async fn index_file(
     };
     let text = normalize_text(&raw_text, &context.config.normalize);
     let chunks = context.chunker.chunk(&text, path)?;
+    let chunk_texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+    let chunks_truncated = context.embedder.count_truncated(&chunk_texts).await?;
+    if chunks_truncated > 0 {
+        if let Some(max_length) = context.embedder.max_length() {
+            tracing::warn!(
+                "{} chunks in {} hit the {max_length}-token limit and were truncated",
+                chunks_truncated,
+                path
+            );
+        } else {
+            tracing::warn!(
+                "{} chunks in {} hit the embedder token limit and were truncated",
+                chunks_truncated,
+                path
+            );
+        }
+        result.chunks_truncated += chunks_truncated;
+    }
     let schema_id = context.chunker.schema_id();
     let doc_ids = doc_ids_for_chunks(&context.config.source_id, path, schema_id, &chunks);
     let existing_ids: HashSet<_> = context
