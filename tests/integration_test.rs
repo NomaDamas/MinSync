@@ -1,6 +1,7 @@
 use minsync::chunker::chonkie::ChonkieChunker;
 use minsync::chunker::create_chunker;
 use minsync::chunker::recursive::RecursiveChunker;
+use minsync::chunker::Chunker;
 use minsync::cli::QueryMode;
 use minsync::config::Config;
 use minsync::embedder::tei::TeiEmbedder;
@@ -12,7 +13,7 @@ use minsync::sync::MinSync;
 use minsync::types::SyncState;
 use minsync::vectorstore::lancedb_store::LanceDbStore;
 use minsync::vectorstore::memory::InMemoryStore;
-use minsync::vectorstore::{create_vectorstore, VectorStore};
+use minsync::vectorstore::{create_vectorstore, Document, VectorStore};
 use minsync::verify::{status, verify};
 use minsync::watch::{
     run_with_shutdown, should_index, WatchControl, WatchStartup, WatchStartupStatus,
@@ -253,6 +254,131 @@ async fn test_full_workflow() {
     assert!(!query_results.is_empty());
     assert_eq!(query_results[0].rank, 1);
     assert!(verify_result.all_passed);
+}
+
+#[tokio::test]
+async fn test_verify_flags_different_texts_with_identical_vectors_in_lancedb() {
+    let root = tempfile::tempdir().expect("create workspace");
+    write_file(&root, "first.txt", "first text");
+    write_file(&root, "second.txt", "second text");
+    let sync = MinSync::new(root.path().to_path_buf());
+    sync.init(false, "tei:test", "recursive")
+        .expect("init succeeds");
+    let chunker = RecursiveChunker::new(1024);
+    let config = Config::load(&root.path().join(".minsync/config.toml")).expect("load config");
+    let mut store = LanceDbStore::open_or_create(
+        &root.path().join(".minsync").join(&config.collection.path),
+        4,
+    )
+    .expect("open LanceDB");
+    store
+        .upsert(&[
+            Document {
+                id: "chunk-a".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "apple orchard weather report".to_string(),
+                source_id: config.source_id.clone(),
+                path: "first.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-a".to_string(),
+                seen_token: "token".to_string(),
+            },
+            Document {
+                id: "chunk-b".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "quantum mechanics lecture notes".to_string(),
+                source_id: config.source_id,
+                path: "second.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-b".to_string(),
+                seen_token: "token".to_string(),
+            },
+        ])
+        .expect("upsert documents");
+
+    let result = verify(
+        &root.path().join(".minsync"),
+        root.path(),
+        &chunker,
+        &mut store,
+        false,
+        None,
+    )
+    .await
+    .expect("verify succeeds");
+
+    assert!(!result.all_passed);
+    assert_eq!(result.embedding_integrity.flagged_pairs.len(), 1);
+    assert_eq!(
+        result.embedding_integrity.flagged_pairs[0].chunk_ids,
+        vec!["chunk-a", "chunk-b"]
+    );
+    assert_eq!(
+        result.embedding_integrity.flagged_pairs[0].paths,
+        vec!["first.txt", "second.txt"]
+    );
+}
+
+#[tokio::test]
+async fn test_verify_ignores_identical_text_duplicate_vectors_in_lancedb() {
+    let root = tempfile::tempdir().expect("create workspace");
+    write_file(&root, "first.txt", "first text");
+    write_file(&root, "second.txt", "second text");
+    let sync = MinSync::new(root.path().to_path_buf());
+    sync.init(false, "tei:test", "recursive")
+        .expect("init succeeds");
+    let chunker = RecursiveChunker::new(1024);
+    let config = Config::load(&root.path().join(".minsync/config.toml")).expect("load config");
+    let mut store = LanceDbStore::open_or_create(
+        &root.path().join(".minsync").join(&config.collection.path),
+        4,
+    )
+    .expect("open LanceDB");
+    store
+        .upsert(&[
+            Document {
+                id: "chunk-a".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "same text".to_string(),
+                source_id: config.source_id.clone(),
+                path: "first.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-a".to_string(),
+                seen_token: "token".to_string(),
+            },
+            Document {
+                id: "chunk-b".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "same text".to_string(),
+                source_id: config.source_id,
+                path: "second.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-b".to_string(),
+                seen_token: "token".to_string(),
+            },
+        ])
+        .expect("upsert documents");
+
+    let result = verify(
+        &root.path().join(".minsync"),
+        root.path(),
+        &chunker,
+        &mut store,
+        false,
+        None,
+    )
+    .await
+    .expect("verify succeeds");
+
+    assert!(result.embedding_integrity.flagged_pairs.is_empty());
 }
 
 #[tokio::test]

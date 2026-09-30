@@ -16,7 +16,8 @@ use crate::config::Config;
 use crate::error::{MinSyncError, Result};
 use crate::manifest::Manifest;
 use crate::state::Cursor;
-use crate::types::VerifyResult;
+use crate::types::{EmbeddingIntegrityPair, EmbeddingIntegrityResult, VerifyResult};
+use crate::vectorstore::similarity::cosine_similarity;
 use crate::vectorstore::{Filter, VectorStore};
 use sampling::{expected_doc_ids, sample_paths};
 use std::collections::{HashMap, HashSet};
@@ -85,13 +86,50 @@ pub async fn verify(
         }
     }
     basic_checks.insert("sample_chunks_match".to_string(), sample_ok);
+    let embedding_integrity = check_embedding_integrity(store)?;
+    basic_checks.insert(
+        "embedding_integrity".to_string(),
+        embedding_integrity.flagged_pairs.is_empty(),
+    );
 
     Ok(VerifyResult {
         all_passed: basic_checks.values().all(|passed| *passed),
         basic_checks,
+        embedding_integrity,
         fixed,
         index_state,
     })
+}
+
+fn check_embedding_integrity(store: &dyn VectorStore) -> Result<EmbeddingIntegrityResult> {
+    let documents = store.documents()?;
+    let mut flagged_pairs = Vec::new();
+
+    for (left_index, left) in documents.iter().enumerate() {
+        for right in documents.iter().skip(left_index + 1) {
+            if cosine_similarity(&left.embedding, &right.embedding) < 0.999
+                || !texts_differ_substantially(&left.text, &right.text)
+            {
+                continue;
+            }
+            flagged_pairs.push(EmbeddingIntegrityPair {
+                chunk_ids: vec![left.id.clone(), right.id.clone()],
+                paths: vec![left.path.clone(), right.path.clone()],
+            });
+        }
+    }
+
+    Ok(EmbeddingIntegrityResult { flagged_pairs })
+}
+
+fn texts_differ_substantially(left: &str, right: &str) -> bool {
+    if left == right {
+        return false;
+    }
+    let left_terms: HashSet<_> = left.split_whitespace().map(str::to_lowercase).collect();
+    let right_terms: HashSet<_> = right.split_whitespace().map(str::to_lowercase).collect();
+    let union = left_terms.union(&right_terms).count();
+    union == 0 || left_terms.intersection(&right_terms).count() * 2 < union
 }
 
 /// Paths present in the store but absent from the manifest (deleted or
@@ -160,6 +198,10 @@ mod tests {
 
         fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
             self.inner.fetch(ids)
+        }
+
+        fn documents(&self) -> Result<Vec<Document>> {
+            self.inner.documents()
         }
 
         fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {

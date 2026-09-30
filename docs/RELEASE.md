@@ -2,6 +2,20 @@
 
 Use this checklist before cutting a public release.
 
+## Release note: pre-#59 macOS/Metal indexes
+
+The native macOS/Metal embedder bug fixed by [#59](https://github.com/NomaDamas/MinSync/pull/59)
+could silently write corrupt, finite vectors when long chunks exceeded the affected
+attention-memory limit described in [#58](https://github.com/NomaDamas/MinSync/issues/58).
+Indexes created before that fix may therefore contain vectors that do not represent
+their stored text. As the manifest treats unchanged files as unchanged, an
+incremental sync does not repair those vectors.
+
+For the diagnostic added in [#61](https://github.com/NomaDamas/MinSync/issues/61),
+run `minsync verify`. If it reports suspicious duplicate-vector pairs, or if the
+native embedder was used on macOS before #59, run `minsync sync --full` once to
+re-embed the index.
+
 ## 1. Version and Metadata
 
 - [ ] Confirm `Cargo.toml` version is the intended release version.

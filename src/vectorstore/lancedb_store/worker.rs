@@ -15,6 +15,7 @@ pub(super) enum Command {
     Upsert(Vec<Document>, Resp<()>),
     Update(Vec<DocumentUpdate>, Resp<()>),
     Fetch(Vec<String>, Resp<Vec<Document>>),
+    Documents(Resp<Vec<Document>>),
     Delete(Filter, Resp<usize>),
     Query {
         vector: Vec<f32>,
@@ -76,6 +77,7 @@ pub(super) fn run_worker(
                 send_response(resp, rt.block_on(inner.update(updates)))
             }
             Command::Fetch(ids, resp) => send_response(resp, rt.block_on(inner.fetch(ids))),
+            Command::Documents(resp) => send_response(resp, rt.block_on(inner.documents())),
             Command::Delete(filter, resp) => {
                 send_response(resp, rt.block_on(inner.delete_by_filter(filter)));
             }
