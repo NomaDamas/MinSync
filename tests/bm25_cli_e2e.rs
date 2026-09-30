@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use minsync::chunker::create_chunker;
 use minsync::config::Config;
 use minsync::state::Cursor;
 use minsync::vectorstore::lancedb_store::LanceDbStore;
@@ -152,4 +153,204 @@ fn verify_failure_returns_nonzero_exit_code() {
     let result: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse verification result");
     assert_eq!(result["all_passed"], false);
+}
+
+#[test]
+fn verify_cli_reports_duplicate_vector_corruption_pairs() {
+    let root = tempfile::tempdir().expect("create workspace");
+    std::fs::write(
+        root.path().join("first.txt"),
+        "apple orchard weather report",
+    )
+    .expect("write first file");
+    std::fs::write(
+        root.path().join("second.txt"),
+        "quantum mechanics lecture notes",
+    )
+    .expect("write second file");
+
+    Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root.path())
+        .args(["init"])
+        .assert()
+        .success();
+
+    let minsync_dir = root.path().join(".minsync");
+    let mut config = Config::load(&minsync_dir.join("config.toml")).expect("load config");
+    let mut options = toml::value::Table::new();
+    options.insert("dimension".into(), toml::Value::Integer(4));
+    config.vectorstore.options = toml::Value::Table(options);
+    config
+        .save(&minsync_dir.join("config.toml"))
+        .expect("save test config");
+    let chunker = create_chunker(&config).expect("create chunker");
+    Cursor {
+        source_id: config.source_id.clone(),
+        last_synced_at: "2026-09-30T00:00:00Z".to_string(),
+        manifest_hash: "sha256:test".to_string(),
+        chunk_schema_id: chunker.schema_id().to_string(),
+        embedder_id: config.embedder.id.clone(),
+        collection_path: config.collection.path.clone(),
+        lexical_language: config.lexical.language.clone(),
+    }
+    .save(&minsync_dir.join("cursor.json"))
+    .expect("save cursor");
+
+    let mut store = LanceDbStore::open_with_language(
+        &minsync_dir.join(&config.collection.path),
+        4,
+        Default::default(),
+        &config.lexical.language,
+    )
+    .expect("open LanceDB");
+    store
+        .upsert(&[
+            Document {
+                id: "chunk-a".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "apple orchard weather report".to_string(),
+                source_id: config.source_id.clone(),
+                path: "first.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-a".to_string(),
+                seen_token: "token".to_string(),
+            },
+            Document {
+                id: "chunk-b".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "quantum mechanics lecture notes".to_string(),
+                source_id: config.source_id,
+                path: "second.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-b".to_string(),
+                seen_token: "token".to_string(),
+            },
+        ])
+        .expect("upsert corrupt documents");
+    store.flush().expect("flush LanceDB");
+    drop(store);
+
+    let output = Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root.path())
+        .args(["--format", "json", "verify"])
+        .output()
+        .expect("run verify");
+
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "parse verification result: {error}; stdout={:?}; stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(
+        result["embedding_integrity"]["flagged_pairs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("verification JSON: {result}"))
+            .len(),
+        1
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("verification failed"),
+        "stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text_output = Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root.path())
+        .args(["verify"])
+        .output()
+        .expect("run text verify");
+    assert_eq!(text_output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&text_output.stdout)
+            .contains("Recommendation: run minsync sync --full"),
+        "stdout={:?}",
+        String::from_utf8_lossy(&text_output.stdout)
+    );
+}
+
+#[test]
+fn build_corrupt_verify_fixture_from_environment() {
+    let Some(path) = std::env::var_os("MINSYNC_CORRUPT_FIXTURE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(path);
+    std::fs::create_dir_all(&root).expect("create fixture root");
+    std::fs::write(root.join("first.txt"), "apple orchard weather report")
+        .expect("write first file");
+    std::fs::write(root.join("second.txt"), "quantum mechanics lecture notes")
+        .expect("write second file");
+    Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(&root)
+        .args(["init"])
+        .assert()
+        .success();
+
+    let minsync_dir = root.join(".minsync");
+    let mut config = Config::load(&minsync_dir.join("config.toml")).expect("load config");
+    let mut options = toml::value::Table::new();
+    options.insert("dimension".into(), toml::Value::Integer(4));
+    config.vectorstore.options = toml::Value::Table(options);
+    config
+        .save(&minsync_dir.join("config.toml"))
+        .expect("save test config");
+    let chunker = create_chunker(&config).expect("create chunker");
+    Cursor {
+        source_id: config.source_id.clone(),
+        last_synced_at: "2026-09-30T00:00:00Z".to_string(),
+        manifest_hash: "sha256:test".to_string(),
+        chunk_schema_id: chunker.schema_id().to_string(),
+        embedder_id: config.embedder.id.clone(),
+        collection_path: config.collection.path.clone(),
+        lexical_language: config.lexical.language.clone(),
+    }
+    .save(&minsync_dir.join("cursor.json"))
+    .expect("save cursor");
+    let mut store = LanceDbStore::open_with_language(
+        &minsync_dir.join(&config.collection.path),
+        4,
+        Default::default(),
+        &config.lexical.language,
+    )
+    .expect("open LanceDB");
+    store
+        .upsert(&[
+            Document {
+                id: "chunk-a".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "apple orchard weather report".to_string(),
+                source_id: config.source_id.clone(),
+                path: "first.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-a".to_string(),
+                seen_token: "token".to_string(),
+            },
+            Document {
+                id: "chunk-b".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                text: "quantum mechanics lecture notes".to_string(),
+                source_id: config.source_id,
+                path: "second.txt".to_string(),
+                chunk_schema_id: chunker.schema_id().to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: "hash-b".to_string(),
+                seen_token: "token".to_string(),
+            },
+        ])
+        .expect("upsert corrupt documents");
+    store.flush().expect("flush LanceDB");
 }

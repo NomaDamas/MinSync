@@ -145,6 +145,10 @@ impl LanceDbInner {
         Ok(docs)
     }
 
+    pub(super) async fn documents(&self) -> Result<Vec<Document>> {
+        self.scan_documents(None).await
+    }
+
     pub(super) async fn delete_by_filter(&self, filter: Filter) -> Result<usize> {
         let sql = filter_to_sql(&filter)?;
         let result = self.table.delete(&sql).await.map_err(to_store_error)?;

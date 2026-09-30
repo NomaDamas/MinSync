@@ -51,6 +51,12 @@ impl VectorStore for InMemoryStore {
             .collect())
     }
 
+    fn documents(&self) -> Result<Vec<Document>> {
+        let mut docs: Vec<_> = self.docs.values().cloned().collect();
+        docs.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(docs)
+    }
+
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
         let original_len = self.docs.len();
         self.docs.retain(|_, doc| !matches_filter(doc, filter));

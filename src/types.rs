@@ -91,8 +91,20 @@ pub struct CheckResult {
 pub struct VerifyResult {
     pub all_passed: bool,
     pub basic_checks: HashMap<String, bool>,
+    pub embedding_integrity: EmbeddingIntegrityResult,
     pub fixed: bool,
     pub index_state: Option<IndexState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingIntegrityResult {
+    pub flagged_pairs: Vec<EmbeddingIntegrityPair>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingIntegrityPair {
+    pub chunk_ids: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 #[cfg(test)]

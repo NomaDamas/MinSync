@@ -50,6 +50,9 @@ pub trait VectorStore: Send + Sync {
     fn upsert(&mut self, docs: &[Document]) -> Result<()>;
     fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()>;
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>>;
+    fn documents(&self) -> Result<Vec<Document>> {
+        Ok(Vec::new())
+    }
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize>;
     fn query(&self, vector: &[f32], filter: Option<&Filter>, topk: usize) -> Result<Vec<QueryHit>>;
     fn query_text(&self, text: &str, filter: Option<&Filter>, topk: usize)
