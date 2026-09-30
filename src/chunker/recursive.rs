@@ -35,35 +35,160 @@ impl Chunker for RecursiveChunker {
             return Ok(Vec::new());
         }
 
+        let mut chunks = Vec::new();
+        let mut plain_start = 0;
+        let mut lines = text.split_inclusive('\n').peekable();
+        let mut offset = 0;
+
+        while let Some(line) = lines.next() {
+            let line_start = offset;
+            offset += line.len();
+            if !is_table_line(line) {
+                continue;
+            }
+
+            let mut table = String::from(line);
+            while let Some(next) = lines.next_if(|next| is_table_line(next)) {
+                table.push_str(next);
+                offset += next.len();
+            }
+
+            if line_start > plain_start {
+                chunks.extend(self.chunk_plain(&text[plain_start..line_start]));
+            }
+            chunks.extend(self.chunk_table(&table));
+            plain_start = offset;
+        }
+
+        if plain_start < text.len() {
+            chunks.extend(self.chunk_plain(&text[plain_start..]));
+        }
+
+        Ok(chunks
+            .into_iter()
+            .filter(|chunk: &Chunk| !chunk.text.trim().is_empty())
+            .collect())
+    }
+}
+
+impl RecursiveChunker {
+    fn chunk_plain(&self, text: &str) -> Vec<Chunk> {
         let bytes = text.as_bytes();
         let offsets = self.splitter.split(bytes, IncludeDelim::Prev, 0);
         let splits: Vec<&str> = offsets
             .into_iter()
             .filter_map(|(start, end)| std::str::from_utf8(&bytes[start..end]).ok())
             .collect();
+        let merged = if splits.is_empty() {
+            vec![text.to_string()]
+        } else {
+            let token_counts: Vec<usize> =
+                splits.iter().map(|split| split.chars().count()).collect();
+            merge_splits(&splits, &token_counts, self.max_chunk_size).merged
+        };
 
-        if splits.is_empty() {
-            return Ok(vec![Chunk {
-                text: text.to_string(),
-                chunk_type: "chunk".to_string(),
-                heading_path: String::new(),
-            }]);
+        merged
+            .into_iter()
+            .flat_map(|text| self.hard_cap(&text))
+            .map(chunk)
+            .collect()
+    }
+
+    fn chunk_table(&self, table: &str) -> Vec<Chunk> {
+        let lines: Vec<&str> = table.split_inclusive('\n').collect();
+        let has_header = lines
+            .get(1)
+            .is_some_and(|separator| is_table_separator(separator));
+        if !has_header {
+            return lines
+                .into_iter()
+                .flat_map(|line| self.hard_cap(line))
+                .map(chunk)
+                .collect();
         }
 
-        let token_counts: Vec<usize> = splits.iter().map(|split| split.chars().count()).collect();
-        let merged = merge_splits(&splits, &token_counts, self.max_chunk_size).merged;
+        let header = format!("{}{}", lines[0], lines[1]);
+        let mut chunks = Vec::new();
+        let mut current = header.clone();
+        for row in &lines[2..] {
+            if current != header
+                && current.chars().count() + row.chars().count() > self.max_chunk_size
+            {
+                tracing::warn!(
+                    max_chunk_size = self.max_chunk_size,
+                    "table chunk boundary falls inside a markdown table"
+                );
+                chunks.push(chunk(current));
+                current = header.clone();
+            }
+            current.push_str(row);
+        }
+        if !current.is_empty() {
+            chunks.push(chunk(current));
+        }
 
-        let result = merged
+        chunks
             .into_iter()
-            .map(|text| Chunk {
-                text,
-                chunk_type: "chunk".to_string(),
-                heading_path: String::new(),
+            .inspect(|chunk| {
+                let length = chunk.text.chars().count();
+                if length > self.max_chunk_size {
+                    tracing::warn!(
+                        original_length = length,
+                        max_chunk_size = self.max_chunk_size,
+                        "table chunk exceeds max_chunk_size because table rows are kept intact"
+                    );
+                }
             })
-            .filter(|c| !c.text.trim().is_empty())
-            .collect();
+            .collect()
+    }
 
-        Ok(result)
+    fn hard_cap(&self, text: &str) -> Vec<String> {
+        let length = text.chars().count();
+        if length <= self.max_chunk_size {
+            return vec![text.to_string()];
+        }
+
+        tracing::warn!(
+            original_length = length,
+            max_chunk_size = self.max_chunk_size,
+            "splitting overlong delimiter-less content at character boundaries"
+        );
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        for character in text.chars() {
+            current.push(character);
+            if current.chars().count() == self.max_chunk_size {
+                chunks.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        chunks
+    }
+}
+
+fn is_table_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with('|') && trimmed.matches('|').count() >= 2
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && trimmed.trim_matches('|').split('|').all(|cell| {
+            cell.trim()
+                .chars()
+                .all(|character| character == '-' || character == ':')
+        })
+}
+
+fn chunk(text: String) -> Chunk {
+    Chunk {
+        text,
+        chunk_type: "chunk".to_string(),
+        heading_path: String::new(),
     }
 }
 
@@ -115,11 +240,49 @@ mod tests {
         assert!(chunks.len() > 1);
         assert_eq!(chunks.concat_text(), text);
         for chunk in chunks {
-            let contains_boundary = chunk.text.matches(". ").count() > 1;
-            if contains_boundary {
-                assert!(chunk.text.chars().count() <= max_chunk_size);
-            }
+            assert!(chunk.text.chars().count() <= max_chunk_size);
         }
+    }
+
+    #[test]
+    fn test_table_keeps_header_and_data_row_together() {
+        let chunker = RecursiveChunker::new(32);
+        let text = "| h0500 | other |\n| --- | --- |\n| v0500 | value |";
+
+        let chunks = chunker.chunk(text, "f.md").expect("chunk markdown table");
+
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("h0500") && chunk.text.contains("v0500")));
+    }
+
+    #[test]
+    fn test_table_parts_repeat_header_and_separator() {
+        let chunker = RecursiveChunker::new(40);
+        let text = "| header |\n| --- |\n| first |\n| second |\n| third |";
+
+        let chunks = chunker.chunk(text, "f.md").expect("chunk markdown table");
+
+        assert!(chunks.len() > 1);
+        let header = "| header |";
+        let separator = "| --- |";
+        for chunk in chunks.iter().skip(1) {
+            assert!(chunk.text.starts_with(&format!("{header}\n{separator}\n")));
+        }
+    }
+
+    #[test]
+    fn test_delimiterless_line_is_hard_capped() {
+        let max_chunk_size = 4096;
+        let chunker = RecursiveChunker::new(max_chunk_size);
+        let text = "x".repeat(8001);
+
+        let chunks = chunker.chunk(&text, "f.md").expect("chunk long line");
+
+        assert_eq!(chunks.concat_text(), text);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.chars().count() <= max_chunk_size));
     }
 
     #[test]

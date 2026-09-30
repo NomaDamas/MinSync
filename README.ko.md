@@ -149,6 +149,21 @@ MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일
 | `chonkie` | delimiter/size 기반 chonkie-core chunking | `recursive`와 같은 drift caveat가 있습니다. |
 | `cdc` | FastCDC 스타일 rolling hash 기반 content-defined chunking | 작은 편집은 보통 변경 지점 근처 chunk에만 영향을 줍니다. |
 
+`recursive` chunker는 paragraph break, sentence delimiter(`. `, `? `,
+`! `), line break를 기준으로 나눈 뒤 `chunker.options.max_chunk_size`
+이하로 병합합니다. 설정한 크기는 일반 delimiter 기반 텍스트와
+delimiter가 없는 긴 줄에도 적용되는 hard cap입니다. delimiter가 없는
+줄은 문자 경계에서 나뉘며 원래 길이를 포함한 warning을 기록합니다.
+
+연속된 Markdown table line(앞쪽 공백은 허용하며 `|`로 시작하고 다른
+`|`도 포함해야 함)은 하나의 table block으로 처리합니다. 유효한 table
+header와 separator는 data row와 함께 유지하고, table chunk는 row 사이에서만
+나눕니다. table이 여러 chunk가 되면 첫 chunk 이후의 모든 chunk가 header와
+separator를 반복합니다. table row 또는 반복 header를 보존하면 cap을 넘는
+경우에는 table 구조를 유지하는 대신 warning을 기록합니다. 이 경우만
+hard cap의 의도적인 예외입니다. table 내부에서 boundary를 선택할 때도
+warning을 기록합니다.
+
 초기화 시 선택:
 
 ```bash
