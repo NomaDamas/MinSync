@@ -62,6 +62,7 @@ minsync watch --watch-on-sync-error   # 초기 sync 오류 후에도 유지하�
 minsync status                        # sync 상태
 minsync check                         # health check
 minsync verify --fix                  # consistency check 및 repair
+minsync optimize                      # store compact + re-index + prune
 ```
 
 초기화할 때 BM25 tokenizer preset을 선택할 수 있습니다.
@@ -137,6 +138,7 @@ MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일
 | `manifest.json` | 마지막으로 확인한 파일 metadata와 content hash |
 | `cursor.json` | 마지막으로 완료된 processing point |
 | `txn.json` | 진행 중 transaction marker |
+| `progress.jsonl` | 중단된 sync가 이미 commit한 파일 목록(resume log) |
 | `lock` | process lock |
 
 처음부터 다시 시작하려면 `.minsync/`를 삭제하세요.
@@ -192,9 +194,23 @@ MinSync는 row 수가 `index_build_threshold`를 넘으면 IVF-HNSW-SQ ANN index
 
 새 vector store를 추가하는 agent는 `VectorStore` trait을 구현하고 `create_vectorstore`에 새 id를 연결해야 합니다. 자세한 내용은 `docs/EXTENDING.md`와 `skills/minsync/SKILL.md`를 참고하세요.
 
+### 쓰기 경로, checkpoint, `optimize`
+
+sync는 파일마다 배치 단위로 commit합니다(재사용 chunk의 metadata는 한 번에 update, 새 chunk는 replace-or-insert 한 번). `id`와 `path`에 BTree index를 유지해 파일별 filter가 fragment 전체 스캔이 되지 않게 하고, `[sync] checkpoint_every_files`(기본 50)개 파일마다 fragment가 `compact_fragment_threshold`(기본 64) 이상이면 compact하고 오래된 version을 prune합니다. 실행 중인 sync는 checkpoint마다 `sync progress`를 로그로 남깁니다.
+
+```toml
+[sync]
+checkpoint_every_files = 50   # 0이면 중간 checkpoint 비활성화
+
+[vectorstore.options]
+compact_fragment_threshold = 64
+```
+
+`minsync optimize`는 compact + re-index + prune만 수행합니다(embedding, 파일 읽기 없음). 중단된 sync 때문에 조각난 store를 복구할 때 사용하세요.
+
 ## Embedding 안정성
 
-Embedding request는 per-request timeout과 transient failure retry를 사용합니다. Retry 대상은 network error, timeout, HTTP 429, HTTP 5xx입니다. Invalid auth, malformed response, validation error 같은 permanent failure는 즉시 실패합니다. 실패한 sync는 cursor나 manifest를 전진시키지 않으므로 다음 `minsync sync`에서 안전하게 재개됩니다.
+Embedding request는 per-request timeout과 transient failure retry를 사용합니다. Retry 대상은 network error, timeout, HTTP 429, HTTP 5xx입니다. Invalid auth, malformed response, validation error 같은 permanent failure는 즉시 실패합니다. 실패하거나 강제 종료된 sync는 cursor나 manifest를 전진시키지 않지만 resume log(`progress.jsonl`)를 남깁니다. 다음 `minsync sync`는 중단된 실행이 이미 commit한 파일을 건너뛰고 이어서 처리합니다. 그 사이 파일, chunker, normalizer, embedder, lexical language가 바뀌면 log는 폐기됩니다.
 
 ```toml
 [embedder]

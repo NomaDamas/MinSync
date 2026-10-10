@@ -3,7 +3,7 @@
 
 use super::{to_store_error, DISTANCE_COLUMN, VECTOR_COLUMN};
 use crate::error::{MinSyncError, Result};
-use crate::vectorstore::{Document, QueryHit};
+use crate::vectorstore::{Document, DocumentUpdate, QueryHit};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, StringArray};
@@ -124,6 +124,36 @@ pub(super) fn docs_to_batch(docs: &[Document], dim: usize, language: &str) -> Re
             )),
             Arc::new(StringArray::from_iter_values(
                 docs.iter().map(|doc| doc.seen_token.as_str()),
+            )),
+        ],
+    )
+    .map_err(to_store_error)
+}
+
+/// Batch holding only `id` plus the three metadata columns an update
+/// rewrites. Used as a partial-schema `merge_insert` source so matched rows
+/// keep their vector, text and every other column untouched.
+pub(super) fn updates_to_batch(updates: &[&DocumentUpdate]) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("heading_path", DataType::Utf8, false),
+        Field::new("seen_token", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                updates.iter().map(|update| update.id.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                updates.iter().map(|update| update.path.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                updates.iter().map(|update| update.heading_path.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                updates.iter().map(|update| update.seen_token.as_str()),
             )),
         ],
     )

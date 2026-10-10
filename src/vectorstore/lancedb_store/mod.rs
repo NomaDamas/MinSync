@@ -157,6 +157,11 @@ impl LanceDbStore {
         self.request(Command::IndexState)
     }
 
+    /// Number of data fragments in the table.
+    pub fn fragment_count(&self) -> Result<usize> {
+        self.request(Command::FragmentCount)
+    }
+
     fn request<T>(&self, make: impl FnOnce(Resp<T>) -> Command) -> Result<T> {
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(make(resp_tx)).map_err(to_store_error)?;
@@ -215,6 +220,10 @@ impl VectorStore for LanceDbStore {
 
     fn flush(&mut self) -> Result<()> {
         self.request(Command::Flush)
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        self.request(Command::Checkpoint)
     }
 
     fn doc_count(&self) -> usize {
@@ -597,6 +606,7 @@ mod tests {
             IndexingConfig {
                 index_build_threshold,
                 index_optimize_delta_threshold: 1,
+                ..IndexingConfig::default()
             },
         )
         .expect("create lancedb store")
@@ -621,8 +631,12 @@ mod tests {
         store.flush().expect("flush");
         let indices = store.index_names().expect("list indices");
         assert!(
-            indices.len() == 1 && indices[0].contains("text"),
-            "only the BM25 text index should exist below the ANN row threshold, got {indices:?}"
+            indices.iter().any(|name| name.contains("text")),
+            "BM25 text index should exist, got {indices:?}"
+        );
+        assert!(
+            !indices.iter().any(|name| name.contains("vector")),
+            "no ANN vector index should exist below the row threshold, got {indices:?}"
         );
     }
 
@@ -667,5 +681,183 @@ mod tests {
             .expect("query late doc");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "late");
+    }
+
+    fn version_count(dir: &TempDir) -> usize {
+        std::fs::read_dir(dir.path().join("documents.lance").join("_versions"))
+            .expect("read _versions")
+            .count()
+    }
+
+    #[test]
+    fn test_update_batch_commits_once_and_applies_per_id_values() {
+        let (dir, mut store) = store();
+        let docs: Vec<_> = (0..40)
+            .map(|i| doc(&format!("id-{i}"), "a.txt", "old", vec![1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        store.upsert(&docs).expect("upsert docs");
+
+        let before = version_count(&dir);
+        let updates: Vec<_> = (0..40)
+            .map(|i| DocumentUpdate {
+                id: format!("id-{i}"),
+                seen_token: "new".to_string(),
+                path: "a.txt".to_string(),
+                heading_path: format!("heading {i}"),
+            })
+            .collect();
+        store.update(&updates).expect("batch update");
+
+        assert!(
+            version_count(&dir) - before <= 1,
+            "a batch update must be a single commit"
+        );
+        let ids: Vec<_> = (0..40).map(|i| format!("id-{i}")).collect();
+        let fetched = store.fetch(&ids).expect("fetch docs");
+        assert_eq!(fetched.len(), 40);
+        for (i, doc) in fetched.iter().enumerate() {
+            assert_eq!(doc.seen_token, "new");
+            assert_eq!(doc.heading_path, format!("heading {i}"));
+            assert_eq!(doc.text, format!("text id-{i}"), "other columns untouched");
+            assert_eq!(doc.embedding, vec![1.0, 0.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn test_update_never_inserts_unknown_ids() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[doc("a", "a.txt", "old", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("upsert doc");
+        store
+            .update(&[
+                DocumentUpdate {
+                    id: "a".to_string(),
+                    seen_token: "new".to_string(),
+                    path: "a.txt".to_string(),
+                    heading_path: "h".to_string(),
+                },
+                DocumentUpdate {
+                    id: "ghost".to_string(),
+                    seen_token: "new".to_string(),
+                    path: "ghost.txt".to_string(),
+                    heading_path: "h".to_string(),
+                },
+            ])
+            .expect("update with unknown id");
+        assert_eq!(store.doc_count(), 1);
+        assert!(store
+            .fetch(&["ghost".to_string()])
+            .expect("fetch ghost")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_upsert_replacement_commits_once() {
+        let (dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "a.txt", "old", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "a.txt", "old", vec![0.0, 1.0, 0.0, 0.0]),
+            ])
+            .expect("seed docs");
+        let before = version_count(&dir);
+        store
+            .upsert(&[
+                doc("b", "a.txt", "new", vec![0.0, 0.0, 1.0, 0.0]),
+                doc("c", "a.txt", "new", vec![0.0, 0.0, 0.0, 1.0]),
+            ])
+            .expect("upsert replace + insert");
+        assert!(
+            version_count(&dir) - before <= 1,
+            "replace+insert must be a single commit"
+        );
+        assert_eq!(store.doc_count(), 3);
+        let fetched = store
+            .fetch(&["b".to_string(), "c".to_string()])
+            .expect("fetch");
+        assert_eq!(fetched[0].seen_token, "new");
+        assert_eq!(fetched[0].embedding, vec![0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_delete_matching_nothing_commits_nothing() {
+        let (dir, mut store) = store();
+        store
+            .upsert(&[doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("seed");
+        let before = version_count(&dir);
+        let deleted = store
+            .delete_by_filter(&Filter::Eq("path".to_string(), "nope.txt".to_string()))
+            .expect("delete nothing");
+        assert_eq!(deleted, 0);
+        assert_eq!(version_count(&dir), before);
+    }
+
+    #[test]
+    fn test_flush_builds_scalar_indexes_for_id_and_path() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("seed");
+        store.flush().expect("flush");
+        let names = store.index_names().expect("index names");
+        assert!(names.iter().any(|n| n.starts_with("id_")), "{names:?}");
+        assert!(names.iter().any(|n| n.starts_with("path_")), "{names:?}");
+        // Idempotent: a second flush must not fail or duplicate them.
+        store.flush().expect("second flush");
+        assert_eq!(store.index_names().expect("index names").len(), names.len());
+    }
+
+    #[test]
+    fn test_checkpoint_compacts_fragments_above_threshold_and_keeps_data() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = LanceDbStore::open_with_indexing(
+            dir.path(),
+            4,
+            IndexingConfig {
+                compact_fragment_threshold: 8,
+                ..IndexingConfig::default()
+            },
+        )
+        .expect("create store");
+        for i in 0..20 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+        }
+        assert!(store.fragment_count().expect("fragments") >= 20);
+        store.checkpoint().expect("checkpoint");
+        assert!(
+            store.fragment_count().expect("fragments") < 8,
+            "checkpoint above threshold must compact"
+        );
+        assert_eq!(store.doc_count(), 20);
+        let fetched = store.fetch(&["id-7".to_string()]).expect("fetch after");
+        assert_eq!(fetched.len(), 1, "scalar-indexed lookup still finds rows");
+    }
+
+    #[test]
+    fn test_checkpoint_below_threshold_does_not_rewrite_data() {
+        let (_dir, mut store) = store();
+        for i in 0..3 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+        }
+        let before = store.fragment_count().expect("fragments");
+        store.checkpoint().expect("checkpoint");
+        assert_eq!(store.fragment_count().expect("fragments"), before);
+        assert_eq!(store.doc_count(), 3);
     }
 }

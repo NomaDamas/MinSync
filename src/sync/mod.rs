@@ -3,6 +3,7 @@
 //! result accounting helpers live in [`result`].
 
 mod indexer;
+mod progress;
 mod result;
 
 use crate::chunker::Chunker;
@@ -14,18 +15,33 @@ use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::SyncResult;
 use crate::vectorstore::{Filter, VectorStore};
 use indexer::{index_file, SyncFileContext};
+use progress::{ProgressHeader, ProgressLog, PROGRESS_FILE};
 use result::{change_path, empty_sync_result};
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
 pub struct MinSync {
     root: PathBuf,
     minsync_dir: PathBuf,
+    /// Overrides `[sync] checkpoint_every_files` (0 disables checkpoints).
+    checkpoint_every: Option<usize>,
 }
 
 impl MinSync {
     pub fn new(root: PathBuf) -> Self {
         let minsync_dir = root.join(".minsync");
-        Self { root, minsync_dir }
+        Self {
+            root,
+            minsync_dir,
+            checkpoint_every: None,
+        }
+    }
+
+    /// Checkpoint every `files` processed files instead of the configured
+    /// `[sync] checkpoint_every_files`. `0` disables checkpoints.
+    pub fn with_checkpoint_every(mut self, files: usize) -> Self {
+        self.checkpoint_every = Some(files);
+        self
     }
 
     pub fn minsync_dir(&self) -> &std::path::Path {
@@ -88,7 +104,7 @@ impl MinSync {
             .join(format!(".reset-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&staging)?;
 
-        for state_file in ["cursor.json", "txn.json"] {
+        for state_file in ["cursor.json", "txn.json", progress::PROGRESS_FILE] {
             let path = self.minsync_dir.join(state_file);
             if path.exists() {
                 std::fs::rename(&path, staging.join(state_file))?;
@@ -103,6 +119,27 @@ impl MinSync {
         }
         Ok(staging)
     }
+}
+
+/// Fingerprint of everything that changes what a processed file writes to
+/// the store. A resume log is only trusted when this matches, so editing the
+/// chunker/normalizer/embedder/language between a crash and the retry
+/// re-indexes instead of silently keeping rows built the old way.
+fn config_fingerprint(config: &Config, chunker: &dyn Chunker, embedder: &dyn Embedder) -> String {
+    let material = serde_json::json!({
+        "chunker": &config.chunker,
+        "chunker_schema": chunker.schema_id(),
+        "normalize": &config.normalize,
+        "embedder": &config.embedder,
+        "embedder_id": embedder.id(),
+        "lexical": &config.lexical,
+        "vectorstore": &config.vectorstore,
+        "collection": &config.collection,
+    });
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(material.to_string()))
+    )
 }
 
 pub(crate) fn collection_store_path(minsync_dir: &Path, configured_path: &str) -> Result<PathBuf> {
@@ -185,6 +222,7 @@ impl MinSync {
         let txn_path = self.minsync_dir.join("txn.json");
         let cursor_path = self.minsync_dir.join("cursor.json");
         let manifest_path = self.minsync_dir.join("manifest.json");
+        let progress_path = self.minsync_dir.join(PROGRESS_FILE);
 
         // A cursor-less workspace has never completed an initial sync: its
         // baseline manifest (written by `init`) cannot drive a meaningful
@@ -199,6 +237,8 @@ impl MinSync {
         };
         let full = full || initial_sync || lexical_rebuild;
 
+        // Read the interrupted run's log BEFORE clearing its txn marker.
+        let resume_state = ProgressLog::load(&progress_path);
         if txn_path.exists() {
             Transaction::remove(&txn_path)?;
         }
@@ -258,7 +298,21 @@ impl MinSync {
             return Ok(result);
         }
 
-        let sync_token = uuid::Uuid::new_v4().to_string().replace('-', "");
+        // Resuming an interrupted run: reuse its sync token (the end-of-run
+        // full sweep deletes rows whose `seen_token` differs, so files the
+        // earlier run already committed must keep carrying it) and skip the
+        // files it logged as done.
+        let fingerprint = config_fingerprint(&config, chunker, embedder);
+        let resume = resume_state.filter(|state| {
+            state.header.source_id == config.source_id
+                && state.header.full == full
+                && state.header.manifest_hash_from == old_manifest.manifest_hash()
+                && state.header.config_fingerprint == fingerprint
+        });
+        let sync_token = match &resume {
+            Some(state) => state.header.sync_token.clone(),
+            None => uuid::Uuid::new_v4().to_string().replace('-', ""),
+        };
         Transaction::new(
             &config.source_id,
             &sync_token,
@@ -266,33 +320,80 @@ impl MinSync {
             &new_manifest.manifest_hash(),
         )
         .save(&txn_path)?;
+        let header = ProgressHeader {
+            source_id: config.source_id.clone(),
+            sync_token: sync_token.clone(),
+            full,
+            manifest_hash_from: old_manifest.manifest_hash(),
+            config_fingerprint: fingerprint,
+        };
+        let carried = resume
+            .as_ref()
+            .map(|state| state.processed.clone())
+            .unwrap_or_default();
+        let mut progress = ProgressLog::create(&progress_path, &header, &carried)?;
 
         let mut result = empty_sync_result(false, false);
         result.initial_sync = initial_sync;
         result.files_checked = new_manifest.files.len();
         result.query_ready = true;
         if lexical_rebuild {
-            result.chunks_deleted += store.delete_by_filter(&Filter::Eq(
-                "source_id".to_string(),
-                config.source_id.clone(),
-            ))?;
+            // Rows indexed under the previous lexical language must go. Keyed
+            // on the token so a resumed run keeps what it already rewrote.
+            result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
+                Filter::Eq("source_id".to_string(), config.source_id.clone()),
+                Filter::Neq("seen_token".to_string(), sync_token.clone()),
+            ]))?;
         }
 
+        let checkpoint_every = self
+            .checkpoint_every
+            .unwrap_or(config.sync.checkpoint_every_files);
+        let mut processed_this_run = 0usize;
+
         for change in &changes {
-            match change {
+            let (path, content_hash) = match change {
                 FileChange::Added(path) => {
                     result.files_added += 1;
-                    let context = SyncFileContext {
-                        config: &config,
-                        chunker,
-                        embedder,
-                        store,
-                        sync_token: &sync_token,
-                    };
-                    index_file(&self.root, path, context, &mut result).await?;
+                    (
+                        path,
+                        new_manifest.files.get(path).map(|e| e.content_hash.clone()),
+                    )
                 }
                 FileChange::Modified(path) => {
                     result.files_modified += 1;
+                    (
+                        path,
+                        new_manifest.files.get(path).map(|e| e.content_hash.clone()),
+                    )
+                }
+                FileChange::Deleted(path) => {
+                    result.files_deleted += 1;
+                    (path, None)
+                }
+            };
+            if resume
+                .as_ref()
+                .is_some_and(|state| state.is_done(path, content_hash.as_deref()))
+            {
+                result.files_resumed += 1;
+                continue;
+            }
+            // Logged by the interrupted run but changed since: its old rows
+            // carry the reused token, so the per-file `seen_token !=` sweep
+            // cannot tell them from fresh ones. Clear the path first.
+            if resume
+                .as_ref()
+                .is_some_and(|state| state.processed.contains_key(path))
+            {
+                result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
+                    Filter::Eq("source_id".to_string(), config.source_id.clone()),
+                    Filter::Eq("path".to_string(), path.clone()),
+                ]))?;
+            }
+
+            match change {
+                FileChange::Added(_) | FileChange::Modified(_) => {
                     let context = SyncFileContext {
                         config: &config,
                         chunker,
@@ -302,8 +403,7 @@ impl MinSync {
                     };
                     index_file(&self.root, path, context, &mut result).await?;
                 }
-                FileChange::Deleted(path) => {
-                    result.files_deleted += 1;
+                FileChange::Deleted(_) => {
                     let deleted = store.delete_by_filter(&Filter::And(vec![
                         Filter::Eq("source_id".to_string(), config.source_id.clone()),
                         Filter::Eq("path".to_string(), path.clone()),
@@ -312,6 +412,20 @@ impl MinSync {
                     result.files_processed += 1;
                     result.files_processed_paths.push(path.clone());
                 }
+            }
+
+            // Logged only after the store commits returned: a logged path is
+            // always safe to skip on resume.
+            progress.append(&[(path.clone(), content_hash)])?;
+            processed_this_run += 1;
+            if checkpoint_every > 0 && processed_this_run.is_multiple_of(checkpoint_every) {
+                store.checkpoint()?;
+                tracing::info!(
+                    processed = processed_this_run + result.files_resumed,
+                    total = changes.len(),
+                    elapsed_seconds = start.elapsed().as_secs(),
+                    "sync progress"
+                );
             }
         }
 
@@ -334,6 +448,7 @@ impl MinSync {
         }
         .save(&cursor_path)?;
         new_manifest.save(&manifest_path)?;
+        ProgressLog::remove(&progress_path)?;
         Transaction::remove(&txn_path)?;
 
         result.elapsed_seconds = start.elapsed().as_secs_f64();
@@ -998,5 +1113,320 @@ mod tests {
         assert!(result.chunks_added > 0);
         assert!(!sync.minsync_dir.join("txn.json").exists());
         assert!(sync.minsync_dir.join("cursor.json").exists());
+    }
+
+    // ---- issue #71: batched writes, checkpoints, crash resume -------------
+
+    use crate::vectorstore::{Document, DocumentUpdate, QueryHit};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Wraps [`InMemoryStore`] to count write calls and inject a crash.
+    #[derive(Default)]
+    struct SpyStore {
+        inner: InMemoryStore,
+        update_batch_sizes: Vec<usize>,
+        upsert_calls: usize,
+        checkpoints: usize,
+        /// Fail every `upsert` once this many have succeeded.
+        fail_upserts_after: Option<usize>,
+    }
+
+    impl VectorStore for SpyStore {
+        fn upsert(&mut self, docs: &[Document]) -> Result<()> {
+            if self
+                .fail_upserts_after
+                .is_some_and(|n| self.upsert_calls >= n)
+            {
+                return Err(MinSyncError::VectorStore("injected crash".into()));
+            }
+            self.upsert_calls += 1;
+            self.inner.upsert(docs)
+        }
+        fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()> {
+            self.update_batch_sizes.push(updates.len());
+            self.inner.update(updates)
+        }
+        fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
+            self.inner.fetch(ids)
+        }
+        fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
+            self.inner.delete_by_filter(filter)
+        }
+        fn query(
+            &self,
+            vector: &[f32],
+            filter: Option<&Filter>,
+            topk: usize,
+        ) -> Result<Vec<QueryHit>> {
+            self.inner.query(vector, filter, topk)
+        }
+        fn query_text(
+            &self,
+            text: &str,
+            filter: Option<&Filter>,
+            topk: usize,
+        ) -> Result<Vec<QueryHit>> {
+            self.inner.query_text(text, filter, topk)
+        }
+        fn flush(&mut self) -> Result<()> {
+            self.inner.flush()
+        }
+        fn checkpoint(&mut self) -> Result<()> {
+            self.checkpoints += 1;
+            Ok(())
+        }
+        fn doc_count(&self) -> usize {
+            self.inner.doc_count()
+        }
+        fn all_paths(&self) -> Vec<String> {
+            self.inner.all_paths()
+        }
+    }
+
+    /// [`MockEmbedder`] that also counts how many texts it was asked to embed.
+    struct CountingEmbedder {
+        texts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    fn counting_embedder() -> (CountingEmbedder, Arc<AtomicUsize>) {
+        let texts = Arc::new(AtomicUsize::new(0));
+        (
+            CountingEmbedder {
+                texts: texts.clone(),
+            },
+            texts,
+        )
+    }
+
+    const MULTI_CHUNK: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+
+    fn write_numbered_files(dir: &TempDir, count: usize) {
+        for i in 0..count {
+            std::fs::write(
+                dir.path().join(format!("f{i}.txt")),
+                format!("{MULTI_CHUNK} file{i} {MULTI_CHUNK}"),
+            )
+            .expect("write file");
+        }
+    }
+
+    fn init_sync(sync: &MinSync) {
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+    }
+
+    #[tokio::test]
+    async fn test_index_file_writes_all_reused_chunks_in_one_update() {
+        let (dir, _sync, chunker, embedder, _store) = fixture();
+        let config = Config::default_for("source-1");
+        std::fs::write(dir.path().join("a.txt"), MULTI_CHUNK).expect("write file");
+        let mut store = SpyStore::default();
+
+        for token in ["t1", "t2"] {
+            let mut result = empty_sync_result(false, false);
+            let context = SyncFileContext {
+                config: &config,
+                chunker: &chunker,
+                embedder: &embedder,
+                store: &mut store,
+                sync_token: token,
+            };
+            index_file(dir.path(), "a.txt", context, &mut result)
+                .await
+                .expect("index file");
+        }
+
+        let chunks = store.doc_count();
+        assert!(chunks > 1, "fixture must be multi-chunk");
+        assert_eq!(
+            store.update_batch_sizes,
+            vec![chunks],
+            "second pass reuses every chunk: ONE update call carrying all of them"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_checkpoints_every_n_files() {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        let sync = sync.with_checkpoint_every(2);
+        write_numbered_files(&dir, 5);
+        init_sync(&sync);
+        let mut store = SpyStore::default();
+
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+
+        assert_eq!(store.checkpoints, 2, "after file 2 and file 4 of 5");
+    }
+
+    /// Run an initial sync that crashes on the 4th file's upsert.
+    async fn crash_initial_sync(
+        dir: &TempDir,
+        sync: &MinSync,
+        chunker: &ChonkieChunker,
+    ) -> SpyStore {
+        write_numbered_files(dir, 6);
+        init_sync(sync);
+        let mut store = SpyStore {
+            fail_upserts_after: Some(3),
+            ..SpyStore::default()
+        };
+        let error = sync
+            .sync(chunker, &MockEmbedder, &mut store, true, false, false)
+            .await
+            .expect_err("injected crash fails the sync");
+        assert!(error.to_string().contains("injected crash"), "{error}");
+        assert!(sync.minsync_dir.join("txn.json").exists());
+        assert!(sync.minsync_dir.join("progress.jsonl").exists());
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+        store
+    }
+
+    async fn uninterrupted_doc_count(chunker: &ChonkieChunker, files: usize) -> usize {
+        let (dir, sync, _chunker, embedder, mut store) = fixture();
+        write_numbered_files(&dir, files);
+        init_sync(&sync);
+        sync.sync(chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("reference sync");
+        store.doc_count()
+    }
+
+    #[tokio::test]
+    async fn test_resume_after_crash_skips_committed_files() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        let mut store = crash_initial_sync(&dir, &sync, &chunker).await;
+        store.fail_upserts_after = None;
+        let (embedder, embedded) = counting_embedder();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("resumed sync");
+
+        assert_eq!(result.files_resumed, 3);
+        assert_eq!(result.files_processed, 3);
+        assert_eq!(
+            embedded.load(Ordering::SeqCst),
+            result.embedded_texts,
+            "only unfinished files are embedded"
+        );
+        assert_eq!(
+            store.doc_count(),
+            uninterrupted_doc_count(&chunker, 6).await,
+            "full-sync sweep must not delete the already-committed files' chunks"
+        );
+        assert_eq!(store.all_paths().len(), 6);
+        assert!(sync.minsync_dir.join("cursor.json").exists());
+        assert!(!sync.minsync_dir.join("txn.json").exists());
+        assert!(!sync.minsync_dir.join("progress.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn test_resume_reprocesses_files_changed_since_interruption() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        let mut store = crash_initial_sync(&dir, &sync, &chunker).await;
+        store.fail_upserts_after = None;
+        std::fs::write(
+            dir.path().join("f0.txt"),
+            "CHANGED after the crash CHANGED after the crash",
+        )
+        .expect("rewrite f0");
+
+        let result = sync
+            .sync(&chunker, &MockEmbedder, &mut store, false, false, false)
+            .await
+            .expect("resumed sync");
+
+        assert_eq!(result.files_resumed, 2, "f1, f2 reused; f0 changed");
+        let hits = store
+            .query(
+                &[0.5; 8],
+                Some(&Filter::Eq("path".to_string(), "f0.txt".to_string())),
+                50,
+            )
+            .expect("query f0");
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter()
+                .all(|hit| !hit.text.contains("alpha") && !hit.text.contains("file0")),
+            "no pre-crash chunk of f0 may survive: {hits:?}"
+        );
+        let joined: String = hits.iter().map(|hit| hit.text.as_str()).collect();
+        assert!(joined.contains("CHANGED"), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_resume_discarded_when_chunking_config_changes() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        let mut store = crash_initial_sync(&dir, &sync, &chunker).await;
+        store.fail_upserts_after = None;
+        let config_path = sync.minsync_dir.join("config.toml");
+        let mut config = Config::load(&config_path).expect("load config");
+        config.normalize.collapse_whitespace = true;
+        config.save(&config_path).expect("save config");
+
+        let result = sync
+            .sync(&chunker, &MockEmbedder, &mut store, false, false, false)
+            .await
+            .expect("sync after config change");
+
+        assert_eq!(result.files_resumed, 0);
+        assert_eq!(result.files_processed, 6);
+    }
+
+    #[tokio::test]
+    async fn test_resume_incremental_sync_honors_recorded_deletions() {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        let mut store = SpyStore::default();
+        for name in ["a-del", "b-del", "c-mod", "d-mod", "e-keep"] {
+            std::fs::write(dir.path().join(format!("{name}.txt")), MULTI_CHUNK)
+                .expect("write file");
+        }
+        init_sync(&sync);
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("initial sync");
+
+        std::fs::remove_file(dir.path().join("a-del.txt")).expect("remove a");
+        std::fs::remove_file(dir.path().join("b-del.txt")).expect("remove b");
+        for name in ["c-mod", "d-mod"] {
+            std::fs::write(
+                dir.path().join(format!("{name}.txt")),
+                format!("{MULTI_CHUNK} brand new tail for {name}"),
+            )
+            .expect("modify file");
+        }
+        store.upsert_calls = 0;
+        store.fail_upserts_after = Some(1);
+        sync.sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect_err("crash while indexing d-mod");
+        store.fail_upserts_after = None;
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("resumed sync");
+
+        assert_eq!(result.files_resumed, 3, "two deletions and c-mod");
+        assert_eq!(result.files_processed, 1, "only d-mod remains");
+        assert_eq!(
+            store.all_paths(),
+            vec!["c-mod.txt", "d-mod.txt", "e-keep.txt"]
+        );
     }
 }

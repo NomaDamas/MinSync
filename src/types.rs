@@ -30,6 +30,10 @@ pub struct SyncResult {
     pub files_checked: usize,
     pub freshness_check_only: bool,
     pub query_ready: bool,
+    /// Files skipped because an interrupted earlier run had already
+    /// committed them (crash resume). NOT included in `files_processed`.
+    #[serde(default)]
+    pub files_resumed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

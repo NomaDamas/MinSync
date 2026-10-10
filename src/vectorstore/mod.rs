@@ -55,6 +55,14 @@ pub trait VectorStore: Send + Sync {
     fn query_text(&self, text: &str, filter: Option<&Filter>, topk: usize)
         -> Result<Vec<QueryHit>>;
     fn flush(&mut self) -> Result<()>;
+    /// Cheap mid-sync maintenance so a long run that is killed leaves a
+    /// store that is still fast to reopen: compact once fragments pile up
+    /// and prune old versions. Unlike [`VectorStore::flush`] it never
+    /// retrains or rebuilds search indexes. Stores with nothing to maintain
+    /// keep the default no-op.
+    fn checkpoint(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn doc_count(&self) -> usize;
     fn all_paths(&self) -> Vec<String>;
     fn index_state(&self) -> Result<Option<IndexState>> {

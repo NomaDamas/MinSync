@@ -56,16 +56,16 @@ pub(super) async fn index_file(
         .map(|doc| doc.id)
         .collect();
     let mut docs_to_embed = Vec::new();
+    let mut reused = Vec::new();
 
     for (chunk, (doc_id, chunk_content_hash)) in chunks.into_iter().zip(doc_ids) {
         if existing_ids.contains(&doc_id) {
-            context.store.update(&[DocumentUpdate {
+            reused.push(DocumentUpdate {
                 id: doc_id,
                 seen_token: context.sync_token.to_string(),
                 path: path.to_string(),
                 heading_path: chunk.heading_path,
-            }])?;
-            result.chunks_updated += 1;
+            });
         } else {
             docs_to_embed.push(Document {
                 id: doc_id,
@@ -80,6 +80,13 @@ pub(super) async fn index_file(
                 seen_token: context.sync_token.to_string(),
             });
         }
+    }
+
+    // One store call (one commit) for every reused chunk of the file,
+    // instead of one commit per chunk.
+    if !reused.is_empty() {
+        context.store.update(&reused)?;
+        result.chunks_updated += reused.len();
     }
 
     if !docs_to_embed.is_empty() {

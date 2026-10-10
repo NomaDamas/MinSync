@@ -55,10 +55,6 @@ pub(super) fn id_in_filter<'a>(ids: impl Iterator<Item = &'a str>) -> String {
     format!("id IN ({values})")
 }
 
-pub(super) fn sql_literal(value: &str) -> String {
-    format!("'{}'", escape_sql_literal(value))
-}
-
 pub(super) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -96,12 +92,6 @@ mod tests {
             "id IN ('a', 'o''brien')"
         );
         assert_eq!(id_in_filter(std::iter::empty()), "id IN ()");
-    }
-
-    #[test]
-    fn test_sql_literal_quotes_and_escapes() {
-        assert_eq!(sql_literal("plain"), "'plain'");
-        assert_eq!(sql_literal("it's"), "'it''s'");
     }
 
     #[test]

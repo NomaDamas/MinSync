@@ -29,6 +29,8 @@ pub(super) enum Command {
         resp: Resp<Vec<QueryHit>>,
     },
     Flush(Resp<()>),
+    Checkpoint(Resp<()>),
+    FragmentCount(Resp<usize>),
     DocCount(Resp<usize>),
     AllPaths(Resp<Vec<String>>),
     IndexNames(Resp<Vec<String>>),
@@ -92,6 +94,10 @@ pub(super) fn run_worker(
                 resp,
             } => send_response(resp, rt.block_on(inner.query_text(text, filter, topk))),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
+            Command::Checkpoint(resp) => send_response(resp, rt.block_on(inner.checkpoint())),
+            Command::FragmentCount(resp) => {
+                send_response(resp, rt.block_on(inner.fragment_count()));
+            }
             Command::DocCount(resp) => send_response(resp, rt.block_on(inner.doc_count())),
             Command::AllPaths(resp) => send_response(resp, rt.block_on(inner.all_paths())),
             Command::IndexNames(resp) => send_response(resp, rt.block_on(inner.index_names())),

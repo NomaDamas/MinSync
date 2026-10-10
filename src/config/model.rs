@@ -14,6 +14,34 @@ pub struct Config {
     pub lexical: LexicalConfig,
     #[serde(default)]
     pub normalize: NormalizeConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
+}
+
+/// Default for [`SyncConfig::checkpoint_every_files`].
+pub const DEFAULT_CHECKPOINT_EVERY_FILES: usize = 50;
+
+/// Knobs for the sync loop itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncConfig {
+    /// Every N processed files a running sync checkpoints: it flushes its
+    /// resume log, compacts fragments and prunes old versions, so a sync
+    /// killed mid-way (timeout, crash) neither loses its progress nor leaves
+    /// a store that is slower to reopen.
+    #[serde(default = "default_checkpoint_every_files")]
+    pub checkpoint_every_files: usize,
+}
+
+fn default_checkpoint_every_files() -> usize {
+    DEFAULT_CHECKPOINT_EVERY_FILES
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_every_files: DEFAULT_CHECKPOINT_EVERY_FILES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +264,7 @@ impl Config {
             },
             lexical: LexicalConfig::default(),
             normalize: NormalizeConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }

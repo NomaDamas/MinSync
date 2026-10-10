@@ -73,6 +73,9 @@ pub enum Commands {
     },
     /// Show sync status
     Status,
+    /// Compact, re-index and prune the vector store without syncing.
+    /// Recovers stores left fragmented by interrupted syncs.
+    Optimize,
     /// Check environment health
     Check,
     /// Verify index consistency

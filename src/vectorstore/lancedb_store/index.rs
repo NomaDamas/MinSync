@@ -2,14 +2,21 @@
 
 use super::{to_store_error, DISTANCE_TYPE, VECTOR_COLUMN};
 use crate::error::{MinSyncError, Result};
+use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::vector::IvfHnswSqIndexBuilder;
 use lancedb::index::Index;
-use lancedb::table::{OptimizeAction, OptimizeOptions};
+use lancedb::table::{CompactionOptions, OptimizeAction, OptimizeOptions};
 use lancedb::Table;
 
 pub(super) const DEFAULT_INDEX_BUILD_THRESHOLD: usize = 256;
 pub(super) const DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD: usize = 10_000;
+pub(super) const DEFAULT_COMPACT_FRAGMENT_THRESHOLD: usize = 64;
+
+/// Columns every sync filter hits: `id` (fetch / metadata update / upsert
+/// replace) and `path` (per-file sweep). Without a scalar index each such
+/// predicate opens every fragment, so cost grows with fragment count.
+const SCALAR_INDEX_COLUMNS: &[&str] = &["id", "path"];
 
 /// ANN index maintenance thresholds. These are tuning knobs, not capacity
 /// limits: any number of vectors can be stored and searched regardless of these
@@ -33,6 +40,10 @@ pub struct IndexingConfig {
     /// recurring incremental `optimize` runs. Raise it to optimize less often,
     /// lower it to keep query latency tighter.
     pub index_optimize_delta_threshold: usize,
+    /// Mid-sync `checkpoint` compacts once the table has at least this many
+    /// fragments. Bounds how fragmented the store can get inside one long
+    /// sync (and so how slow a killed-and-restarted sync is to reopen).
+    pub compact_fragment_threshold: usize,
 }
 
 impl Default for IndexingConfig {
@@ -40,6 +51,7 @@ impl Default for IndexingConfig {
         Self {
             index_build_threshold: DEFAULT_INDEX_BUILD_THRESHOLD,
             index_optimize_delta_threshold: DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD,
+            compact_fragment_threshold: DEFAULT_COMPACT_FRAGMENT_THRESHOLD,
         }
     }
 }
@@ -60,6 +72,10 @@ impl IndexingConfig {
             config.index_optimize_delta_threshold =
                 parse_positive_usize(value, "index_optimize_delta_threshold")?;
         }
+        if let Some(value) = options.get("compact_fragment_threshold") {
+            config.compact_fragment_threshold =
+                parse_positive_usize(value, "compact_fragment_threshold")?;
+        }
         Ok(config)
     }
 }
@@ -76,6 +92,73 @@ fn parse_positive_usize(value: &toml::Value, key: &str) -> Result<usize> {
         )));
     }
     Ok(parsed)
+}
+
+/// Create the BTree indexes on [`SCALAR_INDEX_COLUMNS`] if missing and fold
+/// rows written since the last build into them. Returns without touching the
+/// table when everything is already current.
+pub(super) async fn maintain_scalar_indexes(table: &Table) -> Result<()> {
+    let indices = table.list_indices().await.map_err(to_store_error)?;
+    let mut names = Vec::new();
+    for column in SCALAR_INDEX_COLUMNS {
+        match indices
+            .iter()
+            .find(|index| index.columns.iter().any(|c| c == column))
+        {
+            Some(index) => names.push(index.name.clone()),
+            None => {
+                table
+                    .create_index(&[*column], Index::BTree(BTreeIndexBuilder::default()))
+                    .execute()
+                    .await
+                    .map_err(to_store_error)?;
+            }
+        }
+    }
+    let mut stale = Vec::new();
+    for name in names {
+        let unindexed = table
+            .index_stats(&name)
+            .await
+            .map_err(to_store_error)?
+            .map(|stats| stats.num_unindexed_rows)
+            .unwrap_or(0);
+        if unindexed > 0 {
+            stale.push(name);
+        }
+    }
+    if !stale.is_empty() {
+        // `OptimizeOptions` is non_exhaustive: set fields on a default value.
+        let mut options = OptimizeOptions::default();
+        options.index_names = Some(stale);
+        table
+            .optimize(OptimizeAction::Index(options))
+            .await
+            .map_err(to_store_error)?;
+    }
+    Ok(())
+}
+
+/// Compact all fragments (rewriting deletions) when the table holds at
+/// least `threshold` of them. Returns whether a compaction ran.
+pub(super) async fn compact_if_fragmented(table: &Table, threshold: usize) -> Result<bool> {
+    let fragments = table
+        .stats()
+        .await
+        .map_err(to_store_error)?
+        .fragment_stats
+        .num_fragments;
+    if fragments < threshold {
+        return Ok(false);
+    }
+    table
+        .optimize(OptimizeAction::Compact {
+            options: CompactionOptions::default(),
+            remap_options: None,
+        })
+        .await
+        .map_err(to_store_error)?;
+    Ok(true)
 }
 
 /// Ensure the vector column is ANN-indexed and keep that index current.

@@ -74,6 +74,7 @@ minsync watch --watch-on-sync-error   # stay alive and retry after initial sync 
 minsync status                        # sync state
 minsync check                         # health check
 minsync verify --fix                  # consistency check + repair
+minsync optimize                      # compact + re-index + prune the store
 ```
 
 Select the BM25 tokenizer preset during initialization:
@@ -150,6 +151,7 @@ State lives in `.minsync/`:
 | `manifest.json` | last known file metadata and content hashes |
 | `cursor.json` | last completed processing point |
 | `txn.json` | in-progress transaction marker |
+| `progress.jsonl` | files already committed by an interrupted sync (resume log) |
 | `lock` | process lock |
 
 Delete `.minsync/` to start fresh.
@@ -222,9 +224,23 @@ MinSync builds an IVF-HNSW-SQ ANN index after `index_build_threshold` rows and i
 
 Agents adding another vector store should implement the `VectorStore` trait and wire the new id through `create_vectorstore`. See `docs/EXTENDING.md` and `skills/minsync/SKILL.md` for the agent-facing extension checklist.
 
+### Write path, checkpoints and `optimize`
+
+A sync writes each file with one commit per operation (batched metadata update, one replace-or-insert for new chunks), keeps BTree indexes on `id` and `path` so per-file filters stay index lookups, and every `[sync] checkpoint_every_files` files (default 50) compacts fragments (once there are at least `compact_fragment_threshold`, default 64) and prunes old versions. A running sync logs `sync progress` at each checkpoint.
+
+```toml
+[sync]
+checkpoint_every_files = 50   # 0 disables mid-sync checkpoints
+
+[vectorstore.options]
+compact_fragment_threshold = 64
+```
+
+`minsync optimize` runs only compact + re-index + prune (no embedding, no file reads) to repair a store that earlier interrupted syncs left fragmented.
+
 ## Embedding Reliability
 
-Embedding requests use per-request timeouts and retry transient failures: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed sync never advances the cursor or manifest, so the next `minsync sync` resumes safely.
+Embedding requests use per-request timeouts and retry transient failures: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or lexical language changed in between.
 
 ```toml
 [embedder]

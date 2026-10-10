@@ -34,6 +34,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
         }
         Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
         Commands::Status => status(&cli.format, &minsync_dir).await,
+        Commands::Optimize => optimize(&cli.format, &minsync_dir),
         Commands::Check => check(&cli.format, &minsync_dir).await,
         Commands::Verify { fix, all, sample } => {
             verify(&cli.format, root, &minsync_dir, fix, all, sample).await
@@ -232,6 +233,28 @@ async fn status(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+    }
+    Ok(())
+}
+
+/// `minsync optimize`: compact + re-index + prune only. Takes the writer
+/// lock (never races a sync) but embeds nothing and reads no source files,
+/// so it can repair a store too fragmented for `sync` to make progress.
+fn optimize(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> {
+    require_initialized(minsync_dir)?;
+    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
+    let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
+    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
+    let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
+    let started = std::time::Instant::now();
+    store.flush()?;
+    let elapsed = started.elapsed().as_secs_f64();
+    match format {
+        OutputFormat::Text => println!("Optimized store in {elapsed:.2}s."),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({ "optimized": true, "elapsed_seconds": elapsed })
+        ),
     }
     Ok(())
 }

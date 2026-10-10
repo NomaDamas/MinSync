@@ -1,10 +1,10 @@
 //! Async LanceDB operations executed on the worker thread.
 
-use super::filters::{filter_to_sql, id_in_filter, sql_literal};
-use super::index::maintain_index;
+use super::filters::{filter_to_sql, id_in_filter};
+use super::index::{compact_if_fragmented, maintain_index, maintain_scalar_indexes};
 use super::schema::{
     batch_to_documents, batch_to_fts_hits, batch_to_query_hits, dedupe_documents, docs_to_batch,
-    schema, string_col, validate_schema, validate_vector,
+    schema, string_col, updates_to_batch, validate_schema, validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
@@ -12,7 +12,7 @@ use super::{
 use crate::error::{MinSyncError, Result};
 use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchIterator};
 use futures::TryStreamExt;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
@@ -100,38 +100,48 @@ impl LanceDbInner {
         })
     }
 
+    /// Replace-or-insert `docs` by `id` in ONE commit. (Was `delete` + `add`:
+    /// two commits, and the delete scanned every fragment.)
     pub(super) async fn upsert(&self, docs: Vec<Document>) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
         }
         let docs = dedupe_documents(docs);
-        let id_filter = id_in_filter(docs.iter().map(|doc| doc.id.as_str()));
         let batch = docs_to_batch(&docs, self.dim, &self.language)?;
-        self.table
-            .delete(&id_filter)
-            .await
-            .map_err(to_store_error)?;
-        self.table
-            .add(batch)
-            .execute()
-            .await
-            .map_err(to_store_error)?;
-        Ok(())
+        self.merge_by_id(batch, true).await
     }
 
+    /// Rewrite `seen_token`/`path`/`heading_path` for every listed id in ONE
+    /// commit. Ids not present in the table are ignored, never inserted.
     pub(super) async fn update(&self, updates: Vec<DocumentUpdate>) -> Result<()> {
-        for update in updates {
-            let filter = format!("id = '{}'", super::filters::escape_sql_literal(&update.id));
-            self.table
-                .update()
-                .only_if(filter)
-                .column("seen_token", sql_literal(&update.seen_token))
-                .column("path", sql_literal(&update.path))
-                .column("heading_path", sql_literal(&update.heading_path))
-                .execute()
-                .await
-                .map_err(to_store_error)?;
+        if updates.is_empty() {
+            return Ok(());
         }
+        // merge_insert rejects several source rows matching one target row;
+        // keep the last update per id, like `dedupe_documents` does for upsert.
+        let mut last: std::collections::HashMap<&str, &DocumentUpdate> =
+            std::collections::HashMap::with_capacity(updates.len());
+        for update in &updates {
+            last.insert(update.id.as_str(), update);
+        }
+        let mut ordered: Vec<&DocumentUpdate> = last.into_values().collect();
+        ordered.sort_by(|a, b| a.id.cmp(&b.id));
+        let batch = updates_to_batch(&ordered)?;
+        self.merge_by_id(batch, false).await
+    }
+
+    async fn merge_by_id(&self, batch: RecordBatch, insert_new: bool) -> Result<()> {
+        let batch_schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], batch_schema);
+        let mut merge = self.table.merge_insert(&["id"]);
+        merge.when_matched_update_all(None);
+        if insert_new {
+            merge.when_not_matched_insert_all();
+        }
+        merge
+            .execute(Box::new(reader))
+            .await
+            .map_err(to_store_error)?;
         Ok(())
     }
 
@@ -147,8 +157,31 @@ impl LanceDbInner {
 
     pub(super) async fn delete_by_filter(&self, filter: Filter) -> Result<usize> {
         let sql = filter_to_sql(&filter)?;
+        // A delete that removes nothing still commits a new table version.
+        // The per-file stale sweep matches nothing for most files, so probe
+        // first (an index lookup once `id`/`path` are indexed) to keep those
+        // from piling up versions.
+        if self
+            .table
+            .count_rows(Some(sql.clone()))
+            .await
+            .map_err(to_store_error)?
+            == 0
+        {
+            return Ok(0);
+        }
         let result = self.table.delete(&sql).await.map_err(to_store_error)?;
         usize::try_from(result.num_deleted_rows).map_err(to_store_error)
+    }
+
+    pub(super) async fn fragment_count(&self) -> Result<usize> {
+        Ok(self
+            .table
+            .stats()
+            .await
+            .map_err(to_store_error)?
+            .fragment_stats
+            .num_fragments)
     }
 
     pub(super) async fn query(
@@ -268,7 +301,22 @@ impl LanceDbInner {
             })
             .await
             .map_err(to_store_error)?;
+        maintain_scalar_indexes(&self.table).await?;
         maintain_index(&self.table, &self.indexing).await?;
+        self.prune().await
+    }
+
+    /// Mid-sync maintenance: keep `id`/`path` scalar indexes current (so the
+    /// per-file filters stay index lookups instead of fragment scans), compact
+    /// when fragments pile up, and prune old versions. Never retrains the
+    /// ANN/FTS indexes — that stays in [`Self::flush`].
+    pub(super) async fn checkpoint(&self) -> Result<()> {
+        compact_if_fragmented(&self.table, self.indexing.compact_fragment_threshold).await?;
+        maintain_scalar_indexes(&self.table).await?;
+        self.prune().await
+    }
+
+    async fn prune(&self) -> Result<()> {
         // Keep recent versions alive long enough for lock-free concurrent
         // readers (`minsync query` no longer takes the writer lock): a reader
         // pins the latest version at open time, so pruning only versions older
