@@ -25,7 +25,7 @@ async fn main() {
     let minsync_dir = root.join(".minsync");
 
     match minsync::commands::run(cli, root, minsync_dir).await {
-        Ok(()) => process::exit(0),
+        Ok(code) => process::exit(code),
         Err(error) => {
             eprintln!("Error: {error}");
             process::exit(error.exit_code());

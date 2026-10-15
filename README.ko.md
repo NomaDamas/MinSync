@@ -224,6 +224,24 @@ compact_fragment_threshold = 64
 
 `minsync optimize`는 compact + re-index + prune만 수행합니다(embedding, 파일 읽기 없음). 중단된 sync 때문에 조각난 store를 복구할 때 사용하세요.
 
+## 건너뛴 파일
+
+기본 설정에서는 파일 하나가 실패해도 sync 전체가 중단되지 않습니다. read, chunk, token 수 계산, embed 단계에서 실패한 파일(EACCES, EBUSY, EIO, parser 오류, embedder의 입력 거부 등)은 건너뛰고 기록합니다. batch commit이 실패하면 그 batch를 파일 단위로 다시 시도해 원인 파일만 건너뜁니다. 건너뛴 파일은 저장되는 manifest에서 빠지므로 다음 `minsync sync`가 자동으로 다시 시도하고, 이전에 색인된 파일이라면 성공할 때까지 기존 chunk가 검색됩니다.
+
+```json
+"files_failed": [
+  { "path": "notes/broken.pdf", "stage": "read", "error": "io error: notes/broken.pdf: Permission denied (os error 13)" }
+],
+"partial": true
+```
+
+`stage`는 `read`, `chunk`, `truncate`, `embed`, `store` 중 하나입니다. `partial`이 true이면 CLI는 종료 코드 **6**(완료, 일부 파일 건너뜀)으로 끝나고, text 출력은 건너뛴 경로를 stderr에 나열합니다. 하드 실패의 종료 코드(1, 3, 4, 5)는 그대로입니다. 아직 아무것도 색인하지 못한 실행에서 처음 몇 개 파일이 embed/store 단계에서 연속 실패하면(예: embedder 중단) 파일 문제가 아니라 장애로 보고, 파일 경로가 포함된 오류(종료 코드 5/4)로 sync를 중단합니다.
+
+```toml
+[sync]
+on_file_error = "skip"   # "fail"이면 첫 실패 파일에서 중단(기존 동작)
+```
+
 ## Embedding 안정성
 
 Embedding request는 per-request timeout과 transient failure retry를 사용합니다. Retry 대상은 network error, timeout, HTTP 429, HTTP 5xx입니다. Invalid auth, malformed response, validation error 같은 permanent failure는 즉시 실패합니다. 실패하거나 강제 종료된 sync는 cursor나 manifest를 전진시키지 않지만 resume log(`progress.jsonl`)를 남깁니다. 다음 `minsync sync`는 중단된 실행이 이미 commit한 파일을 건너뛰고 이어서 처리합니다. 그 사이 파일, chunker, normalizer, embedder, lexical language가 바뀌면 log는 폐기됩니다.

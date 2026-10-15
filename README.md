@@ -254,6 +254,24 @@ compact_fragment_threshold = 64
 
 `minsync optimize` runs only compact + re-index + prune (no embedding, no file reads) to repair a store that earlier interrupted syncs left fragmented.
 
+## Skipped files
+
+By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. The skipped file is left out of the saved manifest, so the next `minsync sync` retries it automatically, and its old chunks (if it was indexed before) stay searchable until it succeeds.
+
+```json
+"files_failed": [
+  { "path": "notes/broken.pdf", "stage": "read", "error": "io error: notes/broken.pdf: Permission denied (os error 13)" }
+],
+"partial": true
+```
+
+`stage` is one of `read`, `chunk`, `truncate`, `embed`, `store`. When `partial` is true the CLI exits with code **6** (completed, files skipped) and text output lists each skipped path on stderr. Hard failures keep their codes (1, 3, 4, 5). An embed/store failure that hits the first few files of a run with nothing indexed yet (for example the embedder being down) is treated as an outage, not as bad files: the sync aborts with that error (exit 5/4) and the file path in the message.
+
+```toml
+[sync]
+on_file_error = "skip"   # "fail" aborts on the first failing file (the pre-0.5 behavior)
+```
+
 ## Embedding Reliability
 
 Embedding requests use per-request timeouts and retry transient failures: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or lexical language changed in between.

@@ -34,6 +34,13 @@ pub struct ScanStats {
     pub bytes_hashed: u64,
 }
 
+/// A file the tolerant scan could not stat or hash.
+#[derive(Debug)]
+pub struct ScanFailure {
+    pub path: String,
+    pub error: MinSyncError,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileChange {
     Added(String),
@@ -68,6 +75,29 @@ impl Manifest {
         source_id: &str,
         baseline: Option<&Manifest>,
     ) -> Result<(Self, ScanStats)> {
+        Self::scan_inner(root, source_id, baseline, None)
+    }
+
+    /// Like [`Manifest::scan_with_baseline`], but a file that cannot be
+    /// stat'ed or hashed (EACCES, EBUSY, EIO, ...) is left out of the
+    /// manifest and returned as a [`ScanFailure`] instead of aborting the
+    /// scan.
+    pub fn scan_with_baseline_tolerant(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+    ) -> Result<(Self, Vec<ScanFailure>)> {
+        let mut failures = Vec::new();
+        let (manifest, _) = Self::scan_inner(root, source_id, baseline, Some(&mut failures))?;
+        Ok((manifest, failures))
+    }
+
+    fn scan_inner(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        mut failures: Option<&mut Vec<ScanFailure>>,
+    ) -> Result<(Self, ScanStats)> {
         let mut manifest = Self::new(source_id);
         let mut stats = ScanStats::default();
         let walker = WalkBuilder::new(root)
@@ -88,41 +118,66 @@ impl Manifest {
 
             stats.files_examined += 1;
             let path = entry.path();
-            let metadata = fs::metadata(path)?;
-            let modified = metadata.modified()?;
-            let mtime_ns = modified
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| MinSyncError::Manifest(error.to_string()))?
-                .as_nanos();
             let relative_path = path
                 .strip_prefix(root)
                 .map_err(|error| MinSyncError::Manifest(error.to_string()))?;
             let manifest_path = relative_path.to_string_lossy().replace('\\', "/");
-            let fingerprint = metadata_fingerprint(&metadata, mtime_ns);
-            let content_hash = match baseline
-                .and_then(|manifest| manifest.files.get(&manifest_path))
-                .filter(|entry| fingerprint.is_some() && entry.fingerprint == fingerprint)
-            {
-                Some(entry) => entry.content_hash.clone(),
-                None => {
-                    stats.files_rehashed += 1;
-                    stats.bytes_hashed += metadata.len();
-                    hash_file(path)?
+            match Self::scan_file(path, &manifest_path, baseline, &mut stats) {
+                Ok(file_entry) => {
+                    manifest.files.insert(manifest_path, file_entry);
                 }
-            };
-
-            manifest.files.insert(
-                manifest_path,
-                ManifestFileEntry {
-                    size: metadata.len(),
-                    mtime_ns,
-                    content_hash,
-                    fingerprint,
+                Err(error) => match failures.as_deref_mut() {
+                    Some(failures) => failures.push(ScanFailure {
+                        path: manifest_path,
+                        error,
+                    }),
+                    // Strict scan: abort, but say which file.
+                    None => {
+                        return Err(match error {
+                            MinSyncError::Io(io) => MinSyncError::Io(std::io::Error::new(
+                                io.kind(),
+                                format!("{manifest_path}: {io}"),
+                            )),
+                            other => other,
+                        })
+                    }
                 },
-            );
+            }
         }
 
         Ok((manifest, stats))
+    }
+
+    fn scan_file(
+        path: &Path,
+        manifest_path: &str,
+        baseline: Option<&Manifest>,
+        stats: &mut ScanStats,
+    ) -> Result<ManifestFileEntry> {
+        let metadata = fs::metadata(path)?;
+        let modified = metadata.modified()?;
+        let mtime_ns = modified
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| MinSyncError::Manifest(error.to_string()))?
+            .as_nanos();
+        let fingerprint = metadata_fingerprint(&metadata, mtime_ns);
+        let content_hash = match baseline
+            .and_then(|manifest| manifest.files.get(manifest_path))
+            .filter(|entry| fingerprint.is_some() && entry.fingerprint == fingerprint)
+        {
+            Some(entry) => entry.content_hash.clone(),
+            None => {
+                stats.files_rehashed += 1;
+                stats.bytes_hashed += metadata.len();
+                hash_file(path)?
+            }
+        };
+        Ok(ManifestFileEntry {
+            size: metadata.len(),
+            mtime_ns,
+            content_hash,
+            fingerprint,
+        })
     }
 
     pub fn diff(old: &Manifest, new: &Manifest) -> Vec<FileChange> {

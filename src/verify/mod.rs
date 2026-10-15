@@ -56,7 +56,8 @@ pub async fn verify(
             .is_some_and(|active_cursor| active_cursor.chunk_schema_id == chunker.schema_id()),
     );
 
-    let manifest = Manifest::scan(root, &config.source_id)?;
+    // Tolerant: files sync skipped as unreadable are simply not verified.
+    let (manifest, _) = Manifest::scan_with_baseline_tolerant(root, &config.source_id, None)?;
     let stale_paths = find_stale_paths(&manifest, store);
     basic_checks.insert("no_stale_paths".to_string(), stale_paths.is_empty());
 

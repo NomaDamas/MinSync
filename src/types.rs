@@ -39,6 +39,47 @@ pub struct SyncResult {
     /// committed them (crash resume). NOT included in `files_processed`.
     #[serde(default)]
     pub files_resumed: usize,
+    /// Files that could not be indexed (unreadable, unparseable, embed or
+    /// store failure) and were skipped when `[sync] on_file_error = "skip"`.
+    /// They are retried by the next sync.
+    #[serde(default)]
+    pub files_failed: Vec<FileFailure>,
+    /// True iff `files_failed` is non-empty: the run completed but skipped
+    /// files. The CLI exits with a distinct code for it.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// Pipeline stage that failed for one file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileStage {
+    Read,
+    Chunk,
+    Truncate,
+    Embed,
+    Store,
+}
+
+impl std::fmt::Display for FileStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Chunk => "chunk",
+            Self::Truncate => "truncate",
+            Self::Embed => "embed",
+            Self::Store => "store",
+        })
+    }
+}
+
+/// One skipped file: where it failed and why. `error` is the bare error
+/// text; the path is its own field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileFailure {
+    pub path: String,
+    pub stage: FileStage,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

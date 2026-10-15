@@ -66,7 +66,9 @@ fn status_result(
 
 fn load_or_scan_manifest(minsync_dir: &Path, config: &Config) -> Result<Manifest> {
     if let Some(root) = minsync_dir.parent() {
-        return Manifest::scan(root, &config.source_id);
+        // Tolerant: a file sync skipped as unreadable must not make status fail.
+        return Manifest::scan_with_baseline_tolerant(root, &config.source_id, None)
+            .map(|(manifest, _)| manifest);
     }
 
     Manifest::load(&minsync_dir.join("manifest.json"))
