@@ -3,7 +3,7 @@ use chrono::Utc;
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -27,11 +27,32 @@ pub struct ManifestFileEntry {
     pub fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Why a path could not be inspected during a scan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanErrorKind {
+    /// May succeed on a later scan (`EIO`, `EBUSY`, `ETIMEDOUT`, `ESTALE`).
+    Transient,
+    /// Needs user action (`EACCES`, `EPERM`, `EISDIR`, symlink loops, ...).
+    Permanent,
+}
+
+/// A per-entry scan failure. The scan continues past it; the entry's state
+/// is *unknown*, never "deleted".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanError {
+    /// Manifest-relative path of the file or directory that failed.
+    pub path: String,
+    pub kind: ScanErrorKind,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanStats {
     pub files_examined: usize,
     pub files_rehashed: usize,
     pub bytes_hashed: u64,
+    pub errors: Vec<ScanError>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,10 +84,30 @@ impl Manifest {
         Self::scan_with_baseline_stats(root, source_id, baseline).map(|(manifest, _)| manifest)
     }
 
+    /// Scan `root`, tolerating per-entry failures.
+    ///
+    /// A walk, `stat`, or read error on one entry never aborts the scan: it is
+    /// recorded in [`ScanStats::errors`] and the entry is left out of the
+    /// returned manifest. Entries that vanished (`ENOENT`/`ENOTDIR`) are
+    /// simply absent, like any deleted file. Callers that keep previously
+    /// indexed state MUST pass the result through [`Manifest::carry_unknown`]
+    /// so that errored entries are treated as unknown rather than deleted.
+    ///
+    /// An error on `root` itself is still fatal: nothing can be said about
+    /// any entry, and treating it as "all files deleted" would be destructive.
     pub fn scan_with_baseline_stats(
         root: &Path,
         source_id: &str,
         baseline: Option<&Manifest>,
+    ) -> Result<(Self, ScanStats)> {
+        Self::scan_with_fs(root, source_id, baseline, &RealFs)
+    }
+
+    fn scan_with_fs(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        io: &dyn ScanFs,
     ) -> Result<(Self, ScanStats)> {
         let mut manifest = Self::new(source_id);
         let mut stats = ScanStats::default();
@@ -77,7 +118,13 @@ impl Manifest {
             .build();
 
         for entry in walker {
-            let entry = entry.map_err(|error| MinSyncError::Manifest(error.to_string()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    record_walk_error(root, &error, &mut stats)?;
+                    continue;
+                }
+            };
             let file_type = entry.file_type().ok_or_else(|| {
                 MinSyncError::Manifest(format!("missing file type: {}", entry.path().display()))
             })?;
@@ -86,29 +133,51 @@ impl Manifest {
                 continue;
             }
 
-            stats.files_examined += 1;
             let path = entry.path();
-            let metadata = fs::metadata(path)?;
-            let modified = metadata.modified()?;
-            let mtime_ns = modified
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| MinSyncError::Manifest(error.to_string()))?
-                .as_nanos();
             let relative_path = path
                 .strip_prefix(root)
                 .map_err(|error| MinSyncError::Manifest(error.to_string()))?;
             let manifest_path = relative_path.to_string_lossy().replace('\\', "/");
+            stats.files_examined += 1;
+            let metadata = match io.metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    record_io_error(&mut stats, manifest_path, &error);
+                    continue;
+                }
+            };
+            let mtime_ns = match metadata
+                .modified()
+                .map_err(|error| error.to_string())
+                .and_then(|modified| {
+                    modified
+                        .duration_since(UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_nanos())
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(mtime_ns) => mtime_ns,
+                Err(message) => {
+                    record_error(&mut stats, manifest_path, ScanErrorKind::Permanent, message);
+                    continue;
+                }
+            };
             let fingerprint = metadata_fingerprint(&metadata, mtime_ns);
             let content_hash = match baseline
                 .and_then(|manifest| manifest.files.get(&manifest_path))
                 .filter(|entry| fingerprint.is_some() && entry.fingerprint == fingerprint)
             {
                 Some(entry) => entry.content_hash.clone(),
-                None => {
-                    stats.files_rehashed += 1;
-                    stats.bytes_hashed += metadata.len();
-                    hash_file(path)?
-                }
+                None => match io.hash_file(path) {
+                    Ok(hash) => {
+                        stats.files_rehashed += 1;
+                        stats.bytes_hashed += metadata.len();
+                        hash
+                    }
+                    Err(error) => {
+                        record_io_error(&mut stats, manifest_path, &error);
+                        continue;
+                    }
+                },
             };
 
             manifest.files.insert(
@@ -123,6 +192,49 @@ impl Manifest {
         }
 
         Ok((manifest, stats))
+    }
+
+    /// Scan like [`Manifest::scan_with_baseline_stats`], then carry every
+    /// `carry_from` entry the scan could not inspect (see
+    /// [`Manifest::carry_unknown`]). Returns the manifest, the stats (with
+    /// `errors`), and the carried paths.
+    ///
+    /// `baseline` only speeds up hashing; `carry_from` decides what stays
+    /// "known". A forced full sync passes `baseline: None` yet still carries
+    /// from the stored manifest.
+    pub fn scan_keeping_unknown(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        carry_from: Option<&Manifest>,
+    ) -> Result<(Self, ScanStats, Vec<String>)> {
+        let (mut manifest, stats) = Self::scan_with_baseline_stats(root, source_id, baseline)?;
+        let carried = match carry_from {
+            Some(previous) => manifest.carry_unknown(previous, &stats.errors),
+            None => Vec::new(),
+        };
+        Ok((manifest, stats, carried))
+    }
+
+    /// Treat every entry of `previous` at or under a path in `errors` as
+    /// *unknown*: copy it into `self` so [`Manifest::diff`] reports no change
+    /// and nothing downstream deletes its indexed chunks. Returns the copied
+    /// paths. This is the guarantee behind "scan errors never delete existing
+    /// chunks".
+    pub fn carry_unknown(&mut self, previous: &Manifest, errors: &[ScanError]) -> Vec<String> {
+        if errors.is_empty() {
+            return Vec::new();
+        }
+        let unknown: HashSet<&str> = errors.iter().map(|error| error.path.as_str()).collect();
+        let mut carried = Vec::new();
+        for (path, entry) in &previous.files {
+            if !self.files.contains_key(path) && is_under_unknown(path, &unknown) {
+                self.files.insert(path.clone(), entry.clone());
+                carried.push(path.clone());
+            }
+        }
+        carried.sort();
+        carried
     }
 
     pub fn diff(old: &Manifest, new: &Manifest) -> Vec<FileChange> {
@@ -208,11 +320,113 @@ fn prefixed_sha256(content: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn hash_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+trait ScanFs {
+    fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata>;
+    fn hash_file(&self, path: &Path) -> std::io::Result<String>;
+}
+
+struct RealFs;
+
+impl ScanFs for RealFs {
+    fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+        fs::metadata(path)
+    }
+
+    fn hash_file(&self, path: &Path) -> std::io::Result<String> {
+        let mut file = fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    }
+}
+
+enum IoClass {
+    /// Definitively not there (`ENOENT`, `ENOTDIR`): same as a deletion.
+    Gone,
+    Transient,
+    Permanent,
+}
+
+fn classify_io(error: &std::io::Error) -> IoClass {
+    use std::io::ErrorKind;
+
+    #[cfg(unix)]
+    match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTDIR) => return IoClass::Gone,
+        Some(libc::EIO | libc::EBUSY | libc::ETIMEDOUT | libc::ESTALE) => {
+            return IoClass::Transient
+        }
+        _ => {}
+    }
+
+    match error.kind() {
+        ErrorKind::NotFound => IoClass::Gone,
+        ErrorKind::TimedOut
+        | ErrorKind::ResourceBusy
+        | ErrorKind::StaleNetworkFileHandle
+        | ErrorKind::Interrupted => IoClass::Transient,
+        _ => IoClass::Permanent,
+    }
+}
+
+fn record_error(stats: &mut ScanStats, path: String, kind: ScanErrorKind, error: String) {
+    tracing::warn!(path = %path, ?kind, %error, "scan error: entry skipped, existing chunks kept");
+    stats.errors.push(ScanError { path, kind, error });
+}
+
+fn record_io_error(stats: &mut ScanStats, path: String, error: &std::io::Error) {
+    let kind = match classify_io(error) {
+        IoClass::Gone => {
+            tracing::debug!(path = %path, %error, "entry vanished during scan");
+            return;
+        }
+        IoClass::Transient => ScanErrorKind::Transient,
+        IoClass::Permanent => ScanErrorKind::Permanent,
+    };
+    record_error(stats, path, kind, error.to_string());
+}
+
+/// Record a walker error against the entry it names. Errors with no path, or
+/// on `root` itself, stay fatal (see [`Manifest::scan_with_baseline_stats`]).
+fn record_walk_error(root: &Path, error: &ignore::Error, stats: &mut ScanStats) -> Result<()> {
+    let relative = walk_error_path(error)
+        .and_then(|path| path.strip_prefix(root).ok())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty());
+    let Some(path) = relative else {
+        return Err(MinSyncError::Manifest(error.to_string()));
+    };
+    match error.io_error() {
+        Some(io_error) => record_io_error(stats, path, io_error),
+        None => record_error(stats, path, ScanErrorKind::Permanent, error.to_string()),
+    }
+    Ok(())
+}
+
+fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
+/// True when `path` or any of its ancestor directories is in `unknown`.
+fn is_under_unknown(path: &str, unknown: &HashSet<&str>) -> bool {
+    let mut candidate = path;
+    loop {
+        if unknown.contains(candidate) {
+            return true;
+        }
+        match candidate.rfind('/') {
+            Some(index) => candidate = &candidate[..index],
+            None => return false,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -586,5 +800,174 @@ mod tests {
         let second = manifest_with(&[("b.txt", "sha256:same")]);
 
         assert_ne!(first.manifest_hash(), second.manifest_hash());
+    }
+
+    /// Injects per-path I/O failures into the scan.
+    struct FaultyFs {
+        metadata_errors: Vec<(&'static str, i32)>,
+        hash_errors: Vec<(&'static str, i32)>,
+    }
+
+    impl FaultyFs {
+        fn lookup(table: &[(&'static str, i32)], path: &Path) -> Option<std::io::Error> {
+            let name = path.file_name()?.to_str()?;
+            table
+                .iter()
+                .find(|(file, _)| *file == name)
+                .map(|(_, errno)| std::io::Error::from_raw_os_error(*errno))
+        }
+    }
+
+    impl ScanFs for FaultyFs {
+        fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+            match Self::lookup(&self.metadata_errors, path) {
+                Some(error) => Err(error),
+                None => RealFs.metadata(path),
+            }
+        }
+
+        fn hash_file(&self, path: &Path) -> std::io::Result<String> {
+            match Self::lookup(&self.hash_errors, path) {
+                Some(error) => Err(error),
+                None => RealFs.hash_file(path),
+            }
+        }
+    }
+
+    fn scan_faulty(dir: &Path, faulty: &FaultyFs) -> (Manifest, ScanStats) {
+        Manifest::scan_with_fs(dir, "source-1", None, faulty).expect("scan survives entry errors")
+    }
+
+    fn three_files() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(dir.path().join(name), name).expect("write file");
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_transient_metadata_error_is_recorded_not_fatal() {
+        let dir = three_files();
+        let faulty = FaultyFs {
+            metadata_errors: vec![("b.txt", libc::EIO)],
+            hash_errors: vec![],
+        };
+
+        let (manifest, stats) = scan_faulty(dir.path(), &faulty);
+
+        assert!(manifest.files.contains_key("a.txt"));
+        assert!(manifest.files.contains_key("c.txt"));
+        assert!(!manifest.files.contains_key("b.txt"));
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].path, "b.txt");
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::Transient);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_classifies_errno_kinds() {
+        let dir = three_files();
+        let faulty = FaultyFs {
+            metadata_errors: vec![("a.txt", libc::ESTALE)],
+            hash_errors: vec![("b.txt", libc::EACCES), ("c.txt", libc::EBUSY)],
+        };
+
+        let (manifest, stats) = scan_faulty(dir.path(), &faulty);
+
+        assert!(manifest.files.is_empty());
+        let kinds: HashMap<_, _> = stats
+            .errors
+            .iter()
+            .map(|error| (error.path.as_str(), error.kind))
+            .collect();
+        assert_eq!(kinds["a.txt"], ScanErrorKind::Transient);
+        assert_eq!(kinds["b.txt"], ScanErrorKind::Permanent);
+        assert_eq!(kinds["c.txt"], ScanErrorKind::Transient);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_vanished_file_is_gone_not_an_error() {
+        let dir = three_files();
+        let faulty = FaultyFs {
+            metadata_errors: vec![("a.txt", libc::ENOENT)],
+            hash_errors: vec![("b.txt", libc::ENOTDIR)],
+        };
+
+        let (manifest, stats) = scan_faulty(dir.path(), &faulty);
+
+        assert!(stats.errors.is_empty());
+        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), vec!["c.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_transient_error_never_yields_deleted_change() {
+        let dir = three_files();
+        let previous = Manifest::scan(dir.path(), "source-1").expect("baseline scan");
+        let faulty = FaultyFs {
+            metadata_errors: vec![("b.txt", libc::EIO)],
+            hash_errors: vec![],
+        };
+
+        let (mut current, stats) = scan_faulty(dir.path(), &faulty);
+        assert_eq!(
+            Manifest::diff(&previous, &current),
+            vec![FileChange::Deleted("b.txt".to_string())],
+            "precondition: raw diff alone would delete b.txt"
+        );
+        let carried = current.carry_unknown(&previous, &stats.errors);
+
+        assert_eq!(carried, vec!["b.txt"]);
+        assert!(Manifest::diff(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn test_carry_unknown_covers_descendants_of_an_errored_directory() {
+        let previous = manifest_with(&[
+            ("dir/a.txt", "sha256:a"),
+            ("dir/sub/b.txt", "sha256:b"),
+            ("dir2/c.txt", "sha256:c"),
+            ("other.txt", "sha256:o"),
+        ]);
+        let mut current = manifest_with(&[("other.txt", "sha256:o")]);
+        let errors = vec![ScanError {
+            path: "dir".to_string(),
+            kind: ScanErrorKind::Permanent,
+            error: "permission denied".to_string(),
+        }];
+
+        let carried = current.carry_unknown(&previous, &errors);
+
+        assert_eq!(carried, vec!["dir/a.txt", "dir/sub/b.txt"]);
+        assert_eq!(
+            Manifest::diff(&previous, &current),
+            vec![FileChange::Deleted("dir2/c.txt".to_string())],
+            "sibling with a shared name prefix is not unknown"
+        );
+    }
+
+    #[test]
+    fn test_carry_unknown_keeps_fresh_entry_over_stale_one() {
+        let previous = manifest_with(&[("a.txt", "sha256:old")]);
+        let mut current = manifest_with(&[("a.txt", "sha256:new")]);
+        let errors = vec![ScanError {
+            path: "a.txt".to_string(),
+            kind: ScanErrorKind::Transient,
+            error: "x".to_string(),
+        }];
+
+        assert!(current.carry_unknown(&previous, &errors).is_empty());
+        assert_eq!(current.files["a.txt"].content_hash, "sha256:new");
+    }
+
+    #[test]
+    fn test_scan_root_error_stays_fatal() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing = dir.path().join("does-not-exist");
+
+        assert!(Manifest::scan(&missing, "source-1").is_err());
     }
 }

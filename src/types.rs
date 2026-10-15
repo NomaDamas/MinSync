@@ -39,6 +39,10 @@ pub struct SyncResult {
     /// committed them (crash resume). NOT included in `files_processed`.
     #[serde(default)]
     pub files_resumed: usize,
+    /// Entries the manifest scan could not inspect (unreadable directory,
+    /// I/O error, ...). Their previously indexed chunks are kept untouched.
+    #[serde(default)]
+    pub scan_errors: Vec<crate::manifest::ScanError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

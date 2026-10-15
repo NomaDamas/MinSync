@@ -173,6 +173,21 @@ SHA-256. Filesystem writers that mutate content after metadata is observed
 remain subject to the normal concurrent-write race; run `--full` when an
 authoritative rescan is required.
 
+### Unreadable entries
+
+One bad entry never aborts a sync. A directory or file the scan cannot read
+(`EACCES`, `EPERM`, `EIO`, `EBUSY`, `ETIMEDOUT`, `ESTALE`, symlink loops, ...)
+is skipped and reported in the sync summary's `scan_errors` list
+(`path`, `kind` = `transient` or `permanent`, `error`) with one warning per
+entry. A path that vanished mid-scan (`ENOENT`, `ENOTDIR`) is treated as
+deleted, as before.
+
+**Guarantee:** an entry that errored is *unknown*, never *deleted*. Its
+previously indexed chunks are kept, including during `--full` sweeps, until a
+later scan can read the path again (or confirms it is gone). If the root
+directory itself is unreadable the sync still fails, since nothing can be said
+about any file.
+
 ## Chunkers
 
 | id | Strategy | Boundary stability under edits |

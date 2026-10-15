@@ -18,6 +18,7 @@ use indexer::{index_batch, BatchItem, BatchKind, SyncFileContext};
 use progress::{ProgressHeader, ProgressLog, PROGRESS_FILE};
 use result::{change_path, empty_sync_result};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 pub struct MinSync {
@@ -230,11 +231,12 @@ impl MinSync {
         // the `already_up_to_date` early return below is unreachable while
         // no cursor exists.
         let initial_sync = !cursor_path.exists();
-        let lexical_rebuild = if cursor_path.exists() {
-            Cursor::load(&cursor_path)?.lexical_language != config.lexical.language
+        let stored_lexical_language = if cursor_path.exists() {
+            Cursor::load(&cursor_path)?.lexical_language
         } else {
-            false
+            config.lexical.language.clone()
         };
+        let lexical_rebuild = stored_lexical_language != config.lexical.language;
         let full = full || initial_sync || lexical_rebuild;
 
         // Read the interrupted run's log BEFORE clearing its txn marker.
@@ -257,14 +259,35 @@ impl MinSync {
         };
         let scan_baseline = if full { None } else { stored_manifest.as_ref() };
         let start = std::time::Instant::now();
-        let new_manifest =
-            Manifest::scan_with_baseline(&self.root, &config.source_id, scan_baseline)?;
-        let changes = Manifest::diff(&old_manifest, &new_manifest);
+        // Entries the scan could not inspect are carried over from the stored
+        // manifest: unknown, never deleted (issue #79).
+        let (new_manifest, scan_stats, unknown_paths) = Manifest::scan_keeping_unknown(
+            &self.root,
+            &config.source_id,
+            scan_baseline,
+            stored_manifest.as_ref(),
+        )?;
+        let scan_errors = scan_stats.errors;
+        let unknown_set: HashSet<&str> = unknown_paths.iter().map(String::as_str).collect();
+        let mut changes = Manifest::diff(&old_manifest, &new_manifest);
+        changes.retain(|change| !unknown_set.contains(change_path(change).as_str()));
+        // A sweep must spare rows of paths this run could not inspect.
+        let sweep_filter = |sync_token: &str| {
+            let mut filters = vec![
+                Filter::Eq("source_id".to_string(), config.source_id.clone()),
+                Filter::Neq("seen_token".to_string(), sync_token.to_string()),
+            ];
+            if !unknown_paths.is_empty() {
+                filters.push(Filter::NotIn("path".to_string(), unknown_paths.clone()));
+            }
+            Filter::And(filters)
+        };
 
         if changes.is_empty() && !full {
             let mut result = empty_sync_result(dry_run, true);
             result.files_checked = new_manifest.files.len();
             result.query_ready = cursor_path.exists();
+            result.scan_errors = scan_errors;
             result.elapsed_seconds = start.elapsed().as_secs_f64();
             return Ok(result);
         }
@@ -294,6 +317,7 @@ impl MinSync {
                 ..empty_sync_result(true, false)
             };
             result.files_checked = new_manifest.files.len();
+            result.scan_errors = scan_errors;
             result.elapsed_seconds = start.elapsed().as_secs_f64();
             return Ok(result);
         }
@@ -336,14 +360,12 @@ impl MinSync {
         let mut result = empty_sync_result(false, false);
         result.initial_sync = initial_sync;
         result.files_checked = new_manifest.files.len();
+        result.scan_errors = scan_errors;
         result.query_ready = true;
         if lexical_rebuild {
             // Rows indexed under the previous lexical language must go. Keyed
             // on the token so a resumed run keeps what it already rewrote.
-            result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
-                Filter::Eq("source_id".to_string(), config.source_id.clone()),
-                Filter::Neq("seen_token".to_string(), sync_token.clone()),
-            ]))?;
+            result.chunks_deleted += store.delete_by_filter(&sweep_filter(&sync_token))?;
         }
 
         let checkpoint_every = self
@@ -454,10 +476,7 @@ impl MinSync {
         }
 
         if full {
-            result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
-                Filter::Eq("source_id".to_string(), config.source_id.clone()),
-                Filter::Neq("seen_token".to_string(), sync_token.clone()),
-            ]))?;
+            result.chunks_deleted += store.delete_by_filter(&sweep_filter(&sync_token))?;
         }
 
         store.flush()?;
@@ -468,7 +487,13 @@ impl MinSync {
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
             collection_path: config.collection.path.clone(),
-            lexical_language: config.lexical.language.clone(),
+            // Rows spared above still carry the previous tokenization; keep
+            // the old language so the next sync redoes the rebuild for them.
+            lexical_language: if lexical_rebuild && !unknown_paths.is_empty() {
+                stored_lexical_language.clone()
+            } else {
+                config.lexical.language.clone()
+            },
         }
         .save(&cursor_path)?;
         new_manifest.save(&manifest_path)?;

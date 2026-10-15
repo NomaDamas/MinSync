@@ -40,6 +40,21 @@ pub fn filter_to_sql(filter: &Filter) -> Result<String> {
                 .join(", ");
             Ok(format!("{} IN ({literals})", validate_filter_field(field)?))
         }
+        Filter::NotIn(field, values) if values.is_empty() => {
+            validate_filter_field(field)?;
+            Ok("TRUE".to_string())
+        }
+        Filter::NotIn(field, values) => {
+            let literals = values
+                .iter()
+                .map(|value| format!("'{}'", escape_sql_literal(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!(
+                "{} NOT IN ({literals})",
+                validate_filter_field(field)?
+            ))
+        }
         Filter::And(filters) if filters.is_empty() => Ok("TRUE".to_string()),
         Filter::And(filters) => filters
             .iter()
@@ -125,6 +140,23 @@ mod tests {
             "FALSE"
         );
         assert!(filter_to_sql(&Filter::In("bad".to_string(), vec![])).is_err());
+    }
+
+    #[test]
+    fn test_not_in_filter_sql_escapes_and_empty_matches_everything() {
+        assert_eq!(
+            filter_to_sql(&Filter::NotIn(
+                "path".to_string(),
+                vec!["a.txt".to_string(), "o'brien.txt".to_string()]
+            ))
+            .expect("sql"),
+            "path NOT IN ('a.txt', 'o''brien.txt')"
+        );
+        assert_eq!(
+            filter_to_sql(&Filter::NotIn("path".to_string(), vec![])).expect("sql"),
+            "TRUE"
+        );
+        assert!(filter_to_sql(&Filter::NotIn("bad".to_string(), vec![])).is_err());
     }
 
     #[test]

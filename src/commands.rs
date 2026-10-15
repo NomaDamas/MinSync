@@ -145,11 +145,20 @@ async fn sync(
                 println!("  embedded texts:      {}", result.embedded_texts);
                 println!("  embeddings reused:   {}", result.embeddings_reused);
                 println!("  chunks truncated:    {}", result.chunks_truncated);
+                println!("  scan errors:         {}", result.scan_errors.len());
                 println!("  estimated tokens:    {}", result.estimated_tokens);
             }
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+    }
+    if matches!(format, OutputFormat::Text) {
+        for error in &result.scan_errors {
+            eprintln!(
+                "warning: scan error ({:?}) {}: {} — existing chunks kept",
+                error.kind, error.path, error.error
+            );
         }
     }
     Ok(())

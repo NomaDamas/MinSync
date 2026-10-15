@@ -34,6 +34,7 @@ pub(super) fn empty_sync_result(dry_run: bool, already_up_to_date: bool) -> Sync
         freshness_check_only: already_up_to_date,
         query_ready: false,
         files_resumed: 0,
+        scan_errors: Vec::new(),
     }
 }
 

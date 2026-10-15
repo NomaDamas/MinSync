@@ -45,6 +45,8 @@ pub enum Filter {
     Neq(String, String),
     /// Field equals any of the values; an empty list matches nothing.
     In(String, Vec<String>),
+    /// Field equals none of the values; an empty list matches everything.
+    NotIn(String, Vec<String>),
     And(Vec<Filter>),
 }
 

@@ -143,6 +143,19 @@ MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일
 
 처음부터 다시 시작하려면 `.minsync/`를 삭제하세요.
 
+### 읽을 수 없는 항목
+
+항목 하나 때문에 sync가 중단되지 않습니다. scan이 읽지 못한 디렉터리·파일(`EACCES`,
+`EPERM`, `EIO`, `EBUSY`, `ETIMEDOUT`, `ESTALE`, symlink loop 등)은 건너뛰고 sync
+summary의 `scan_errors`(`path`, `kind` = `transient` 또는 `permanent`, `error`)에
+기록하며 항목당 경고를 한 번 출력합니다. scan 도중 사라진 경로(`ENOENT`, `ENOTDIR`)는
+기존처럼 삭제로 처리합니다.
+
+**보장:** 오류가 난 항목은 *삭제*가 아니라 *unknown*입니다. 이전에 index된 chunk는
+`--full` sweep 중에도 유지되며, 이후 scan이 해당 경로를 다시 읽거나 사라졌음을
+확인할 때까지 남습니다. root 디렉터리 자체를 읽을 수 없으면 어떤 파일도 판단할 수
+없으므로 sync는 여전히 실패합니다.
+
 ## Chunker
 
 | id | 전략 | 편집 시 boundary 안정성 |

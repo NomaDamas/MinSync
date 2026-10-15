@@ -44,6 +44,8 @@ pub fn matches_filter(doc: &Document, filter: &Filter) -> bool {
         }
         Filter::In(field, values) => get_field(doc, field)
             .is_some_and(|doc_value| values.iter().any(|value| value == doc_value)),
+        Filter::NotIn(field, values) => get_field(doc, field)
+            .is_some_and(|doc_value| values.iter().all(|value| value != doc_value)),
         Filter::And(filters) => filters.iter().all(|nested| matches_filter(doc, nested)),
     }
 }
@@ -151,6 +153,23 @@ mod tests {
         assert!(!matches_filter(
             &doc,
             &Filter::In("path".to_string(), vec![])
+        ));
+    }
+
+    #[test]
+    fn test_matches_filter_not_in() {
+        let doc = doc();
+        assert!(matches_filter(
+            &doc,
+            &Filter::NotIn("path".to_string(), vec!["x.txt".to_string()])
+        ));
+        assert!(!matches_filter(
+            &doc,
+            &Filter::NotIn("path".to_string(), vec!["a.txt".to_string()])
+        ));
+        assert!(matches_filter(
+            &doc,
+            &Filter::NotIn("path".to_string(), vec![])
         ));
     }
 }
