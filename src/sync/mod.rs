@@ -1699,6 +1699,65 @@ mod tests {
         assert!(joined.contains("CHANGED"), "{hits:?}");
     }
 
+    /// The `fail_on_call`-th `embed` call (1-based) reports a native deadline
+    /// expiry instead of embedding.
+    struct TimeoutOnCall {
+        calls: AtomicUsize,
+        fail_on_call: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for TimeoutOnCall {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_call {
+                return Err(MinSyncError::Timeout("stuck native batch".to_string()));
+            }
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embedder_timeout_aborts_with_code_7_and_rerun_resumes_committed_files() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_numbered_files(&dir, 6);
+        init_sync(&sync);
+        set_batch_files(&sync, 1);
+        let stuck = TimeoutOnCall {
+            calls: AtomicUsize::new(0),
+            fail_on_call: 4,
+        };
+
+        let error = sync
+            .sync(&chunker, &stuck, &mut store, true, false, false)
+            .await
+            .expect_err("timeout aborts the run");
+
+        assert!(matches!(error, MinSyncError::Timeout(_)), "{error}");
+        assert_eq!(error.exit_code(), 7);
+        assert!(sync.minsync_dir.join("progress.jsonl").exists());
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+        assert_eq!(store.all_paths().len(), 3, "three files committed first");
+
+        let (healthy, healthy_count) = counting_embedder();
+        let result = sync
+            .sync(&chunker, &healthy, &mut store, false, false, false)
+            .await
+            .expect("rerun resumes");
+
+        assert_eq!(result.files_resumed, 3);
+        assert_eq!(result.files_processed, 3);
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            result.embedded_texts,
+            "committed files are not re-embedded"
+        );
+        assert_eq!(store.all_paths().len(), 6);
+    }
+
     #[tokio::test]
     async fn test_resume_discarded_when_chunking_config_changes() {
         let (dir, sync, chunker, _embedder, _store) = fixture();

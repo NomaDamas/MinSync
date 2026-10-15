@@ -265,6 +265,14 @@ timeout_seconds = 60
 max_concurrent = 1
 ```
 
+`timeout_seconds` also bounds the native (in-process) embedder: each forward pass (one batch) must finish within `per_batch_timeout_seconds` (default: `timeout_seconds`). A blocked native kernel cannot be cancelled, so on expiry `minsync sync` aborts with exit code `7` (`embedder timeout`) instead of hanging; the stuck thread dies with the process. `progress.jsonl` keeps every file committed before the timeout, so re-running `minsync sync` resumes without re-embedding them. `minsync check` is bounded the same way.
+
+```toml
+[embedder]
+timeout_seconds = 60
+per_batch_timeout_seconds = 120   # optional, native only
+```
+
 `base_url` also works for OpenAI-compatible gateways.
 
 ## Local Embeddings

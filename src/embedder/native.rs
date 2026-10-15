@@ -1,6 +1,7 @@
 //! In-process native embedder backed by fastembed-rs (Qwen3 / candle).
 
 use crate::config::EmbedderConfig;
+use crate::embedder::deadline::BatchDeadline;
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
@@ -9,6 +10,7 @@ use fastembed::Qwen3TextEmbedding;
 use hf_hub::api::sync::ApiBuilder;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tokio::sync::OnceCell;
 
@@ -56,17 +58,25 @@ enum NativeDtype {
     Bf16,
 }
 
+#[derive(Clone)]
+struct LoadedModel {
+    model: Arc<Mutex<Qwen3TextEmbedding>>,
+    attention_heads: usize,
+}
+
 pub struct NativeEmbedder {
     model_id: String,
     device: NativeDevice,
     dtype: NativeDtype,
     max_length: usize,
     batch_size: usize,
+    batch_timeout: Duration,
     cache_dir: Option<PathBuf>,
     query_prefix: Option<String>,
     passage_prefix: Option<String>,
-    inner: OnceCell<Arc<Mutex<Qwen3TextEmbedding>>>,
+    inner: OnceCell<LoadedModel>,
     tokenizer: OnceCell<Tokenizer>,
+    deadline: BatchDeadline,
 }
 
 impl NativeEmbedder {
@@ -78,11 +88,13 @@ impl NativeEmbedder {
             dtype: parse_dtype(settings.dtype.as_deref())?,
             max_length: settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
             batch_size: settings.batch_size,
+            batch_timeout: batch_timeout(settings),
             cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
             query_prefix: settings.query_prefix.clone(),
             passage_prefix: settings.passage_prefix.clone(),
             inner: OnceCell::new(),
             tokenizer: OnceCell::new(),
+            deadline: BatchDeadline::new(),
         })
     }
 
@@ -158,7 +170,7 @@ impl NativeEmbedder {
             .sum()
     }
 
-    async fn model(&self) -> Result<Arc<Mutex<Qwen3TextEmbedding>>> {
+    async fn model(&self) -> Result<LoadedModel> {
         self.inner
             .get_or_try_init(|| async {
                 let repo = self.model_id.clone();
@@ -178,7 +190,10 @@ impl NativeEmbedder {
                 .map_err(|error| {
                     MinSyncError::Embedding(format!("native model load join failed: {error}"))
                 })??;
-                Ok(Arc::new(Mutex::new(loaded)))
+                Ok(LoadedModel {
+                    attention_heads: loaded.config().num_attention_heads.max(1),
+                    model: Arc::new(Mutex::new(loaded)),
+                })
             })
             .await
             .cloned()
@@ -193,44 +208,69 @@ impl NativeEmbedder {
                 "batch_size must be greater than 0".to_string(),
             ));
         }
-        let model = self.model().await?;
-        let batch_size = self.batch_size;
-        let max_length = self.max_length;
+        let loaded = self.model().await?;
         let dtype_bytes = self.dtype.to_candle().size_in_bytes();
-        tokio::task::spawn_blocking(move || {
-            let model = model.lock().map_err(|error| {
-                MinSyncError::Embedding(format!("native model lock poisoned: {error}"))
-            })?;
-            let per_row_attention_bytes = model.config().num_attention_heads.max(1) * dtype_bytes;
-            let batches = plan_batches(
-                &texts,
-                batch_size,
-                max_length,
-                per_row_attention_bytes,
-                ATTENTION_BYTES_BUDGET,
-            );
-            let mut all = Vec::with_capacity(texts.len());
-            for range in batches {
-                let chunk = &texts[range];
-                let vectors = model.embed(chunk).map_err(|error| {
-                    MinSyncError::Embedding(format!("native embedding failed: {error}"))
+        let per_row_attention_bytes = loaded.attention_heads * dtype_bytes;
+        let model = loaded.model;
+        let batches = plan_batches(
+            &texts,
+            self.batch_size,
+            self.max_length,
+            per_row_attention_bytes,
+            ATTENTION_BYTES_BUDGET,
+        );
+        embed_in_batches(
+            &self.deadline,
+            self.batch_timeout,
+            texts,
+            batches,
+            move |chunk: &[String]| {
+                let model = model.lock().map_err(|error| {
+                    MinSyncError::Embedding(format!("native model lock poisoned: {error}"))
                 })?;
-                if vectors.len() != chunk.len() {
-                    return Err(MinSyncError::Embedding(format!(
-                        "native embedder returned {} embeddings for {} inputs",
-                        vectors.len(),
-                        chunk.len()
-                    )));
-                }
-                all.extend(vectors);
-            }
-            Ok(all)
-        })
+                model.embed(chunk).map_err(|error| {
+                    MinSyncError::Embedding(format!("native embedding failed: {error}"))
+                })
+            },
+        )
         .await
-        .map_err(|error| {
-            MinSyncError::Embedding(format!("native embedding join failed: {error}"))
-        })?
     }
+}
+
+/// Run `embed_batch` over each planned batch on the blocking pool, each
+/// forward pass under its own `batch_timeout` so a stuck kernel surfaces as
+/// [`MinSyncError::Timeout`] instead of hanging the caller.
+async fn embed_in_batches<F>(
+    deadline: &BatchDeadline,
+    batch_timeout: Duration,
+    texts: Vec<String>,
+    batches: Vec<std::ops::Range<usize>>,
+    embed_batch: F,
+) -> Result<Vec<Vec<f32>>>
+where
+    F: Fn(&[String]) -> Result<Vec<Vec<f32>>> + Send + Sync + 'static,
+{
+    let texts = Arc::new(texts);
+    let embed_batch = Arc::new(embed_batch);
+    let mut all = Vec::with_capacity(texts.len());
+    for range in batches {
+        let batch_texts = Arc::clone(&texts);
+        let embed_batch = Arc::clone(&embed_batch);
+        let expected = range.len();
+        let vectors = deadline
+            .run("native embedding batch", batch_timeout, move || {
+                embed_batch(&batch_texts[range])
+            })
+            .await?;
+        if vectors.len() != expected {
+            return Err(MinSyncError::Embedding(format!(
+                "native embedder returned {} embeddings for {expected} inputs",
+                vectors.len(),
+            )));
+        }
+        all.extend(vectors);
+    }
+    Ok(all)
 }
 
 #[async_trait]
@@ -309,6 +349,16 @@ fn plan_batches(
         batches.push(start..texts.len());
     }
     batches
+}
+
+/// Deadline for one forward pass: `per_batch_timeout_seconds`, else
+/// `timeout_seconds`.
+fn batch_timeout(settings: &EmbedderConfig) -> Duration {
+    Duration::from_secs(
+        settings
+            .per_batch_timeout_seconds
+            .unwrap_or(settings.timeout_seconds),
+    )
 }
 
 fn parse_native_model_id(id: &str) -> Result<&str> {
@@ -543,5 +593,101 @@ mod tests {
             ATTENTION_BYTES_BUDGET,
         );
         assert!(batches.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn settings(timeout: u64, per_batch: Option<u64>) -> EmbedderConfig {
+        let mut config = crate::config::Config::default_for("s").embedder;
+        config.timeout_seconds = timeout;
+        config.per_batch_timeout_seconds = per_batch;
+        config
+    }
+
+    #[test]
+    fn batch_timeout_defaults_to_timeout_seconds() {
+        assert_eq!(batch_timeout(&settings(42, None)), Duration::from_secs(42));
+    }
+
+    #[test]
+    fn per_batch_timeout_overrides_timeout_seconds() {
+        assert_eq!(
+            batch_timeout(&settings(42, Some(3))),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_batch_returns_timeout_within_deadline() {
+        let deadline = BatchDeadline::new();
+        let texts: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+        let started = Instant::now();
+
+        let outcome = embed_in_batches(
+            &deadline,
+            Duration::from_millis(100),
+            texts,
+            vec![0..2, 2..4],
+            |chunk: &[String]| {
+                if chunk[0] == "t2" {
+                    std::thread::sleep(Duration::from_millis(800));
+                }
+                Ok(chunk.iter().map(|_| vec![1.0]).collect())
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(MinSyncError::Timeout(_))),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(600));
+    }
+
+    #[tokio::test]
+    async fn healthy_batches_return_vectors_in_input_order() {
+        let deadline = BatchDeadline::new();
+        let texts: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+
+        let vectors = embed_in_batches(
+            &deadline,
+            Duration::from_secs(5),
+            texts,
+            vec![0..2, 2..5],
+            |chunk: &[String]| {
+                Ok(chunk
+                    .iter()
+                    .map(|text| vec![text.parse::<f32>().unwrap()])
+                    .collect())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            vectors,
+            vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0]]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::single_range_in_vec_init)]
+    async fn vector_count_mismatch_is_an_embedding_error() {
+        let deadline = BatchDeadline::new();
+
+        let outcome = embed_in_batches(
+            &deadline,
+            Duration::from_secs(5),
+            vec!["a".into(), "b".into()],
+            vec![0..2],
+            |_: &[String]| Ok(vec![vec![1.0]]),
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(MinSyncError::Embedding(_))));
     }
 }

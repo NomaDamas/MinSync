@@ -124,6 +124,10 @@ pub struct EmbedderConfig {
     pub max_retries: usize,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Native embedder only: deadline in seconds for a single forward pass
+    /// (one batch). Defaults to `timeout_seconds`.
+    #[serde(default)]
+    pub per_batch_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -262,6 +266,7 @@ impl Config {
                 max_concurrent: default_max_concurrent(),
                 max_retries: default_max_retries(),
                 timeout_seconds: default_timeout_seconds(),
+                per_batch_timeout_seconds: None,
                 base_url: None,
                 query_prefix: None,
                 passage_prefix: None,
