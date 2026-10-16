@@ -129,16 +129,8 @@ impl RecursiveChunker {
 
         chunks
             .into_iter()
-            .inspect(|chunk| {
-                let length = chunk.text.chars().count();
-                if length > self.max_chunk_size {
-                    tracing::warn!(
-                        original_length = length,
-                        max_chunk_size = self.max_chunk_size,
-                        "table chunk exceeds max_chunk_size because table rows are kept intact"
-                    );
-                }
-            })
+            .flat_map(|chunk| self.hard_cap(&chunk.text))
+            .map(chunk)
             .collect()
     }
 
@@ -246,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_table_keeps_header_and_data_row_together() {
-        let chunker = RecursiveChunker::new(32);
+        let chunker = RecursiveChunker::new(64);
         let text = "| h0500 | other |\n| --- | --- |\n| v0500 | value |";
 
         let chunks = chunker.chunk(text, "f.md").expect("chunk markdown table");
@@ -269,6 +261,49 @@ mod tests {
         for chunk in chunks.iter().skip(1) {
             assert!(chunk.text.starts_with(&format!("{header}\n{separator}\n")));
         }
+    }
+
+    #[test]
+    fn test_table_row_wider_than_max_chunk_size_is_hard_capped() {
+        let max_chunk_size = 100;
+        let chunker = RecursiveChunker::new(max_chunk_size);
+        let blob = "x".repeat(2_000);
+        let text = format!("| h | blob |\n| --- | --- |\n| 1 | {blob} |\n| 2 | short |\n");
+
+        let chunks = chunker.chunk(&text, "f.md").expect("chunk wide table");
+
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text.chars().count() <= max_chunk_size),
+            "chunk lengths: {:?}",
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.chars().count())
+                .collect::<Vec<_>>()
+        );
+        assert!(chunks.iter().any(|chunk| chunk.text.contains("short")));
+        let xs: usize = chunks
+            .iter()
+            .map(|chunk| chunk.text.matches('x').count())
+            .sum();
+        assert_eq!(xs, 2_000, "no row content may be dropped");
+    }
+
+    #[test]
+    fn test_table_header_alone_wider_than_max_chunk_size_is_hard_capped() {
+        let max_chunk_size = 50;
+        let chunker = RecursiveChunker::new(max_chunk_size);
+        let columns: Vec<String> = (0..40).map(|index| format!("column{index}")).collect();
+        let header = format!("| {} |\n", columns.join(" | "));
+        let separator = format!("|{}|\n", " --- |".repeat(columns.len()));
+        let text = format!("{header}{separator}| a |\n");
+
+        let chunks = chunker.chunk(&text, "f.md").expect("chunk wide header");
+
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.chars().count() <= max_chunk_size));
     }
 
     #[test]

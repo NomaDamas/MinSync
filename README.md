@@ -204,17 +204,19 @@ about any file.
 The `recursive` chunker splits on paragraph breaks, sentence delimiters
 (`. `, `? `, `! `), and line breaks, then merges those pieces up to
 `chunker.options.max_chunk_size`. The configured size is a hard cap for
-ordinary delimiter-based text and for delimiter-less lines, which are split
-at character boundaries with a warning that includes the original length.
+ordinary delimiter-based text, for delimiter-less lines, and for table chunks:
+overlong content is split at character boundaries with a warning that includes
+the original length.
 
 Contiguous Markdown table lines (optional leading whitespace, beginning with
 `|` and containing another `|`) are treated as one table block. A valid table
 header and separator stay together with data rows, and table chunks are
-split only between rows. When a table needs multiple chunks, every chunk
-after the first repeats the header and separator rows. If preserving a table
-row or its repeated header would exceed the cap, MinSync keeps that table
-structure intact and emits a warning; this is the only intentional exception
-to the hard cap. A warning is also emitted when a table boundary is selected.
+split only between rows when a row fits. When a table needs multiple chunks,
+every chunk after the first repeats the header and separator rows. If a single
+row plus its repeated header (or the header alone) exceeds the cap, that chunk
+is split at character boundaries so no chunk ever exceeds `max_chunk_size`; the
+split pieces are no longer valid table fragments. A warning is also emitted
+when a table boundary is selected.
 
 Select at init time:
 
