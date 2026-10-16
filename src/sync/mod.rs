@@ -638,11 +638,17 @@ impl MinSync {
         // manifest keeps its previous entry (or none, if it was never
         // indexed) instead of recording it as done.
         let mut saved_manifest = new_manifest.clone();
+        // `init` writes a baseline manifest before the first sync, but those
+        // entries have no indexed chunks to preserve. Only a completed sync
+        // (signaled by an existing cursor at run start) makes stored entries
+        // safe to restore after a failure.
+        let prior_indexed_manifest = if initial_sync {
+            None
+        } else {
+            stored_manifest.as_ref()
+        };
         for failure in &result.files_failed {
-            match stored_manifest
-                .as_ref()
-                .and_then(|manifest| manifest.files.get(&failure.path))
-            {
+            match prior_indexed_manifest.and_then(|manifest| manifest.files.get(&failure.path)) {
                 Some(entry) => {
                     saved_manifest
                         .files

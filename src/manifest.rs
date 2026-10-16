@@ -1,12 +1,12 @@
 use crate::error::{MinSyncError, Result};
-use crate::file_size::size_guard_error;
+use crate::file_size::{size_guard_error, size_guard_message};
 use chrono::Utc;
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
@@ -181,18 +181,29 @@ impl Manifest {
                 }
             };
             let fingerprint = metadata_fingerprint(&metadata, mtime_ns);
+            let mut file_size = metadata.len();
             let content_hash = match baseline
                 .and_then(|manifest| manifest.files.get(&manifest_path))
                 .filter(|entry| fingerprint.is_some() && entry.fingerprint == fingerprint)
             {
                 Some(entry) => entry.content_hash.clone(),
-                None => match io.hash_file(path) {
-                    Ok(hash) => {
+                None => match io.hash_file(path, max_file_bytes) {
+                    Ok((hash, bytes_hashed)) => {
                         stats.files_rehashed += 1;
-                        stats.bytes_hashed += metadata.len();
+                        stats.bytes_hashed += bytes_hashed;
+                        file_size = bytes_hashed;
                         hash
                     }
-                    Err(error) => {
+                    Err(HashFileError::TooLarge { size, limit }) => {
+                        record_error(
+                            &mut stats,
+                            manifest_path,
+                            ScanErrorKind::SizeGuard,
+                            size_guard_message(size, limit),
+                        );
+                        continue;
+                    }
+                    Err(HashFileError::Io(error)) => {
                         record_io_error(&mut stats, manifest_path, &error);
                         continue;
                     }
@@ -202,7 +213,7 @@ impl Manifest {
             manifest.files.insert(
                 manifest_path,
                 ManifestFileEntry {
-                    size: metadata.len(),
+                    size: file_size,
                     mtime_ns,
                     content_hash,
                     fingerprint,
@@ -358,7 +369,45 @@ fn prefixed_sha256(content: &[u8]) -> String {
 
 trait ScanFs {
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata>;
-    fn hash_file(&self, path: &Path) -> std::io::Result<String>;
+    fn hash_file(
+        &self,
+        path: &Path,
+        max_file_bytes: u64,
+    ) -> std::result::Result<(String, u64), HashFileError>;
+}
+
+#[derive(Debug)]
+enum HashFileError {
+    Io(io::Error),
+    TooLarge { size: u64, limit: u64 },
+}
+
+#[derive(Debug)]
+enum HashReaderError {
+    Io(io::Error),
+    TooLarge { bytes_hashed: u64 },
+}
+
+fn hash_reader<R: Read>(
+    reader: R,
+    limit: u64,
+) -> std::result::Result<(String, u64), HashReaderError> {
+    let mut hasher = Sha256::new();
+    let mut reader = reader;
+    let bytes_hashed = if limit == 0 {
+        io::copy(&mut reader, &mut hasher).map_err(HashReaderError::Io)?
+    } else {
+        let mut bounded = reader.take(limit.saturating_add(1));
+        let bytes_hashed = io::copy(&mut bounded, &mut hasher).map_err(HashReaderError::Io)?;
+        if bytes_hashed > limit {
+            return Err(HashReaderError::TooLarge { bytes_hashed });
+        }
+        bytes_hashed
+    };
+    Ok((
+        format!("sha256:{}", hex::encode(hasher.finalize())),
+        bytes_hashed,
+    ))
 }
 
 struct RealFs;
@@ -368,11 +417,33 @@ impl ScanFs for RealFs {
         fs::metadata(path)
     }
 
-    fn hash_file(&self, path: &Path) -> std::io::Result<String> {
-        let mut file = fs::File::open(path)?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher)?;
-        Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    fn hash_file(
+        &self,
+        path: &Path,
+        max_file_bytes: u64,
+    ) -> std::result::Result<(String, u64), HashFileError> {
+        let file = fs::File::open(path).map_err(HashFileError::Io)?;
+        let initial_size = file.metadata().map_err(HashFileError::Io)?.len();
+        if size_guard_error(initial_size, max_file_bytes).is_some() {
+            return Err(HashFileError::TooLarge {
+                size: initial_size,
+                limit: max_file_bytes,
+            });
+        }
+        match hash_reader(file, max_file_bytes) {
+            Ok(result) => Ok(result),
+            Err(HashReaderError::Io(error)) => Err(HashFileError::Io(error)),
+            Err(HashReaderError::TooLarge { bytes_hashed }) => {
+                let size = fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(bytes_hashed)
+                    .max(bytes_hashed);
+                Err(HashFileError::TooLarge {
+                    size,
+                    limit: max_file_bytes,
+                })
+            }
+        }
     }
 }
 
@@ -498,8 +569,33 @@ mod tests {
             fs::metadata(path)
         }
 
-        fn hash_file(&self, _path: &Path) -> std::io::Result<String> {
+        fn hash_file(
+            &self,
+            _path: &Path,
+            _max_file_bytes: u64,
+        ) -> std::result::Result<(String, u64), HashFileError> {
             panic!("oversized file must not be hashed")
+        }
+    }
+
+    struct GrowsAfterScanMetadata;
+
+    impl ScanFs for GrowsAfterScanMetadata {
+        fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+            fs::metadata(path)
+        }
+
+        fn hash_file(
+            &self,
+            path: &Path,
+            max_file_bytes: u64,
+        ) -> std::result::Result<(String, u64), HashFileError> {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(HashFileError::Io)?;
+            file.write_all(b"x").map_err(HashFileError::Io)?;
+            RealFs.hash_file(path, max_file_bytes)
         }
     }
 
@@ -738,6 +834,35 @@ mod tests {
     }
 
     #[test]
+    fn capped_hash_reads_at_most_one_byte_past_the_limit() {
+        let mut reader = std::io::Cursor::new(b"more than four bytes");
+
+        let error = hash_reader(&mut reader, 4).expect_err("growing file exceeds cap");
+
+        assert!(matches!(
+            error,
+            HashReaderError::TooLarge { bytes_hashed: 5 }
+        ));
+        assert_eq!(reader.position(), 5);
+    }
+
+    #[test]
+    fn scan_reports_size_guard_if_file_grows_after_metadata_check() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("growing.txt"), "1234").expect("write file");
+
+        let (manifest, stats) =
+            Manifest::scan_with_fs(dir.path(), "source-1", None, 4, &GrowsAfterScanMetadata)
+                .expect("scan records growth as a size guard");
+
+        assert!(!manifest.files.contains_key("growing.txt"));
+        assert_eq!(stats.bytes_hashed, 0);
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::SizeGuard);
+        assert_eq!(stats.errors[0].error, size_guard_message(5, 4));
+    }
+
+    #[test]
     fn capped_scan_carries_an_old_manifest_entry_as_unknown() {
         let dir = tempfile::tempdir().expect("create tempdir");
         fs::write(dir.path().join("large.txt"), "large content").expect("write file");
@@ -919,10 +1044,14 @@ mod tests {
             }
         }
 
-        fn hash_file(&self, path: &Path) -> std::io::Result<String> {
+        fn hash_file(
+            &self,
+            path: &Path,
+            max_file_bytes: u64,
+        ) -> std::result::Result<(String, u64), HashFileError> {
             match Self::lookup(&self.hash_errors, path) {
-                Some(error) => Err(error),
-                None => RealFs.hash_file(path),
+                Some(error) => Err(HashFileError::Io(error)),
+                None => RealFs.hash_file(path, max_file_bytes),
             }
         }
     }

@@ -117,6 +117,64 @@ async fn oversized_file_is_reported_while_other_files_are_indexed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn failed_first_sync_does_not_restore_the_init_baseline_as_indexed() {
+    let server = tei_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let contents = format!("{} searchablemarker", "large ".repeat(40));
+    std::fs::write(dir.path().join("large.txt"), &contents).unwrap();
+    // `init` records this file in its baseline before the lower sync cap is
+    // applied. That baseline must not be mistaken for indexed state.
+    setup(dir.path(), &server.uri(), 8);
+
+    let first = run(dir.path(), &["--format", "json", "sync"]).await;
+    assert_eq!(first.status.code(), Some(6), "{first:?}");
+    let first_result: Value = serde_json::from_slice(&first.stdout).expect("json result");
+    assert_eq!(
+        first_result["files_failed"][0]["stage"],
+        json!("size_guard")
+    );
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join(".minsync/manifest.json")).expect("read manifest"),
+    )
+    .expect("manifest json");
+    assert!(manifest["files"].get("large.txt").is_none());
+
+    let config_path = dir.path().join(".minsync/config.toml");
+    let mut config = Config::load(&config_path).expect("load config");
+    config.sync.max_file_bytes = 0;
+    config.save(&config_path).expect("disable size guard");
+
+    let retry = run(dir.path(), &["--format", "json", "sync"]).await;
+    assert_eq!(retry.status.code(), Some(0), "{retry:?}");
+    let retry_result: Value = serde_json::from_slice(&retry.stdout).expect("json result");
+    assert!(retry_result["files_processed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == "large.txt"));
+
+    let query = run(
+        dir.path(),
+        &[
+            "--format",
+            "json",
+            "query",
+            "searchablemarker",
+            "--mode",
+            "bm25",
+        ],
+    )
+    .await;
+    assert!(query.status.success(), "{query:?}");
+    let hits: Value = serde_json::from_slice(&query.stdout).expect("query json");
+    assert!(hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hit| hit["path"] == "large.txt"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zero_disables_the_guard_and_lowering_the_limit_preserves_existing_chunks() {
     let server = tei_server().await;
     let dir = tempfile::tempdir().unwrap();
