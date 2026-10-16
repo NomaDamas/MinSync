@@ -19,7 +19,7 @@ use minsync::watch::{
     run_with_shutdown, should_index, WatchControl, WatchStartup, WatchStartupStatus,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tempfile::TempDir;
@@ -1247,6 +1247,88 @@ async fn test_sync_embedding_failure_keeps_cursor_and_manifest_unchanged() {
     assert!(result.chunks_added > 0);
     assert!(dir.path().join(".minsync/cursor.json").exists());
     assert!(!dir.path().join(".minsync/txn.json").exists());
+}
+
+#[tokio::test]
+async fn test_lexical_rebuild_retries_files_that_fail_indexing() {
+    struct SelectiveEmbedder {
+        fail_retry_target: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for SelectiveEmbedder {
+        fn id(&self) -> &str {
+            "selective-mock"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if self.fail_retry_target.load(Ordering::SeqCst)
+                && texts.iter().any(|text| text.contains("retrytarget"))
+            {
+                return Err(MinSyncError::Embedding(
+                    "selected file temporarily unavailable".to_string(),
+                ));
+            }
+            Ok(texts.iter().map(|_| vec![0.0; 8]).collect())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sync = MinSync::new(dir.path().to_path_buf());
+    let chunker = RecursiveChunker::new(256);
+    let fail_retry_target = Arc::new(AtomicBool::new(false));
+    let embedder = SelectiveEmbedder {
+        fail_retry_target: fail_retry_target.clone(),
+    };
+    let mut store = InMemoryStore::new();
+
+    write_file(&dir, "a-good.md", "good document content");
+    write_file(&dir, "z-retry.md", "retrytarget document content");
+    sync.init(false, "tei:test-model", "recursive")
+        .expect("init succeeds");
+    sync.sync(&chunker, &embedder, &mut store, true, false, false)
+        .await
+        .expect("initial sync succeeds");
+    assert_eq!(store.doc_count(), 2);
+
+    let config_path = dir.path().join(".minsync/config.toml");
+    let mut config = Config::load(&config_path).expect("load config");
+    assert_eq!(config.lexical.language, "simple");
+    config.lexical.language = "ko".to_string();
+    config.save(&config_path).expect("save changed language");
+
+    fail_retry_target.store(true, Ordering::SeqCst);
+    let failed_rebuild = sync
+        .sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("file-level failure is recorded as a partial sync");
+
+    assert!(failed_rebuild.partial);
+    assert_eq!(
+        failed_rebuild
+            .files_failed
+            .iter()
+            .map(|failure| failure.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["z-retry.md"]
+    );
+    assert_eq!(store.doc_count(), 1, "failed file was removed by the sweep");
+    let cursor = minsync::state::Cursor::load(&dir.path().join(".minsync/cursor.json"))
+        .expect("load cursor after partial rebuild");
+    assert_eq!(
+        cursor.lexical_language, "simple",
+        "failed indexing must keep the old lexical cursor so the rebuild retries"
+    );
+
+    fail_retry_target.store(false, Ordering::SeqCst);
+    sync.sync(&chunker, &embedder, &mut store, false, false, false)
+        .await
+        .expect("healed lexical rebuild succeeds");
+
+    assert_eq!(store.doc_count(), 2, "healed retry restores both files");
+    let cursor = minsync::state::Cursor::load(&dir.path().join(".minsync/cursor.json"))
+        .expect("load cursor after healed rebuild");
+    assert_eq!(cursor.lexical_language, "ko");
 }
 
 #[tokio::test]

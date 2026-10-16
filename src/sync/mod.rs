@@ -667,9 +667,9 @@ impl MinSync {
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
             collection_path: config.collection.path.clone(),
-            // Rows spared above still carry the previous tokenization; keep
-            // the old language so the next sync redoes the rebuild for them.
-            lexical_language: if lexical_rebuild && !unknown_paths.is_empty() {
+            // Repeat a partial lexical rebuild: a failed file may have lost
+            // its old rows during the pre-sweep before indexing failed.
+            lexical_language: if lexical_rebuild && !result.files_failed.is_empty() {
                 stored_lexical_language.clone()
             } else {
                 config.lexical.language.clone()
