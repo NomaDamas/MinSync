@@ -1,14 +1,23 @@
 use crate::error::{MinSyncError, Result};
+use std::collections::VecDeque;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Error from a single embedding HTTP request, classified for retry.
 #[derive(Debug)]
 pub enum RequestError {
-    /// Transient: network failure, timeout, HTTP 429, HTTP 5xx.
+    /// Transient: network failure, HTTP 429, other HTTP 5xx.
     Retryable(String),
     /// Permanent: auth/validation 4xx, malformed response — fail fast.
     Fatal(String),
+    /// The request was too big or too slow for the server: HTTP 413, 408,
+    /// 504, or a client-side timeout. Resending the identical batch only
+    /// queues more work behind the stuck one, so [`embed_adaptive`] splits it
+    /// instead. A single input cannot be split: with `retry_alone` it is
+    /// retried like [`RequestError::Retryable`] (timeouts, 504), otherwise it
+    /// fails like [`RequestError::Fatal`] (413).
+    TooLarge { message: String, retry_alone: bool },
 }
 
 /// Shared retry policy: exponential backoff with equal jitter, bounded by
@@ -40,12 +49,21 @@ impl RetryPolicy {
         let attempts = self.max_retries + 1;
         let mut last_error = String::new();
         for attempt in 0..attempts {
-            match op().await {
+            let outcome = match op().await {
+                Err(RequestError::TooLarge {
+                    message,
+                    retry_alone: true,
+                }) => Err(RequestError::Retryable(message)),
+                Err(RequestError::TooLarge { message, .. }) => Err(RequestError::Fatal(message)),
+                other => other,
+            };
+            match outcome {
                 Ok(value) => return Ok(value),
                 Err(RequestError::Fatal(message)) => {
                     return Err(MinSyncError::Embedding(message));
                 }
-                Err(RequestError::Retryable(message)) => {
+                Err(RequestError::Retryable(message))
+                | Err(RequestError::TooLarge { message, .. }) => {
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_attempts = attempts,
@@ -77,7 +95,73 @@ impl RetryPolicy {
     }
 }
 
-/// Classify an HTTP error status: 429 and 5xx are retryable, other
+/// Embed `inputs` through `send`, never resending a batch the server found
+/// too big or too slow.
+///
+/// Batches are cut to at most `limit` inputs. When a request of more than one
+/// input fails with [`RequestError::TooLarge`], `limit` is lowered to half of
+/// that batch (shared with later calls through the atomic) and the batch is
+/// re-cut and sent as smaller requests, without the retry/backoff of
+/// [`RetryPolicy::run`]. Single inputs go through the normal retry policy.
+/// Results keep input order.
+pub async fn embed_adaptive<F, Fut>(
+    policy: &RetryPolicy,
+    limit: &AtomicUsize,
+    inputs: Vec<String>,
+    send: F,
+) -> Result<Vec<Vec<f32>>>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: Future<Output = std::result::Result<Vec<Vec<f32>>, RequestError>>,
+{
+    let total = inputs.len();
+    let mut queue: VecDeque<Vec<String>> = VecDeque::from([inputs]);
+    let mut embeddings = Vec::with_capacity(total);
+    while let Some(mut piece) = queue.pop_front() {
+        let cut = limit.load(Ordering::Relaxed).max(1);
+        if piece.len() > cut {
+            let rest = piece.split_off(cut);
+            queue.push_front(rest);
+        }
+        let sent = policy
+            .run(|| async {
+                match send(piece.clone()).await {
+                    Ok(vectors) => Ok(Sent::Done(vectors)),
+                    // Leaves the retry loop at once; the split is handled below.
+                    Err(RequestError::TooLarge { message, .. }) if piece.len() > 1 => {
+                        Ok(Sent::TooLarge(message))
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+            .await?;
+        match sent {
+            Sent::Done(vectors) => embeddings.extend(vectors),
+            Sent::TooLarge(message) => {
+                let half = (piece.len() / 2).max(1);
+                limit.fetch_min(half, Ordering::Relaxed);
+                tracing::warn!(
+                    batch = piece.len(),
+                    new_batch_size = half,
+                    error = %message,
+                    "embedding batch too large or too slow; splitting it"
+                );
+                queue.push_front(piece);
+            }
+        }
+    }
+    Ok(embeddings)
+}
+
+/// Result of sending one piece of an adaptive batch.
+enum Sent {
+    Done(Vec<Vec<f32>>),
+    /// A multi-input request the server found too big or too slow.
+    TooLarge(String),
+}
+
+/// Classify an HTTP error status: 429 and 5xx are retryable, 413/408/504
+/// mean the batch was too big or too slow ([`RequestError::TooLarge`]), other
 /// non-success statuses (auth, validation) are fatal.
 pub fn classify_status(status: reqwest::StatusCode, provider: &str, body: &str) -> RequestError {
     let message = format!("{provider} API error {status}: {body}");
@@ -88,10 +172,21 @@ pub fn classify_status(status: reqwest::StatusCode, provider: &str, body: &str) 
              ({message})"
         ));
     }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        RequestError::Retryable(message)
-    } else {
-        RequestError::Fatal(message)
+    match status {
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE => RequestError::TooLarge {
+            message,
+            retry_alone: false,
+        },
+        reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT => {
+            RequestError::TooLarge {
+                message,
+                retry_alone: true,
+            }
+        }
+        _ if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
+            RequestError::Retryable(message)
+        }
+        _ => RequestError::Fatal(message),
     }
 }
 
@@ -102,10 +197,19 @@ fn is_context_length_error(body: &str) -> bool {
         || body.contains("must have less than")
 }
 
-/// Classify a request transport error: connection failures and timeouts are
-/// retryable.
+/// Classify a request transport error: a client-side timeout means the
+/// batch was too slow ([`RequestError::TooLarge`]); other connection
+/// failures are retryable.
 pub fn classify_send_error(error: &reqwest::Error, provider: &str) -> RequestError {
-    RequestError::Retryable(format!("{provider} request failed: {error}"))
+    let message = format!("{provider} request failed: {error}");
+    if error.is_timeout() {
+        RequestError::TooLarge {
+            message,
+            retry_alone: true,
+        }
+    } else {
+        RequestError::Retryable(message)
+    }
 }
 
 /// Pseudo-random fraction in [0, 1) derived from the wall clock via
@@ -300,5 +404,75 @@ mod tests {
             let fraction = jitter_fraction();
             assert!((0.0..1.0).contains(&fraction));
         }
+    }
+
+    #[test]
+    fn test_classify_status_too_large_variants() {
+        for status in [
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+        ] {
+            assert!(
+                matches!(
+                    classify_status(status, "TEI", "x"),
+                    RequestError::TooLarge { .. }
+                ),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            classify_status(reqwest::StatusCode::PAYLOAD_TOO_LARGE, "TEI", "x"),
+            RequestError::TooLarge {
+                retry_alone: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_status(reqwest::StatusCode::GATEWAY_TIMEOUT, "TEI", "x"),
+            RequestError::TooLarge {
+                retry_alone: true,
+                ..
+            }
+        ));
+        // Other 5xx stay plain retryable.
+        assert!(matches!(
+            classify_status(reqwest::StatusCode::BAD_GATEWAY, "TEI", "x"),
+            RequestError::Retryable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_never_resends_an_identical_oversized_batch() {
+        let policy = fast_policy(3);
+        let limit = AtomicUsize::new(6);
+        let sizes = std::sync::Mutex::new(Vec::new());
+
+        let out = embed_adaptive(
+            &policy,
+            &limit,
+            (0..6).map(|index| index.to_string()).collect(),
+            |batch| {
+                sizes.lock().unwrap().push(batch.len());
+                async move {
+                    if batch.len() > 1 {
+                        return Err(RequestError::TooLarge {
+                            message: "504".to_string(),
+                            retry_alone: true,
+                        });
+                    }
+                    Ok(vec![vec![batch[0].parse::<f32>().unwrap()]])
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, (0..6).map(|v| vec![v as f32]).collect::<Vec<_>>());
+        let sizes = sizes.into_inner().unwrap();
+        // One attempt per oversized size, never the same multi-input size twice
+        // in a row for the same data.
+        assert_eq!(sizes.iter().filter(|&&size| size == 6).count(), 1);
+        assert_eq!(limit.load(Ordering::Relaxed), 1);
     }
 }

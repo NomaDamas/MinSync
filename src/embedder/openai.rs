@@ -1,9 +1,12 @@
-use crate::embedder::retry::{classify_send_error, classify_status, RequestError, RetryPolicy};
+use crate::embedder::retry::{
+    classify_send_error, classify_status, embed_adaptive, RequestError, RetryPolicy,
+};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -12,6 +15,9 @@ pub struct OpenAiEmbedder {
     model: String,
     api_key: String,
     batch_size: usize,
+    /// Current per-request input limit: starts at `batch_size` and only ever
+    /// shrinks, when the server answers 413/504/timeouts for a larger batch.
+    batch_limit: AtomicUsize,
     max_concurrent: usize,
     retry: RetryPolicy,
     client: reqwest::Client,
@@ -51,6 +57,7 @@ impl OpenAiEmbedder {
             model: model.to_string(),
             api_key: api_key.to_string(),
             batch_size,
+            batch_limit: AtomicUsize::new(batch_size.max(1)),
             max_concurrent: 1,
             retry: RetryPolicy::default(),
             client: build_client(DEFAULT_REQUEST_TIMEOUT),
@@ -85,39 +92,46 @@ impl OpenAiEmbedder {
     }
 
     async fn embed_batch(&self, batch: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.retry
-            .run(|| async {
-                let request = EmbedRequest {
-                    input: batch.clone(),
-                    model: self.model.clone(),
-                };
+        embed_adaptive(&self.retry, &self.batch_limit, batch, |batch| {
+            self.send_once(batch)
+        })
+        .await
+    }
 
-                let response = self
-                    .client
-                    .post(format!("{}/v1/embeddings", self.base_url))
-                    .bearer_auth(&self.api_key)
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|error| classify_send_error(&error, "OpenAI"))?;
+    async fn send_once(
+        &self,
+        batch: Vec<String>,
+    ) -> std::result::Result<Vec<Vec<f32>>, RequestError> {
+        let request = EmbedRequest {
+            input: batch,
+            model: self.model.clone(),
+        };
 
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(classify_status(status, "OpenAI", &body));
-                }
-
-                let embed_response: EmbedResponse = response.json().await.map_err(|error| {
-                    RequestError::Fatal(format!("OpenAI malformed response: {error}"))
-                })?;
-
-                Ok(embed_response
-                    .data
-                    .into_iter()
-                    .map(|data| data.embedding)
-                    .collect())
-            })
+        let response = self
+            .client
+            .post(format!("{}/v1/embeddings", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
             .await
+            .map_err(|error| classify_send_error(&error, "OpenAI"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify_status(status, "OpenAI", &body));
+        }
+
+        let embed_response: EmbedResponse = response
+            .json()
+            .await
+            .map_err(|error| RequestError::Fatal(format!("OpenAI malformed response: {error}")))?;
+
+        Ok(embed_response
+            .data
+            .into_iter()
+            .map(|data| data.embedding)
+            .collect())
     }
 
     pub fn from_env(model: &str, batch_size: usize) -> Result<Self> {
@@ -486,5 +500,80 @@ mod tests {
             elapsed < Duration::from_millis(550),
             "3 batches x 200ms should overlap with max_concurrent=3, took {elapsed:?}"
         );
+    }
+
+    /// 200 with `[first byte]` per input, but `status` for any request with
+    /// more than `max_inputs` inputs.
+    struct CeilingOpenAi {
+        max_inputs: usize,
+        status: u16,
+    }
+
+    impl wiremock::Respond for CeilingOpenAi {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            if inputs.len() > self.max_inputs {
+                return ResponseTemplate::new(self.status).set_body_string("too big");
+            }
+            let data: Vec<_> = inputs
+                .iter()
+                .map(|input| json!({"embedding": [f32::from(input.as_str().unwrap().as_bytes()[0])]}))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+        }
+    }
+
+    fn letters(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| char::from(b'a' + index as u8).to_string())
+            .collect()
+    }
+
+    async fn ceiling_server(max_inputs: usize, status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(CeilingOpenAi { max_inputs, status })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_504_and_413_split_the_batch_and_keep_order() {
+        for status in [504, 413] {
+            let server = ceiling_server(2, status).await;
+            let embedder = OpenAiEmbedder::new("text-embedding-3-small", "test-key", 8)
+                .with_base_url(&server.uri())
+                .with_max_retries(3)
+                .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+            let texts = letters(8);
+
+            let embeddings = embedder.embed(&texts).await.unwrap();
+
+            let expected: Vec<Vec<f32>> = texts
+                .iter()
+                .map(|text| vec![f32::from(text.as_bytes()[0])])
+                .collect();
+            assert_eq!(embeddings, expected, "status {status}");
+            // 8 fails, 4 fails, then only requests of 2.
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                6,
+                "status {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_input_413_fails_fast() {
+        let server = ceiling_server(0, 413).await;
+        let embedder = fast_retry_embedder(&server.uri(), 3);
+
+        let error = embedder.embed(&letters(1)).await.unwrap_err();
+
+        assert!(error.to_string().contains("413"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

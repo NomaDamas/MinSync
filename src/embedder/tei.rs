@@ -1,16 +1,22 @@
 use crate::embedder::openai::{build_client, DEFAULT_REQUEST_TIMEOUT};
-use crate::embedder::retry::{classify_send_error, classify_status, RequestError, RetryPolicy};
+use crate::embedder::retry::{
+    classify_send_error, classify_status, embed_adaptive, RequestError, RetryPolicy,
+};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Serialize;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 pub struct TeiEmbedder {
     model: String,
     base_url: String,
     batch_size: usize,
+    /// Current per-request input limit: starts at `batch_size` and only ever
+    /// shrinks, when the server answers 413/504/timeouts for a larger batch.
+    batch_limit: AtomicUsize,
     max_concurrent: usize,
     retry: RetryPolicy,
     query_prefix: Option<String>,
@@ -36,6 +42,7 @@ impl TeiEmbedder {
             model: model.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             batch_size,
+            batch_limit: AtomicUsize::new(batch_size.max(1)),
             max_concurrent: 1,
             retry: RetryPolicy::default(),
             query_prefix: None,
@@ -82,44 +89,51 @@ impl TeiEmbedder {
     }
 
     async fn embed_inputs(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        embed_adaptive(&self.retry, &self.batch_limit, inputs, |batch| {
+            self.send_once(batch)
+        })
+        .await
+    }
+
+    async fn send_once(
+        &self,
+        inputs: Vec<String>,
+    ) -> std::result::Result<Vec<Vec<f32>>, RequestError> {
         let expected_count = inputs.len();
-        self.retry
-            .run(|| async {
-                let request = EmbedRequest {
-                    inputs: inputs.clone(),
-                    normalize: true,
-                    truncate: self.truncate.then_some(true),
-                };
+        let request = EmbedRequest {
+            inputs,
+            normalize: true,
+            truncate: self.truncate.then_some(true),
+        };
 
-                let response = self
-                    .client
-                    .post(format!("{}/embed", self.base_url))
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|error| classify_send_error(&error, "TEI"))?;
-
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(classify_status(status, "TEI", &body));
-                }
-
-                let embeddings: Vec<Vec<f32>> = response.json().await.map_err(|error| {
-                    RequestError::Fatal(format!("TEI malformed response: {error}"))
-                })?;
-
-                if embeddings.len() != expected_count {
-                    return Err(RequestError::Fatal(format!(
-                        "TEI API returned {} embeddings for {} inputs",
-                        embeddings.len(),
-                        expected_count
-                    )));
-                }
-
-                Ok(embeddings)
-            })
+        let response = self
+            .client
+            .post(format!("{}/embed", self.base_url))
+            .json(&request)
+            .send()
             .await
+            .map_err(|error| classify_send_error(&error, "TEI"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify_status(status, "TEI", &body));
+        }
+
+        let embeddings: Vec<Vec<f32>> = response
+            .json()
+            .await
+            .map_err(|error| RequestError::Fatal(format!("TEI malformed response: {error}")))?;
+
+        if embeddings.len() != expected_count {
+            return Err(RequestError::Fatal(format!(
+                "TEI API returned {} embeddings for {} inputs",
+                embeddings.len(),
+                expected_count
+            )));
+        }
+
+        Ok(embeddings)
     }
 }
 
@@ -554,5 +568,170 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].headers.contains_key("authorization"));
+    }
+
+    /// Answers 200 with `[[first byte of the text]]` per input, but replies
+    /// with `status` (optionally after `delay`) to any request carrying more
+    /// than `max_inputs` inputs, like a gateway with a batch/latency ceiling.
+    struct CeilingTei {
+        max_inputs: usize,
+        status: u16,
+        delay: Option<std::time::Duration>,
+    }
+
+    impl wiremock::Respond for CeilingTei {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let inputs = body["inputs"].as_array().unwrap();
+            if inputs.len() > self.max_inputs {
+                let mut response = ResponseTemplate::new(self.status).set_body_string("too big");
+                if let Some(delay) = self.delay {
+                    response = response.set_delay(delay);
+                }
+                return response;
+            }
+            let vectors: Vec<Vec<f32>> = inputs
+                .iter()
+                .map(|input| vec![f32::from(input.as_str().unwrap().as_bytes()[0])])
+                .collect();
+            ResponseTemplate::new(200).set_body_json(vectors)
+        }
+    }
+
+    fn letters(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| char::from(b'a' + index as u8).to_string())
+            .collect()
+    }
+
+    fn expected_for(texts: &[String]) -> Vec<Vec<f32>> {
+        texts
+            .iter()
+            .map(|text| vec![f32::from(text.as_bytes()[0])])
+            .collect()
+    }
+
+    async fn ceiling_server(ceiling: CeilingTei) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embed"))
+            .respond_with(ceiling)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_504_splits_the_batch_instead_of_resending_it() {
+        let server = ceiling_server(CeilingTei {
+            max_inputs: 2,
+            status: 504,
+            delay: None,
+        })
+        .await;
+        let embedder = TeiEmbedder::new("m", &server.uri(), 8)
+            .with_max_retries(3)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+        let texts = letters(8);
+
+        let embeddings = embedder.embed(&texts).await.unwrap();
+
+        assert_eq!(embeddings, expected_for(&texts), "order must be preserved");
+        // 8 (504) -> 4 (504) -> 2+2 ok, then the second 4 is pre-split to 2+2.
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_413_splits_the_batch() {
+        let server = ceiling_server(CeilingTei {
+            max_inputs: 3,
+            status: 413,
+            delay: None,
+        })
+        .await;
+        let embedder = TeiEmbedder::new("m", &server.uri(), 8)
+            .with_max_retries(3)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+        let texts = letters(8);
+
+        let embeddings = embedder.embed(&texts).await.unwrap();
+
+        assert_eq!(embeddings, expected_for(&texts));
+    }
+
+    #[tokio::test]
+    async fn test_client_timeout_splits_the_batch() {
+        let server = ceiling_server(CeilingTei {
+            max_inputs: 2,
+            status: 200,
+            delay: Some(Duration::from_millis(600)),
+        })
+        .await;
+        let embedder = TeiEmbedder::new("m", &server.uri(), 8)
+            .with_timeout(Duration::from_millis(150))
+            .with_max_retries(3)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+        let texts = letters(8);
+
+        let embeddings = embedder.embed(&texts).await.unwrap();
+
+        assert_eq!(embeddings, expected_for(&texts));
+    }
+
+    #[tokio::test]
+    async fn test_later_calls_start_from_the_lowered_batch_size() {
+        let server = ceiling_server(CeilingTei {
+            max_inputs: 2,
+            status: 504,
+            delay: None,
+        })
+        .await;
+        let embedder = TeiEmbedder::new("m", &server.uri(), 8)
+            .with_max_retries(3)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+        let texts = letters(8);
+        embedder.embed(&texts).await.unwrap();
+        let after_first = server.received_requests().await.unwrap().len();
+
+        embedder.embed(&texts).await.unwrap();
+
+        let second = server.received_requests().await.unwrap().len() - after_first;
+        assert_eq!(second, 4, "four requests of two, no oversize probe");
+    }
+
+    #[tokio::test]
+    async fn test_single_input_504_still_uses_the_retry_policy() {
+        let server = ceiling_server(CeilingTei {
+            max_inputs: 0,
+            status: 504,
+            delay: None,
+        })
+        .await;
+        let embedder = TeiEmbedder::new("m", &server.uri(), 8)
+            .with_max_retries(2)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+
+        let error = embedder.embed(&letters(1)).await.unwrap_err();
+
+        assert!(error.to_string().contains("retries exhausted"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_single_input_413_fails_fast() {
+        let server = ceiling_server(CeilingTei {
+            max_inputs: 0,
+            status: 413,
+            delay: None,
+        })
+        .await;
+        let embedder = TeiEmbedder::new("m", &server.uri(), 8)
+            .with_max_retries(3)
+            .with_backoff(Duration::from_millis(1), Duration::from_millis(4));
+
+        let error = embedder.embed(&letters(1)).await.unwrap_err();
+
+        assert!(error.to_string().contains("413"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

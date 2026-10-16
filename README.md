@@ -318,7 +318,7 @@ on_file_error = "skip"   # "fail" aborts on the first failing file (the pre-0.5 
 
 ## Embedding Reliability
 
-Embedding requests use per-request timeouts and retry transient failures: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or lexical language changed in between.
+Embedding requests use per-request timeouts and retry transient failures: network errors, HTTP 429, and HTTP 5xx. When a `tei:` / `openai:` request with several inputs is answered with HTTP 413, 408 or 504, or hits the request timeout, the server found the batch too big or too slow: MinSync does not resend it, but halves the batch and lowers the effective `batch_size` for the rest of the run (a single input is retried per `max_retries`; a single-input 413 fails immediately). Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or lexical language changed in between.
 
 ```toml
 [embedder]
