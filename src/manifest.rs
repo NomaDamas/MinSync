@@ -803,11 +803,13 @@ mod tests {
     }
 
     /// Injects per-path I/O failures into the scan.
+    #[cfg(unix)]
     struct FaultyFs {
         metadata_errors: Vec<(&'static str, i32)>,
         hash_errors: Vec<(&'static str, i32)>,
     }
 
+    #[cfg(unix)]
     impl FaultyFs {
         fn lookup(table: &[(&'static str, i32)], path: &Path) -> Option<std::io::Error> {
             let name = path.file_name()?.to_str()?;
@@ -818,6 +820,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl ScanFs for FaultyFs {
         fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
             match Self::lookup(&self.metadata_errors, path) {
@@ -834,10 +837,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn scan_faulty(dir: &Path, faulty: &FaultyFs) -> (Manifest, ScanStats) {
         Manifest::scan_with_fs(dir, "source-1", None, faulty).expect("scan survives entry errors")
     }
 
+    #[cfg(unix)]
     fn three_files() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create tempdir");
         for name in ["a.txt", "b.txt", "c.txt"] {

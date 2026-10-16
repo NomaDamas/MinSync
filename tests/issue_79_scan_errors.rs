@@ -174,6 +174,38 @@ async fn unreadable_file_is_recorded_and_keeps_its_chunks() {
     assert_eq!(sorted_paths(&store), vec!["ok.txt", "secret.txt"]);
 }
 
+#[tokio::test]
+async fn verify_fix_and_status_treat_unreadable_directory_as_unknown() {
+    if running_as_root() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(root.path().join("locked")).expect("mkdir");
+    fs::write(root.path().join("locked/inner.txt"), "inner text").expect("write inner");
+    fs::write(root.path().join("ok.txt"), "ok text").expect("write ok");
+    let sync = setup(root.path());
+    let mut store = InMemoryStore::new();
+    run(&sync, &mut store, false).await;
+
+    let _lock = Locked::new(root.path().join("locked"));
+    let minsync_dir = root.path().join(".minsync");
+    let chunker = RecursiveChunker::new(4096);
+
+    let verified =
+        minsync::verify::verify(&minsync_dir, root.path(), &chunker, &mut store, true, None)
+            .await
+            .expect("verify must not abort");
+    assert!(
+        !verified.fixed,
+        "verify --fix must not delete unreadable chunks"
+    );
+    assert!(verified.basic_checks["no_stale_paths"]);
+    assert_eq!(sorted_paths(&store), vec!["locked/inner.txt", "ok.txt"]);
+
+    let status = minsync::verify::status(&minsync_dir).await.expect("status");
+    assert_eq!(status.state, minsync::types::SyncState::UpToDate);
+}
+
 #[test]
 fn sync_result_without_scan_errors_field_still_deserializes() {
     let json = serde_json::json!({

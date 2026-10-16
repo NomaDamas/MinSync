@@ -56,7 +56,12 @@ pub async fn verify(
             .is_some_and(|active_cursor| active_cursor.chunk_schema_id == chunker.schema_id()),
     );
 
-    let manifest = Manifest::scan(root, &config.source_id)?;
+    // Paths the scan could not inspect are unknown, never stale: carrying
+    // them keeps `--fix` from deleting their chunks (issue #79).
+    let stored_manifest = Manifest::load(&minsync_dir.join("manifest.json")).ok();
+    let (manifest, _, unknown_paths) =
+        Manifest::scan_keeping_unknown(root, &config.source_id, None, stored_manifest.as_ref())?;
+    let unknown_set: HashSet<&str> = unknown_paths.iter().map(String::as_str).collect();
     let stale_paths = find_stale_paths(&manifest, store);
     basic_checks.insert("no_stale_paths".to_string(), stale_paths.is_empty());
 
@@ -72,7 +77,14 @@ pub async fn verify(
     let index_state = store.index_state()?;
 
     let mut sample_ok = true;
-    for path in sample_paths(&manifest, sample) {
+    let readable_manifest = {
+        let mut readable = manifest.clone();
+        readable
+            .files
+            .retain(|path, _| !unknown_set.contains(path.as_str()));
+        readable
+    };
+    for path in sample_paths(&readable_manifest, sample) {
         let expected_ids = expected_doc_ids(root, &path, &config, chunker)?;
         let fetched = store.fetch(&expected_ids)?;
         if fetched.len() != expected_ids.len() {

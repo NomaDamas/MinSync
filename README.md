@@ -175,12 +175,13 @@ authoritative rescan is required.
 
 ### Unreadable entries
 
-One bad entry never aborts a sync. A directory or file the scan cannot read
+A directory or file the scan cannot read
 (`EACCES`, `EPERM`, `EIO`, `EBUSY`, `ETIMEDOUT`, `ESTALE`, symlink loops, ...)
-is skipped and reported in the sync summary's `scan_errors` list
-(`path`, `kind` = `transient` or `permanent`, `error`) with one warning per
-entry. A path that vanished mid-scan (`ENOENT`, `ENOTDIR`) is treated as
-deleted, as before.
+no longer aborts the scan: it is skipped and reported in the sync summary's
+`scan_errors` list (`path`, `kind` = `transient` or `permanent`, `error`) with
+one warning per entry. A path that vanished mid-scan (`ENOENT`, `ENOTDIR`) is
+treated as deleted. `status` and `verify` apply the same rule, so
+`verify --fix` never removes chunks of an unreadable path.
 
 **Guarantee:** an entry that errored is *unknown*, never *deleted*. Its
 previously indexed chunks are kept, including during `--full` sweeps, until a

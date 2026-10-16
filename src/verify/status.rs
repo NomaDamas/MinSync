@@ -66,7 +66,12 @@ fn status_result(
 
 fn load_or_scan_manifest(minsync_dir: &Path, config: &Config) -> Result<Manifest> {
     if let Some(root) = minsync_dir.parent() {
-        return Manifest::scan(root, &config.source_id);
+        // Carry entries the scan cannot inspect, as `sync` does, so status
+        // agrees with the cursor hash while an unreadable path exists.
+        let stored = Manifest::load(&minsync_dir.join("manifest.json")).ok();
+        let (manifest, _, _) =
+            Manifest::scan_keeping_unknown(root, &config.source_id, None, stored.as_ref())?;
+        return Ok(manifest);
     }
 
     Manifest::load(&minsync_dir.join("manifest.json"))
