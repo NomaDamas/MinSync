@@ -99,6 +99,7 @@ fn with_path(error: MinSyncError, path: &str) -> MinSyncError {
         }
         MinSyncError::Manifest(message) => MinSyncError::Manifest(format!("{path}: {message}")),
         MinSyncError::Config(message) => MinSyncError::Config(format!("{path}: {message}")),
+        MinSyncError::Timeout(message) => MinSyncError::Timeout(format!("{path}: {message}")),
         other => MinSyncError::Other(format!("{path}: {other}")),
     }
 }
@@ -111,7 +112,10 @@ fn record_failure(
     failure: StageError,
     result: &mut SyncResult,
 ) -> Result<()> {
-    if !skip {
+    // An embedder deadline means the native runtime is wedged for the rest of
+    // the process: skipping files would only time out again. Abort (exit 7);
+    // `progress.jsonl` keeps what was already committed.
+    if !skip || matches!(failure.error, MinSyncError::Timeout(_)) {
         return Err(with_path(failure.error, path));
     }
     tracing::warn!(
@@ -212,7 +216,9 @@ pub(super) async fn index_batch(
     let prepared_items: Vec<&BatchItem> = prepared.iter().map(|file| file.item).collect();
     match commit(prepared, &delete_paths, &mut context, result).await {
         Ok(()) => {}
-        Err(failure) if !skip => return Err(failure.error),
+        Err(failure) if !skip || matches!(failure.error, MinSyncError::Timeout(_)) => {
+            return Err(failure.error)
+        }
         Err(failure) => {
             tracing::warn!(
                 stage = %failure.stage,
