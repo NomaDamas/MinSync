@@ -35,6 +35,8 @@ pub(super) fn empty_sync_result(dry_run: bool, already_up_to_date: bool) -> Sync
         query_ready: false,
         files_resumed: 0,
         scan_errors: Vec::new(),
+        files_failed: Vec::new(),
+        partial: false,
     }
 }
 

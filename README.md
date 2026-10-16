@@ -183,6 +183,10 @@ one warning per entry. A path that vanished mid-scan (`ENOENT`, `ENOTDIR`) is
 treated as deleted. `status` and `verify` apply the same rule, so
 `verify --fix` never removes chunks of an unreadable path.
 
+With `[sync] on_file_error = "skip"` (default) each unreadable entry is also
+listed in `files_failed` (stage `read`), so the run is `partial` and exits with
+code 6; with `"fail"` the sync aborts at the first one, naming its path.
+
 **Guarantee:** an entry that errored is *unknown*, never *deleted*. Its
 previously indexed chunks are kept, including during `--full` sweeps, until a
 later scan can read the path again (or confirms it is gone). If the root
@@ -270,6 +274,24 @@ compact_fragment_threshold = 64
 
 `minsync optimize` runs only compact + re-index + prune (no embedding, no file reads) to repair a store that earlier interrupted syncs left fragmented.
 
+## Skipped files
+
+By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. A skipped file is never recorded as done: a new file stays out of the saved manifest and a previously indexed file keeps its previous manifest entry, so the next `minsync sync` retries it automatically. Its old chunks (if it was indexed before) stay searchable until it succeeds, including across full syncs.
+
+```json
+"files_failed": [
+  { "path": "notes/broken.pdf", "stage": "read", "error": "io error: notes/broken.pdf: Permission denied (os error 13)" }
+],
+"partial": true
+```
+
+`stage` is one of `read`, `chunk`, `truncate`, `embed`, `store`. When `partial` is true the CLI exits with code **6** (completed, files skipped) and text output lists each skipped path on stderr. Hard failures keep their codes (1, 3, 4, 5). An embed/store failure that hits the first few files of a run with nothing indexed yet (for example the embedder being down) is treated as an outage, not as bad files: the sync aborts with that error (exit 5/4) and the file path in the message.
+
+```toml
+[sync]
+on_file_error = "skip"   # "fail" aborts on the first failing file (the pre-0.5 behavior)
+```
+
 ## Embedding Reliability
 
 Embedding requests use per-request timeouts and retry transient failures: network errors, timeouts, HTTP 429, and HTTP 5xx. Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or lexical language changed in between.
@@ -279,6 +301,14 @@ Embedding requests use per-request timeouts and retry transient failures: networ
 max_retries = 3
 timeout_seconds = 60
 max_concurrent = 1
+```
+
+`timeout_seconds` also bounds the native (in-process) embedder: each forward pass (one batch) must finish within `per_batch_timeout_seconds` (default: `timeout_seconds`); `0` is rejected. A blocked native kernel cannot be cancelled, so on expiry `minsync sync` aborts with exit code `7` (`embedder timeout`) instead of hanging; the stuck thread dies with the process, and once it happens every later native call in that process fails fast. `progress.jsonl` keeps every file committed before the timeout, so re-running `minsync sync` resumes without re-embedding them. `minsync check` forward passes are bounded the same way. Model download/load is not bounded. On CPU, large batches can legitimately take long; raise `per_batch_timeout_seconds` there.
+
+```toml
+[embedder]
+timeout_seconds = 60
+per_batch_timeout_seconds = 120   # optional, native only
 ```
 
 `base_url` also works for OpenAI-compatible gateways.

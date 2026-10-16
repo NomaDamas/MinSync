@@ -55,6 +55,7 @@ mod tests {
         assert_eq!(config.embedder.max_concurrent, 1);
         assert_eq!(config.embedder.max_retries, 3);
         assert_eq!(config.embedder.timeout_seconds, 60);
+        assert_eq!(config.embedder.per_batch_timeout_seconds, None);
         assert_eq!(config.embedder.base_url, None);
         assert_eq!(config.embedder.query_prefix, None);
         assert_eq!(config.embedder.passage_prefix, None);

@@ -1,3 +1,4 @@
+pub mod deadline;
 pub mod native;
 pub mod openai;
 pub mod retry;

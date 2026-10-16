@@ -71,6 +71,8 @@ fn default_sync_result_serializes_zero_chunks_truncated() {
         files_deleted: 0,
         files_resumed: 0,
         scan_errors: Vec::new(),
+        files_failed: Vec::new(),
+        partial: false,
         elapsed_seconds: 0.0,
         embedding_api_calls: 0,
         embedded_texts: 0,

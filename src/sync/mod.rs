@@ -7,12 +7,12 @@ mod progress;
 mod result;
 
 use crate::chunker::Chunker;
-use crate::config::Config;
+use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use crate::manifest::{FileChange, Manifest};
 use crate::state::{Cursor, FileLock, Transaction};
-use crate::types::SyncResult;
+use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
 use indexer::{index_batch, BatchItem, BatchKind, SyncFileContext};
 use progress::{ProgressHeader, ProgressLog, PROGRESS_FILE};
@@ -85,7 +85,11 @@ impl MinSync {
         }
 
         config.save(&self.minsync_dir.join("config.toml"))?;
-        Manifest::scan(&self.root, &source_id)?.save(&self.minsync_dir.join("manifest.json"))?;
+        // Baseline only (the first sync is always full): a file that cannot
+        // be read here is skipped and reported by that sync, not fatal.
+        Manifest::scan_with_baseline_stats(&self.root, &source_id, None)?
+            .0
+            .save(&self.minsync_dir.join("manifest.json"))?;
         if let Some(staging) = reset_staging {
             std::fs::remove_dir_all(staging)?;
         }
@@ -259,6 +263,7 @@ impl MinSync {
         };
         let scan_baseline = if full { None } else { stored_manifest.as_ref() };
         let start = std::time::Instant::now();
+        let skip_failures = config.sync.on_file_error == OnFileError::Skip;
         // Entries the scan could not inspect are carried over from the stored
         // manifest: unknown, never deleted (issue #79).
         let (new_manifest, scan_stats, unknown_paths) = Manifest::scan_keeping_unknown(
@@ -268,11 +273,36 @@ impl MinSync {
             stored_manifest.as_ref(),
         )?;
         let scan_errors = scan_stats.errors;
+        if !skip_failures {
+            // `on_file_error = "fail"`: abort on the first unreadable entry,
+            // naming it.
+            if let Some(first) = scan_errors.first() {
+                return Err(MinSyncError::Manifest(format!(
+                    "{}: {}",
+                    first.path, first.error
+                )));
+            }
+        }
+        // `on_file_error = "skip"`: an unreadable entry is also a skipped
+        // file, so the run is `partial` (exit 6) and the next sync retries it.
+        let scan_failures: Vec<FileFailure> = if skip_failures {
+            scan_errors
+                .iter()
+                .map(|error| FileFailure {
+                    path: error.path.clone(),
+                    stage: FileStage::Read,
+                    error: error.error.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let unknown_set: HashSet<&str> = unknown_paths.iter().map(String::as_str).collect();
         let mut changes = Manifest::diff(&old_manifest, &new_manifest);
         changes.retain(|change| !unknown_set.contains(change_path(change).as_str()));
-        // A sweep must spare rows of paths this run could not inspect.
-        let sweep_filter = |sync_token: &str| {
+        // A sweep must spare rows of paths this run could not inspect and of
+        // files it skipped (their old rows stay searchable until they succeed).
+        let sweep_filter = |sync_token: &str, failed: &[FileFailure]| {
             let mut filters = vec![
                 Filter::Eq("source_id".to_string(), config.source_id.clone()),
                 Filter::Neq("seen_token".to_string(), sync_token.to_string()),
@@ -280,11 +310,18 @@ impl MinSync {
             if !unknown_paths.is_empty() {
                 filters.push(Filter::NotIn("path".to_string(), unknown_paths.clone()));
             }
+            filters.extend(
+                failed
+                    .iter()
+                    .map(|failure| Filter::Neq("path".to_string(), failure.path.clone())),
+            );
             Filter::And(filters)
         };
 
         if changes.is_empty() && !full {
             let mut result = empty_sync_result(dry_run, true);
+            result.partial = !scan_failures.is_empty();
+            result.files_failed = scan_failures;
             result.files_checked = new_manifest.files.len();
             result.query_ready = cursor_path.exists();
             result.scan_errors = scan_errors;
@@ -316,6 +353,8 @@ impl MinSync {
                 initial_sync,
                 ..empty_sync_result(true, false)
             };
+            result.partial = !scan_failures.is_empty();
+            result.files_failed = scan_failures;
             result.files_checked = new_manifest.files.len();
             result.scan_errors = scan_errors;
             result.elapsed_seconds = start.elapsed().as_secs_f64();
@@ -358,6 +397,7 @@ impl MinSync {
         let mut progress = ProgressLog::create(&progress_path, &header, &carried)?;
 
         let mut result = empty_sync_result(false, false);
+        result.files_failed = scan_failures;
         result.initial_sync = initial_sync;
         result.files_checked = new_manifest.files.len();
         result.scan_errors = scan_errors;
@@ -365,7 +405,8 @@ impl MinSync {
         if lexical_rebuild {
             // Rows indexed under the previous lexical language must go. Keyed
             // on the token so a resumed run keeps what it already rewrote.
-            result.chunks_deleted += store.delete_by_filter(&sweep_filter(&sync_token))?;
+            result.chunks_deleted +=
+                store.delete_by_filter(&sweep_filter(&sync_token, &result.files_failed))?;
         }
 
         let checkpoint_every = self
@@ -451,12 +492,19 @@ impl MinSync {
                 store,
                 sync_token: &sync_token,
             };
+            let failed_before = result.files_failed.len();
             index_batch(&self.root, &items, context, &mut result).await?;
 
             // Logged only after the store commits returned: a logged path is
             // always safe to skip on resume. One fsync for the whole batch.
+            // Failed files stay unlogged so a resumed run retries them.
+            let failed_now: HashSet<&str> = result.files_failed[failed_before..]
+                .iter()
+                .map(|failure| failure.path.as_str())
+                .collect();
             let logged: Vec<(String, Option<String>)> = group
                 .iter()
+                .filter(|(item, _)| !failed_now.contains(item.path.as_str()))
                 .map(|(item, hash)| (item.path.clone(), hash.clone()))
                 .collect();
             progress.append(&logged)?;
@@ -476,14 +524,33 @@ impl MinSync {
         }
 
         if full {
-            result.chunks_deleted += store.delete_by_filter(&sweep_filter(&sync_token))?;
+            result.chunks_deleted +=
+                store.delete_by_filter(&sweep_filter(&sync_token, &result.files_failed))?;
         }
 
         store.flush()?;
+
+        // A skipped file must be retried by the next sync, so the saved
+        // manifest keeps its previous entry (or none, if it was never
+        // indexed) instead of recording it as done.
+        let mut saved_manifest = new_manifest.clone();
+        for failure in &result.files_failed {
+            match old_manifest.files.get(&failure.path) {
+                Some(entry) => {
+                    saved_manifest
+                        .files
+                        .insert(failure.path.clone(), entry.clone());
+                }
+                None => {
+                    saved_manifest.files.remove(&failure.path);
+                }
+            }
+        }
+        result.partial = !result.files_failed.is_empty();
         Cursor {
             source_id: config.source_id.clone(),
             last_synced_at: chrono::Utc::now().to_rfc3339(),
-            manifest_hash: new_manifest.manifest_hash(),
+            manifest_hash: saved_manifest.manifest_hash(),
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
             collection_path: config.collection.path.clone(),
@@ -496,7 +563,7 @@ impl MinSync {
             },
         }
         .save(&cursor_path)?;
-        new_manifest.save(&manifest_path)?;
+        saved_manifest.save(&manifest_path)?;
         ProgressLog::remove(&progress_path)?;
         Transaction::remove(&txn_path)?;
 
@@ -1074,7 +1141,8 @@ mod tests {
     #[tokio::test]
     async fn test_index_file_reports_path_for_persistent_non_finite_chunk() {
         let (dir, _sync, chunker, _embedder, mut store) = fixture();
-        let config = Config::default_for("source-1");
+        let mut config = Config::default_for("source-1");
+        config.sync.on_file_error = crate::config::OnFileError::Fail;
         std::fs::write(dir.path().join("bad.txt"), "poison").expect("write file");
         let mut result = empty_sync_result(false, false);
         let context = SyncFileContext {
@@ -1318,6 +1386,8 @@ mod tests {
         checkpoints: usize,
         /// Fail every write of new rows once this many have succeeded.
         fail_upserts_after: Option<usize>,
+        /// Fail any insert that carries a row for this path.
+        poison_path: Option<String>,
     }
 
     impl SpyStore {
@@ -1343,6 +1413,11 @@ mod tests {
                 .is_some_and(|n| self.upsert_calls >= n)
             {
                 return Err(MinSyncError::VectorStore("injected crash".into()));
+            }
+            if let Some(poison) = &self.poison_path {
+                if docs.iter().any(|doc| &doc.path == poison) {
+                    return Err(MinSyncError::VectorStore("disk full".into()));
+                }
             }
             self.upsert_calls += 1;
             self.insert_calls += 1;
@@ -1602,6 +1677,7 @@ mod tests {
         write_numbered_files(&dir, 6);
         init_sync(&sync);
         set_batch_files(&sync, 2);
+        set_on_file_error(&sync, crate::config::OnFileError::Fail);
         let mut store = SpyStore {
             fail_upserts_after: Some(2),
             ..SpyStore::default()
@@ -1635,6 +1711,7 @@ mod tests {
         write_numbered_files(dir, 6);
         init_sync(sync);
         set_batch_files(sync, 1);
+        set_on_file_error(sync, crate::config::OnFileError::Fail);
         let mut store = SpyStore {
             fail_upserts_after: Some(3),
             ..SpyStore::default()
@@ -1724,6 +1801,65 @@ mod tests {
         assert!(joined.contains("CHANGED"), "{hits:?}");
     }
 
+    /// The `fail_on_call`-th `embed` call (1-based) reports a native deadline
+    /// expiry instead of embedding.
+    struct TimeoutOnCall {
+        calls: AtomicUsize,
+        fail_on_call: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for TimeoutOnCall {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_call {
+                return Err(MinSyncError::Timeout("stuck native batch".to_string()));
+            }
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embedder_timeout_aborts_with_code_7_and_rerun_resumes_committed_files() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_numbered_files(&dir, 6);
+        init_sync(&sync);
+        set_batch_files(&sync, 1);
+        let stuck = TimeoutOnCall {
+            calls: AtomicUsize::new(0),
+            fail_on_call: 4,
+        };
+
+        let error = sync
+            .sync(&chunker, &stuck, &mut store, true, false, false)
+            .await
+            .expect_err("timeout aborts the run");
+
+        assert!(matches!(error, MinSyncError::Timeout(_)), "{error}");
+        assert_eq!(error.exit_code(), 7);
+        assert!(sync.minsync_dir.join("progress.jsonl").exists());
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+        assert_eq!(store.all_paths().len(), 3, "three files committed first");
+
+        let (healthy, healthy_count) = counting_embedder();
+        let result = sync
+            .sync(&chunker, &healthy, &mut store, false, false, false)
+            .await
+            .expect("rerun resumes");
+
+        assert_eq!(result.files_resumed, 3);
+        assert_eq!(result.files_processed, 3);
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            result.embedded_texts,
+            "committed files are not re-embedded"
+        );
+        assert_eq!(store.all_paths().len(), 6);
+    }
+
     #[tokio::test]
     async fn test_resume_discarded_when_chunking_config_changes() {
         let (dir, sync, chunker, _embedder, _store) = fixture();
@@ -1766,6 +1902,7 @@ mod tests {
             )
             .expect("modify file");
         }
+        set_on_file_error(&sync, crate::config::OnFileError::Fail);
         store.upsert_calls = 0;
         store.fail_upserts_after = Some(1);
         sync.sync(&chunker, &embedder, &mut store, false, false, false)
@@ -1784,5 +1921,393 @@ mod tests {
             store.all_paths(),
             vec!["c-mod.txt", "d-mod.txt", "e-keep.txt"]
         );
+    }
+
+    // ---- issue #78: skip-and-record failing files -------------------------
+
+    use crate::chunker::Chunker;
+    use crate::types::{Chunk, FileStage};
+
+    /// Fails on any text containing `POISON`, like a parser rejecting a file.
+    struct PoisonChunker(ChonkieChunker);
+
+    impl Chunker for PoisonChunker {
+        fn schema_id(&self) -> &str {
+            self.0.schema_id()
+        }
+        fn chunk(&self, text: &str, path: &str) -> Result<Vec<Chunk>> {
+            if text.contains("POISON") {
+                return Err(MinSyncError::Other("parser rejected file".into()));
+            }
+            self.0.chunk(text, path)
+        }
+    }
+
+    /// Fails the whole `embed` call when any text contains `POISON`.
+    struct RejectingEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for RejectingEmbedder {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if texts.iter().any(|text| text.contains("POISON")) {
+                return Err(MinSyncError::Embedding("backend rejected input".into()));
+            }
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    fn set_on_file_error(sync: &MinSync, mode: crate::config::OnFileError) {
+        let path = sync.minsync_dir.join("config.toml");
+        let mut config = Config::load(&path).expect("load config");
+        config.sync.on_file_error = mode;
+        config.save(&path).expect("save config");
+    }
+
+    fn write_good_and_poison(dir: &TempDir) {
+        for name in ["a", "b", "d", "e"] {
+            std::fs::write(
+                dir.path().join(format!("{name}.txt")),
+                format!("{MULTI_CHUNK} {name}"),
+            )
+            .expect("write good file");
+        }
+        std::fs::write(
+            dir.path().join("c-bad.txt"),
+            format!("{MULTI_CHUNK} POISON"),
+        )
+        .expect("write poison file");
+    }
+
+    const GOOD: [&str; 4] = ["a.txt", "b.txt", "d.txt", "e.txt"];
+
+    #[tokio::test]
+    async fn test_chunk_failure_skips_file_and_indexes_the_rest() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+        let chunker = PoisonChunker(chunker);
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync completes despite the bad file");
+
+        assert_eq!(store.all_paths(), GOOD);
+        assert!(result.partial);
+        assert_eq!(result.files_failed.len(), 1);
+        let failure = &result.files_failed[0];
+        assert_eq!(failure.path, "c-bad.txt");
+        assert_eq!(failure.stage, FileStage::Chunk);
+        assert!(failure.error.contains("parser rejected file"));
+        assert_eq!(result.files_processed, 4);
+        assert!(!result
+            .files_processed_paths
+            .contains(&"c-bad.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_embed_failure_poison_file_does_not_take_batch_mates_down() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+
+        let result = sync
+            .sync(&chunker, &RejectingEmbedder, &mut store, true, false, false)
+            .await
+            .expect("sync completes despite the bad file");
+
+        assert_eq!(store.all_paths(), GOOD, "all 4 batch-mates committed");
+        assert!(result.partial);
+        assert_eq!(result.files_failed.len(), 1);
+        assert_eq!(result.files_failed[0].path, "c-bad.txt");
+        assert_eq!(result.files_failed[0].stage, FileStage::Embed);
+        assert!(result.files_failed[0]
+            .error
+            .contains("backend rejected input"));
+        assert_eq!(result.files_processed, 4);
+    }
+
+    #[tokio::test]
+    async fn test_store_failure_poison_file_is_isolated_by_per_file_retry() {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+        let mut store = SpyStore {
+            poison_path: Some("c-bad.txt".into()),
+            ..SpyStore::default()
+        };
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync completes despite the bad file");
+
+        assert_eq!(store.inner.all_paths(), GOOD);
+        assert_eq!(result.files_failed.len(), 1);
+        assert_eq!(result.files_failed[0].path, "c-bad.txt");
+        assert_eq!(result.files_failed[0].stage, FileStage::Store);
+        assert!(result.partial);
+    }
+
+    #[tokio::test]
+    async fn test_read_failure_in_index_batch_names_path_and_stage() {
+        let (dir, _sync, chunker, embedder, _store) = fixture();
+        // A directory where a file is expected: read_to_string fails with
+        // EISDIR, which is neither InvalidData nor NotFound.
+        std::fs::create_dir(dir.path().join("dir.txt")).expect("mkdir");
+        std::fs::write(dir.path().join("ok.txt"), MULTI_CHUNK).expect("write");
+        let config = Config::default_for("source-1");
+        let mut store = InMemoryStore::new();
+        let mut result = empty_sync_result(false, false);
+        let items = ["dir.txt", "ok.txt"].map(|path| BatchItem {
+            path: path.to_string(),
+            kind: BatchKind::Index,
+            purge_first: false,
+        });
+        let context = SyncFileContext {
+            config: &config,
+            chunker: &chunker,
+            embedder: &embedder,
+            store: &mut store,
+            sync_token: "t1",
+        };
+
+        index_batch(dir.path(), &items, context, &mut result)
+            .await
+            .expect("skip mode swallows the read error");
+
+        assert_eq!(store.all_paths(), vec!["ok.txt"]);
+        assert_eq!(result.files_failed.len(), 1);
+        assert_eq!(result.files_failed[0].path, "dir.txt");
+        assert_eq!(result.files_failed[0].stage, FileStage::Read);
+        assert_eq!(result.files_processed_paths, vec!["ok.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unreadable_file_is_skipped_and_retried_once_fixed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        write_numbered_files(&dir, 3);
+        let locked = dir.path().join("locked.txt");
+        std::fs::write(&locked, MULTI_CHUNK).expect("write locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read(&locked).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        init_sync(&sync);
+
+        let first = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync completes despite the unreadable file");
+
+        assert_eq!(store.all_paths(), vec!["f0.txt", "f1.txt", "f2.txt"]);
+        assert!(first.partial);
+        assert_eq!(first.files_failed.len(), 1);
+        assert_eq!(first.files_failed[0].path, "locked.txt");
+        assert_eq!(first.files_failed[0].stage, FileStage::Read);
+        assert!(!first.already_up_to_date);
+
+        // Still unreadable: nothing changed for the indexed files, yet the
+        // failure is reported again rather than silently forgotten.
+        let again = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("second sync");
+        assert!(again.partial);
+        assert_eq!(again.files_failed[0].path, "locked.txt");
+        assert_eq!(again.files_processed, 0);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        let fixed = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("sync after fix");
+        assert!(!fixed.partial);
+        assert!(fixed.files_failed.is_empty());
+        assert_eq!(fixed.files_processed_paths, vec!["locked.txt"]);
+        assert!(store.all_paths().contains(&"locked.txt".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_full_sync_keeps_old_chunks_of_unreadable_indexed_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        write_numbered_files(&dir, 2);
+        let locked = dir.path().join("locked.txt");
+        std::fs::write(&locked, MULTI_CHUNK).expect("write locked");
+        init_sync(&sync);
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("initial sync");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read(&locked).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+
+        let full = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("full sync completes");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        assert!(full.partial);
+        assert!(
+            store.all_paths().contains(&"locked.txt".to_string()),
+            "full sweep must not delete the skipped file's old chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skipped_file_is_retried_by_next_sync() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+        let poison_chunker = PoisonChunker(ChonkieChunker::new(32, "\n "));
+        sync.sync(&poison_chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first sync");
+
+        std::fs::write(dir.path().join("c-bad.txt"), MULTI_CHUNK).expect("fix file");
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("retry sync");
+
+        assert!(!result.partial);
+        assert!(result.files_failed.is_empty());
+        assert_eq!(result.files_processed_paths, vec!["c-bad.txt"]);
+        assert!(store.all_paths().contains(&"c-bad.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_skipped_modified_file_keeps_old_chunks_until_it_succeeds() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), MULTI_CHUNK).expect("write");
+        init_sync(&sync);
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("initial sync");
+        std::fs::write(dir.path().join("a.txt"), format!("{MULTI_CHUNK} POISON")).expect("modify");
+
+        let result = sync
+            .sync(
+                &PoisonChunker(chunker),
+                &embedder,
+                &mut store,
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("sync completes");
+
+        assert!(result.partial);
+        assert_eq!(
+            store.all_paths(),
+            vec!["a.txt"],
+            "old chunks stay searchable"
+        );
+        let status = sync
+            .sync(
+                &PoisonChunker(ChonkieChunker::new(32, "\n ")),
+                &embedder,
+                &mut store,
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("retry still fails the same way");
+        assert!(status.partial, "modified file is retried, not marked done");
+    }
+
+    #[tokio::test]
+    async fn test_on_file_error_fail_aborts_with_path_in_error() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+        set_on_file_error(&sync, crate::config::OnFileError::Fail);
+
+        let error = sync
+            .sync(
+                &PoisonChunker(chunker),
+                &embedder,
+                &mut store,
+                true,
+                false,
+                false,
+            )
+            .await
+            .expect_err("fail mode aborts on the first bad file");
+
+        assert!(
+            error.to_string().contains("c-bad.txt"),
+            "error must name the file: {error}"
+        );
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_on_file_error_fail_embed_error_keeps_exit_code_and_names_path() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+        set_on_file_error(&sync, crate::config::OnFileError::Fail);
+
+        let error = sync
+            .sync(&chunker, &RejectingEmbedder, &mut store, true, false, false)
+            .await
+            .expect_err("fail mode aborts");
+
+        assert!(matches!(error, MinSyncError::Embedding(_)));
+        assert_eq!(error.exit_code(), 5);
+    }
+
+    #[test]
+    fn test_on_file_error_defaults_to_skip_and_parses_from_toml() {
+        let config: crate::config::SyncConfig = toml::from_str("").expect("empty section");
+        assert_eq!(config.on_file_error, crate::config::OnFileError::Skip);
+        let config: crate::config::SyncConfig =
+            toml::from_str("on_file_error = \"fail\"").expect("fail section");
+        assert_eq!(config.on_file_error, crate::config::OnFileError::Fail);
+        assert!(toml::from_str::<crate::config::SyncConfig>("on_file_error = \"x\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_embedder_outage_is_a_hard_failure_not_a_pile_of_skipped_files() {
+        struct DownEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for DownEmbedder {
+            fn id(&self) -> &str {
+                "mock"
+            }
+            async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                Err(MinSyncError::Embedding("service unavailable".into()))
+            }
+        }
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_numbered_files(&dir, 6);
+        init_sync(&sync);
+
+        let error = sync
+            .sync(&chunker, &DownEmbedder, &mut store, true, false, false)
+            .await
+            .expect_err("outage must abort, not skip every file");
+
+        assert_eq!(error.exit_code(), 5);
+        assert!(error.to_string().contains("service unavailable"), "{error}");
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
     }
 }

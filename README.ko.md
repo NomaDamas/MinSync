@@ -152,6 +152,8 @@ summary의 `scan_errors`(`path`, `kind` = `transient` 또는 `permanent`, `error
 삭제로 처리합니다. `status`와 `verify`도 같은 규칙을 적용하므로 `verify --fix`가 읽을 수 없는
 경로의 chunk를 삭제하지 않습니다.
 
+`[sync] on_file_error = "skip"`(기본값)이면 읽을 수 없는 항목은 `files_failed`(stage `read`)에도 기록되어 sync가 `partial`(종료 코드 6)이 되고, `"fail"`이면 첫 항목에서 경로를 밝히며 중단합니다.
+
 **보장:** 오류가 난 항목은 *삭제*가 아니라 *unknown*입니다. 이전에 index된 chunk는
 `--full` sweep 중에도 유지되며, 이후 scan이 해당 경로를 다시 읽거나 사라졌음을
 확인할 때까지 남습니다. root 디렉터리 자체를 읽을 수 없으면 어떤 파일도 판단할 수
@@ -237,6 +239,24 @@ compact_fragment_threshold = 64
 ```
 
 `minsync optimize`는 compact + re-index + prune만 수행합니다(embedding, 파일 읽기 없음). 중단된 sync 때문에 조각난 store를 복구할 때 사용하세요.
+
+## 건너뛴 파일
+
+기본 설정에서는 파일 하나가 실패해도 sync 전체가 중단되지 않습니다. read, chunk, token 수 계산, embed 단계에서 실패한 파일(EACCES, EBUSY, EIO, parser 오류, embedder의 입력 거부 등)은 건너뛰고 기록합니다. batch commit이 실패하면 그 batch를 파일 단위로 다시 시도해 원인 파일만 건너뜁니다. 건너뛴 파일은 완료로 기록되지 않습니다. 새 파일은 저장되는 manifest에서 빠지고, 이전에 색인된 파일은 이전 manifest 항목을 유지하므로 다음 `minsync sync`가 자동으로 다시 시도하며, 성공할 때까지 기존 chunk가 (full sync 중에도) 검색됩니다.
+
+```json
+"files_failed": [
+  { "path": "notes/broken.pdf", "stage": "read", "error": "io error: notes/broken.pdf: Permission denied (os error 13)" }
+],
+"partial": true
+```
+
+`stage`는 `read`, `chunk`, `truncate`, `embed`, `store` 중 하나입니다. `partial`이 true이면 CLI는 종료 코드 **6**(완료, 일부 파일 건너뜀)으로 끝나고, text 출력은 건너뛴 경로를 stderr에 나열합니다. 하드 실패의 종료 코드(1, 3, 4, 5)는 그대로입니다. 아직 아무것도 색인하지 못한 실행에서 처음 몇 개 파일이 embed/store 단계에서 연속 실패하면(예: embedder 중단) 파일 문제가 아니라 장애로 보고, 파일 경로가 포함된 오류(종료 코드 5/4)로 sync를 중단합니다.
+
+```toml
+[sync]
+on_file_error = "skip"   # "fail"이면 첫 실패 파일에서 중단(기존 동작)
+```
 
 ## Embedding 안정성
 

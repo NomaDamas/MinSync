@@ -38,6 +38,11 @@ pub struct SyncConfig {
     /// faster; the price is that a crash redoes at most this many files.
     #[serde(default = "default_batch_files")]
     pub batch_files: usize,
+    /// `skip` (default) isolates a failing file: it is recorded in the
+    /// result and the rest of the sync proceeds. `fail` aborts on the first
+    /// failure.
+    #[serde(default)]
+    pub on_file_error: OnFileError,
 }
 
 fn default_checkpoint_every_files() -> usize {
@@ -48,11 +53,23 @@ fn default_batch_files() -> usize {
     DEFAULT_BATCH_FILES
 }
 
+/// What a sync does when one file fails to read, chunk, embed or store.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OnFileError {
+    /// Record the failure in `SyncResult.files_failed` and keep going.
+    #[default]
+    Skip,
+    /// Abort the whole sync on the first failure.
+    Fail,
+}
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             checkpoint_every_files: DEFAULT_CHECKPOINT_EVERY_FILES,
             batch_files: DEFAULT_BATCH_FILES,
+            on_file_error: OnFileError::default(),
         }
     }
 }
@@ -124,6 +141,10 @@ pub struct EmbedderConfig {
     pub max_retries: usize,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Native embedder only: deadline in seconds for a single forward pass
+    /// (one batch). Defaults to `timeout_seconds`.
+    #[serde(default)]
+    pub per_batch_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -262,6 +283,7 @@ impl Config {
                 max_concurrent: default_max_concurrent(),
                 max_retries: default_max_retries(),
                 timeout_seconds: default_timeout_seconds(),
+                per_batch_timeout_seconds: None,
                 base_url: None,
                 query_prefix: None,
                 passage_prefix: None,

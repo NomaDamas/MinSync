@@ -7,7 +7,35 @@ use crate::error::Result;
 use crate::sync::MinSync;
 use std::path::PathBuf;
 
-pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
+/// Exit code of a sync that completed but skipped files that failed to
+/// index (see `SyncResult.files_failed`). Hard failures keep their own codes
+/// (`MinSyncError::exit_code`).
+pub const EXIT_PARTIAL_SYNC: i32 = 6;
+
+/// Run a command and return the process exit code on success.
+pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
+    if let Commands::Sync {
+        full,
+        dry_run,
+        wait,
+        batch_size,
+    } = cli.command
+    {
+        return sync(
+            &cli.format,
+            root,
+            &minsync_dir,
+            full,
+            dry_run,
+            wait,
+            batch_size,
+        )
+        .await;
+    }
+    run_other(cli, root, minsync_dir).await.map(|()| 0)
+}
+
+async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
     match cli.command {
         Commands::Init {
             force,
@@ -15,23 +43,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> {
             chunker,
             language,
         } => init(&cli.format, root, force, &embedder, &chunker, &language),
-        Commands::Sync {
-            full,
-            dry_run,
-            wait,
-            batch_size,
-        } => {
-            sync(
-                &cli.format,
-                root,
-                &minsync_dir,
-                full,
-                dry_run,
-                wait,
-                batch_size,
-            )
-            .await
-        }
+        Commands::Sync { .. } => unreachable!("handled by run"),
         Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
         Commands::Status => status(&cli.format, &minsync_dir).await,
         Commands::Optimize => optimize(&cli.format, &minsync_dir),
@@ -94,7 +106,7 @@ async fn sync(
     dry_run: bool,
     wait: bool,
     batch_size: Option<usize>,
-) -> Result<()> {
+) -> Result<i32> {
     require_initialized(minsync_dir)?;
     let ms = MinSync::new(root.clone());
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), wait)?;
@@ -148,20 +160,34 @@ async fn sync(
                 println!("  scan errors:         {}", result.scan_errors.len());
                 println!("  estimated tokens:    {}", result.estimated_tokens);
             }
+            if result.partial {
+                eprintln!(
+                    "Warning: {} file(s) skipped; they will be retried by the next sync:",
+                    result.files_failed.len()
+                );
+                for failure in &result.files_failed {
+                    eprintln!("  {} [{}]: {}", failure.path, failure.stage, failure.error);
+                }
+            }
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
     if matches!(format, OutputFormat::Text) {
-        for error in &result.scan_errors {
+        // Entries already listed as skipped files above are not repeated.
+        for error in result
+            .scan_errors
+            .iter()
+            .filter(|error| !result.files_failed.iter().any(|f| f.path == error.path))
+        {
             eprintln!(
                 "warning: scan error ({:?}) {}: {} — existing chunks kept",
                 error.kind, error.path, error.error
             );
         }
     }
-    Ok(())
+    Ok(if result.partial { EXIT_PARTIAL_SYNC } else { 0 })
 }
 
 async fn query(

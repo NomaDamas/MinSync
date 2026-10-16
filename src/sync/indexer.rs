@@ -6,14 +6,20 @@
 //! `update` (reused chunks), one `insert_new` (new chunks), one stale-chunk
 //! sweep, and one delete for removed files. The cost of a LanceDB write is
 //! dominated by the commit, not the rows, so N files cost about what one did.
+//!
+//! One bad file must not sink the run. With `[sync] on_file_error = "skip"`
+//! (the default) a file whose read, chunk, token-count, embed or store step
+//! fails is recorded in `SyncResult.files_failed` and the rest proceeds; a
+//! batch commit that fails is retried file by file to find the culprit.
+//! `"fail"` aborts on the first error instead.
 
 use crate::chunker::Chunker;
-use crate::config::Config;
+use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use crate::id::doc_ids_for_chunks;
 use crate::normalize::normalize_text;
-use crate::types::{Chunk, SyncResult};
+use crate::types::{Chunk, FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Document, DocumentUpdate, Filter, VectorStore};
 use std::collections::HashSet;
 use std::path::Path;
@@ -44,8 +50,29 @@ pub(super) struct BatchItem {
 }
 
 struct PreparedFile<'a> {
-    path: &'a str,
+    item: &'a BatchItem,
     chunks: Vec<(Chunk, String, String)>,
+    truncated: usize,
+}
+
+enum Prepared<'a> {
+    /// The file vanished since the scan; treat it like a deletion.
+    Gone,
+    File(PreparedFile<'a>),
+}
+
+/// Consecutive embed/store failures, with no success yet in the run, after
+/// which the per-file retry concludes the failure is systemic.
+const SYSTEMIC_STREAK: usize = 3;
+
+/// An error tagged with the pipeline stage that produced it.
+struct StageError {
+    stage: FileStage,
+    error: MinSyncError,
+}
+
+fn at(stage: FileStage) -> impl Fn(MinSyncError) -> StageError {
+    move |error| StageError { stage, error }
 }
 
 fn path_filter(source_id: &str, paths: Vec<String>) -> Filter {
@@ -55,98 +82,264 @@ fn path_filter(source_id: &str, paths: Vec<String>) -> Filter {
     ])
 }
 
-/// Index/delete `items` as one unit. On success every item is fully
-/// committed; on error nothing is recorded as processed in `result`.
+/// Prefix `error` with `path` unless its text already names it, keeping the
+/// variant so exit codes are unchanged.
+fn with_path(error: MinSyncError, path: &str) -> MinSyncError {
+    if error.to_string().contains(path) {
+        return error;
+    }
+    match error {
+        MinSyncError::Io(error) => MinSyncError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{path}: {error}"),
+        )),
+        MinSyncError::Embedding(message) => MinSyncError::Embedding(format!("{path}: {message}")),
+        MinSyncError::VectorStore(message) => {
+            MinSyncError::VectorStore(format!("{path}: {message}"))
+        }
+        MinSyncError::Manifest(message) => MinSyncError::Manifest(format!("{path}: {message}")),
+        MinSyncError::Config(message) => MinSyncError::Config(format!("{path}: {message}")),
+        other => MinSyncError::Other(format!("{path}: {other}")),
+    }
+}
+
+/// Record `failure` in `result` (skip mode) or abort with the path attached
+/// (fail mode).
+fn record_failure(
+    skip: bool,
+    path: &str,
+    failure: StageError,
+    result: &mut SyncResult,
+) -> Result<()> {
+    if !skip {
+        return Err(with_path(failure.error, path));
+    }
+    tracing::warn!(
+        path,
+        stage = %failure.stage,
+        error = %failure.error,
+        "skipping file that failed to sync"
+    );
+    result.files_failed.push(FileFailure {
+        path: path.to_string(),
+        stage: failure.stage,
+        error: failure.error.to_string(),
+    });
+    Ok(())
+}
+
+/// Read, normalize, chunk, count truncation and derive ids for one file.
+async fn prepare_file<'a>(
+    root: &Path,
+    item: &'a BatchItem,
+    context: &SyncFileContext<'_>,
+) -> std::result::Result<Prepared<'a>, StageError> {
+    let raw_text = match std::fs::read_to_string(root.join(&item.path)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => String::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Prepared::Gone),
+        Err(error) => return Err(at(FileStage::Read)(MinSyncError::Io(error))),
+    };
+    let text = normalize_text(&raw_text, &context.config.normalize);
+    let chunks = context
+        .chunker
+        .chunk(&text, &item.path)
+        .map_err(at(FileStage::Chunk))?;
+    let chunk_texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+    let truncated = context
+        .embedder
+        .count_truncated(&chunk_texts)
+        .await
+        .map_err(at(FileStage::Truncate))?;
+    if truncated > 0 {
+        if let Some(max_length) = context.embedder.max_length() {
+            tracing::warn!(
+                "{truncated} chunks in {} hit the {max_length}-token limit and were truncated",
+                item.path
+            );
+        } else {
+            tracing::warn!(
+                "{truncated} chunks in {} hit the embedder token limit and were truncated",
+                item.path
+            );
+        }
+    }
+    let ids = doc_ids_for_chunks(
+        context.config.source_id.as_str(),
+        &item.path,
+        context.chunker.schema_id(),
+        &chunks,
+    );
+    Ok(Prepared::File(PreparedFile {
+        item,
+        chunks: chunks
+            .into_iter()
+            .zip(ids)
+            .map(|(chunk, (doc_id, content_hash))| (chunk, doc_id, content_hash))
+            .collect(),
+        truncated,
+    }))
+}
+
+/// Index/delete `items` as one unit. Every item either lands in the store
+/// and in `result.files_processed*`, or (skip mode) in `result.files_failed`;
+/// in fail mode the first error aborts with nothing recorded for the batch.
 pub(super) async fn index_batch(
     root: &Path,
     items: &[BatchItem],
-    context: SyncFileContext<'_>,
+    mut context: SyncFileContext<'_>,
     result: &mut SyncResult,
 ) -> Result<()> {
-    let source_id = context.config.source_id.as_str();
-    let schema_id = context.chunker.schema_id();
-
-    let purge: Vec<String> = items
-        .iter()
-        .filter(|item| item.purge_first)
-        .map(|item| item.path.clone())
-        .collect();
-    let mut chunks_deleted = 0;
-    if !purge.is_empty() {
-        chunks_deleted += context
-            .store
-            .delete_by_filter(&path_filter(source_id, purge))?;
-    }
+    let skip = context.config.sync.on_file_error == OnFileError::Skip;
+    let failed_before = result.files_failed.len();
 
     // Read + chunk + id every file; files that vanished since the scan are
     // handled like deletions.
     let mut delete_paths: Vec<String> = Vec::new();
     let mut prepared: Vec<PreparedFile<'_>> = Vec::new();
-    let mut truncated_total = 0;
     for item in items {
         if item.kind == BatchKind::Delete {
             delete_paths.push(item.path.clone());
             continue;
         }
-        let raw_text = match std::fs::read_to_string(root.join(&item.path)) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => String::new(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                delete_paths.push(item.path.clone());
-                continue;
-            }
-            Err(error) => return Err(MinSyncError::Io(error)),
-        };
-        let text = normalize_text(&raw_text, &context.config.normalize);
-        let chunks = context.chunker.chunk(&text, &item.path)?;
-        let chunk_texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
-        let chunks_truncated = context.embedder.count_truncated(&chunk_texts).await?;
-        if chunks_truncated > 0 {
-            if let Some(max_length) = context.embedder.max_length() {
-                tracing::warn!(
-                    "{} chunks in {} hit the {max_length}-token limit and were truncated",
-                    chunks_truncated,
-                    item.path
-                );
-            } else {
-                tracing::warn!(
-                    "{} chunks in {} hit the embedder token limit and were truncated",
-                    chunks_truncated,
-                    item.path
-                );
-            }
-            truncated_total += chunks_truncated;
+        match prepare_file(root, item, &context).await {
+            Ok(Prepared::Gone) => delete_paths.push(item.path.clone()),
+            Ok(Prepared::File(file)) => prepared.push(file),
+            Err(failure) => record_failure(skip, &item.path, failure, result)?,
         }
-        let ids = doc_ids_for_chunks(source_id, &item.path, schema_id, &chunks);
-        prepared.push(PreparedFile {
-            path: &item.path,
-            chunks: chunks
-                .into_iter()
-                .zip(ids)
-                .map(|(chunk, (doc_id, content_hash))| (chunk, doc_id, content_hash))
-                .collect(),
-        });
     }
 
-    // One id-only existence check for the whole batch.
-    let all_ids: Vec<String> = prepared
+    let prepared_items: Vec<&BatchItem> = prepared.iter().map(|file| file.item).collect();
+    match commit(prepared, &delete_paths, &mut context, result).await {
+        Ok(()) => {}
+        Err(failure) if !skip => return Err(failure.error),
+        Err(failure) => {
+            tracing::warn!(
+                stage = %failure.stage,
+                error = %failure.error,
+                "batch commit failed; retrying file by file"
+            );
+            // Embed/store failures that hit every file are an outage or a
+            // misconfiguration (embedder down, bad key, disk full), not bad
+            // files. While nothing has succeeded in this run, give up after
+            // a few failures in a row with the original error so the hard
+            // failure (and its exit code) is preserved.
+            let mut succeeded = result.files_processed;
+            let mut streak = 0;
+            let streak_limit = prepared_items.len().min(SYSTEMIC_STREAK);
+            // With one file and nothing else to write, a per-file retry would
+            // repeat the identical commit: reuse the failure we already have.
+            let mut first_failure =
+                (prepared_items.len() == 1 && delete_paths.is_empty()).then_some(failure);
+            for item in prepared_items {
+                let outcome = if let Some(failure) = first_failure.take() {
+                    Err(failure)
+                } else {
+                    match prepare_file(root, item, &context).await {
+                        Ok(Prepared::File(file)) => {
+                            commit(vec![file], &[], &mut context, result).await
+                        }
+                        Ok(Prepared::Gone) => {
+                            commit(
+                                Vec::new(),
+                                std::slice::from_ref(&item.path),
+                                &mut context,
+                                result,
+                            )
+                            .await
+                        }
+                        Err(failure) => Err(failure),
+                    }
+                };
+                match outcome {
+                    Ok(()) => {
+                        succeeded += 1;
+                        streak = 0;
+                    }
+                    Err(failure) => {
+                        let systemic = matches!(failure.stage, FileStage::Embed | FileStage::Store);
+                        streak = if systemic { streak + 1 } else { 0 };
+                        if succeeded == 0 && streak >= streak_limit {
+                            result.files_failed.truncate(failed_before);
+                            return Err(with_path(failure.error, &item.path));
+                        }
+                        record_failure(skip, &item.path, failure, result)?;
+                    }
+                }
+            }
+            for path in &delete_paths {
+                if let Err(failure) =
+                    commit(Vec::new(), std::slice::from_ref(path), &mut context, result).await
+                {
+                    record_failure(skip, path, failure, result)?;
+                }
+            }
+        }
+    }
+
+    let failed: HashSet<&str> = result.files_failed[failed_before..]
         .iter()
+        .map(|failure| failure.path.as_str())
+        .collect();
+    let done: Vec<String> = items
+        .iter()
+        .filter(|item| !failed.contains(item.path.as_str()))
+        .map(|item| item.path.clone())
+        .collect();
+    result.files_processed += done.len();
+    result.files_processed_paths.extend(done);
+    Ok(())
+}
+
+/// Write `files` and delete `delete_paths` in one pass: existence check,
+/// embed, update, insert, stale sweep, delete. Counters in `result` move
+/// only when every write succeeded.
+async fn commit(
+    files: Vec<PreparedFile<'_>>,
+    delete_paths: &[String],
+    context: &mut SyncFileContext<'_>,
+    result: &mut SyncResult,
+) -> std::result::Result<(), StageError> {
+    let source_id = context.config.source_id.as_str();
+    let schema_id = context.chunker.schema_id();
+    let store_stage = at(FileStage::Store);
+    let embed_stage = at(FileStage::Embed);
+
+    // Files being re-indexed after a resume have old rows that carry this
+    // run's token, so the stale sweep cannot tell them from fresh ones.
+    // Their rows are cleared after embedding succeeded (see below) and their
+    // chunks are all treated as new, so an embed failure leaves them intact.
+    let purge: Vec<String> = files
+        .iter()
+        .filter(|file| file.item.purge_first)
+        .map(|file| file.item.path.clone())
+        .collect();
+    let mut chunks_deleted = 0;
+    let truncated_total: usize = files.iter().map(|file| file.truncated).sum();
+    let indexed_paths: Vec<String> = files.iter().map(|file| file.item.path.clone()).collect();
+
+    // One id-only existence check for the whole batch. Purged files skip it:
+    // their rows are cleared before the insert, so every chunk is written new.
+    let all_ids: Vec<String> = files
+        .iter()
+        .filter(|file| !file.item.purge_first)
         .flat_map(|file| file.chunks.iter().map(|(_, doc_id, _)| doc_id.clone()))
         .collect();
-    let existing: HashSet<String> = context.store.existing_ids(&all_ids)?;
+    let existing: HashSet<String> = context.store.existing_ids(&all_ids).map_err(&store_stage)?;
 
     let mut reused: Vec<DocumentUpdate> = Vec::new();
     let mut docs_to_embed: Vec<Document> = Vec::new();
     // Position of each new chunk within its own file, for error messages.
     let mut chunk_in_file: Vec<usize> = Vec::new();
-    for file in prepared {
+    for file in files {
+        let path = file.item.path.as_str();
         let mut new_in_file = 0;
         for (chunk, doc_id, content_hash) in file.chunks {
             if existing.contains(&doc_id) {
                 reused.push(DocumentUpdate {
                     id: doc_id,
                     seen_token: context.sync_token.to_string(),
-                    path: file.path.to_string(),
+                    path: path.to_string(),
                     heading_path: chunk.heading_path,
                 });
             } else {
@@ -155,7 +348,7 @@ pub(super) async fn index_batch(
                     embedding: Vec::new(),
                     text: chunk.text,
                     source_id: source_id.to_string(),
-                    path: file.path.to_string(),
+                    path: path.to_string(),
                     chunk_schema_id: schema_id.to_string(),
                     chunk_type: chunk.chunk_type,
                     heading_path: chunk.heading_path,
@@ -186,7 +379,10 @@ pub(super) async fn index_batch(
             .iter()
             .map(|&index| docs_to_embed[index].content_hash.clone())
             .collect();
-        let mut vectors = context.store.fetch_embeddings_by_content_hash(&hashes)?;
+        let mut vectors = context
+            .store
+            .fetch_embeddings_by_content_hash(&hashes)
+            .map_err(&store_stage)?;
 
         let mut to_embed: Vec<usize> = unique
             .into_iter()
@@ -199,13 +395,13 @@ pub(super) async fn index_batch(
                 .iter()
                 .map(|&index| docs_to_embed[index].text.clone())
                 .collect();
-            let mut embeddings = context.embedder.embed(&texts).await?;
+            let mut embeddings = context.embedder.embed(&texts).await.map_err(&embed_stage)?;
             if embeddings.len() != texts.len() {
-                return Err(MinSyncError::Embedding(format!(
+                return Err(embed_stage(MinSyncError::Embedding(format!(
                     "expected {} embeddings, got {}",
                     texts.len(),
                     embeddings.len()
-                )));
+                ))));
             }
             let located: Vec<(&Document, usize)> = to_embed
                 .iter()
@@ -218,7 +414,8 @@ pub(super) async fn index_batch(
                 context.config.embedder.max_retries,
                 &located,
             )
-            .await?;
+            .await
+            .map_err(&embed_stage)?;
 
             result.embedding_api_calls += 1;
             result.embedded_texts += texts.len();
@@ -234,49 +431,53 @@ pub(super) async fn index_batch(
         result.embeddings_reused += docs_to_embed.len() - to_embed.len();
         for (index, doc) in docs_to_embed.iter_mut().enumerate() {
             doc.embedding = vectors.get(&doc.content_hash).cloned().ok_or_else(|| {
-                MinSyncError::Embedding(format!(
+                embed_stage(MinSyncError::Embedding(format!(
                     "missing embedding for {} (chunk {})",
                     doc.path, chunk_in_file[index]
-                ))
+                )))
             })?;
         }
     }
 
+    if !purge.is_empty() {
+        chunks_deleted += context
+            .store
+            .delete_by_filter(&path_filter(source_id, purge))
+            .map_err(&store_stage)?;
+    }
     if !reused.is_empty() {
-        context.store.update(&reused)?;
-        result.chunks_updated += reused.len();
+        context.store.update(&reused).map_err(&store_stage)?;
     }
     if !docs_to_embed.is_empty() {
-        context.store.insert_new(&docs_to_embed)?;
-        result.chunks_added += docs_to_embed.len();
+        context
+            .store
+            .insert_new(&docs_to_embed)
+            .map_err(&store_stage)?;
     }
 
     // Stale chunks of every indexed file (content changed: old ids no longer
     // carry this run's token) in one sweep, then removed files in one delete.
-    let indexed_paths: Vec<String> = items
-        .iter()
-        .filter(|item| item.kind == BatchKind::Index && !delete_paths.contains(&item.path))
-        .map(|item| item.path.clone())
-        .collect();
     if !indexed_paths.is_empty() {
-        chunks_deleted += context.store.delete_by_filter(&Filter::And(vec![
-            Filter::Eq("source_id".to_string(), source_id.to_string()),
-            Filter::In("path".to_string(), indexed_paths),
-            Filter::Neq("seen_token".to_string(), context.sync_token.to_string()),
-        ]))?;
+        chunks_deleted += context
+            .store
+            .delete_by_filter(&Filter::And(vec![
+                Filter::Eq("source_id".to_string(), source_id.to_string()),
+                Filter::In("path".to_string(), indexed_paths),
+                Filter::Neq("seen_token".to_string(), context.sync_token.to_string()),
+            ]))
+            .map_err(&store_stage)?;
     }
     if !delete_paths.is_empty() {
         chunks_deleted += context
             .store
-            .delete_by_filter(&path_filter(source_id, delete_paths))?;
+            .delete_by_filter(&path_filter(source_id, delete_paths.to_vec()))
+            .map_err(&store_stage)?;
     }
 
+    result.chunks_updated += reused.len();
+    result.chunks_added += docs_to_embed.len();
     result.chunks_deleted += chunks_deleted;
     result.chunks_truncated += truncated_total;
-    result.files_processed += items.len();
-    result
-        .files_processed_paths
-        .extend(items.iter().map(|item| item.path.clone()));
     Ok(())
 }
 

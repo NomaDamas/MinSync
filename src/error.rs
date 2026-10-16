@@ -32,6 +32,9 @@ pub enum MinSyncError {
     #[error("manifest error: {0}")]
     Manifest(String),
 
+    #[error("embedder timeout: {0}")]
+    Timeout(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -54,9 +57,29 @@ impl MinSyncError {
             Self::LockFailed => 3,
             Self::VectorStore(_) => 4,
             Self::Embedding(_) => 5,
+            Self::Timeout(_) => 7,
             _ => 1,
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, MinSyncError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_has_distinct_exit_code() {
+        let error = MinSyncError::Timeout("native batch stuck".to_string());
+        assert_eq!(error.exit_code(), 7);
+        assert!(error.to_string().contains("native batch stuck"));
+        for other in [
+            MinSyncError::LockFailed.exit_code(),
+            MinSyncError::VectorStore(String::new()).exit_code(),
+            MinSyncError::Embedding(String::new()).exit_code(),
+        ] {
+            assert_ne!(other, 7);
+        }
+    }
+}
