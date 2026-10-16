@@ -69,8 +69,13 @@ fn load_or_scan_manifest(minsync_dir: &Path, config: &Config) -> Result<Manifest
         // Carry entries the scan cannot inspect, as `sync` does, so status
         // agrees with the cursor hash while an unreadable path exists.
         let stored = Manifest::load(&minsync_dir.join("manifest.json")).ok();
-        let (manifest, _, _) =
-            Manifest::scan_keeping_unknown(root, &config.source_id, None, stored.as_ref())?;
+        let (manifest, _, _) = Manifest::scan_keeping_unknown_with_max_file_bytes(
+            root,
+            &config.source_id,
+            None,
+            stored.as_ref(),
+            config.sync.max_file_bytes,
+        )?;
         return Ok(manifest);
     }
 

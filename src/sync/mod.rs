@@ -11,7 +11,7 @@ use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
-use crate::manifest::{FileChange, Manifest};
+use crate::manifest::{FileChange, Manifest, ScanErrorKind};
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
@@ -102,9 +102,14 @@ impl MinSync {
         config.save(&self.minsync_dir.join("config.toml"))?;
         // Baseline only (the first sync is always full): a file that cannot
         // be read here is skipped and reported by that sync, not fatal.
-        Manifest::scan_with_baseline_stats(&self.root, &source_id, None)?
-            .0
-            .save(&self.minsync_dir.join("manifest.json"))?;
+        Manifest::scan_with_baseline_stats_and_max_file_bytes(
+            &self.root,
+            &source_id,
+            None,
+            config.sync.max_file_bytes,
+        )?
+        .0
+        .save(&self.minsync_dir.join("manifest.json"))?;
         if let Some(staging) = reset_staging {
             std::fs::remove_dir_all(staging)?;
         }
@@ -299,12 +304,14 @@ impl MinSync {
         let skip_failures = config.sync.on_file_error == OnFileError::Skip;
         // Entries the scan could not inspect are carried over from the stored
         // manifest: unknown, never deleted (issue #79).
-        let (new_manifest, scan_stats, unknown_paths) = Manifest::scan_keeping_unknown(
-            &self.root,
-            &config.source_id,
-            scan_baseline,
-            stored_manifest.as_ref(),
-        )?;
+        let (new_manifest, scan_stats, unknown_paths) =
+            Manifest::scan_keeping_unknown_with_max_file_bytes(
+                &self.root,
+                &config.source_id,
+                scan_baseline,
+                stored_manifest.as_ref(),
+                config.sync.max_file_bytes,
+            )?;
         let scan_errors = scan_stats.errors;
         if !skip_failures {
             // `on_file_error = "fail"`: abort on the first unreadable entry,
@@ -323,7 +330,11 @@ impl MinSync {
                 .iter()
                 .map(|error| FileFailure {
                     path: error.path.clone(),
-                    stage: FileStage::Read,
+                    stage: if error.kind == ScanErrorKind::SizeGuard {
+                        FileStage::SizeGuard
+                    } else {
+                        FileStage::Read
+                    },
                     error: error.error.clone(),
                 })
                 .collect()
@@ -628,7 +639,10 @@ impl MinSync {
         // indexed) instead of recording it as done.
         let mut saved_manifest = new_manifest.clone();
         for failure in &result.files_failed {
-            match old_manifest.files.get(&failure.path) {
+            match stored_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.files.get(&failure.path))
+            {
                 Some(entry) => {
                     saved_manifest
                         .files

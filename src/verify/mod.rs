@@ -59,8 +59,13 @@ pub async fn verify(
     // Paths the scan could not inspect are unknown, never stale: carrying
     // them keeps `--fix` from deleting their chunks (issue #79).
     let stored_manifest = Manifest::load(&minsync_dir.join("manifest.json")).ok();
-    let (manifest, _, unknown_paths) =
-        Manifest::scan_keeping_unknown(root, &config.source_id, None, stored_manifest.as_ref())?;
+    let (manifest, _, unknown_paths) = Manifest::scan_keeping_unknown_with_max_file_bytes(
+        root,
+        &config.source_id,
+        None,
+        stored_manifest.as_ref(),
+        config.sync.max_file_bytes,
+    )?;
     let unknown_set: HashSet<&str> = unknown_paths.iter().map(String::as_str).collect();
     let stale_paths = find_stale_paths(&manifest, store);
     basic_checks.insert("no_stale_paths".to_string(), stale_paths.is_empty());

@@ -24,6 +24,9 @@ pub const DEFAULT_CHECKPOINT_EVERY_FILES: usize = 50;
 /// Default for [`SyncConfig::batch_files`].
 pub const DEFAULT_BATCH_FILES: usize = 25;
 
+/// Default maximum size of a file read for indexing (64 MiB).
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Knobs for the sync loop itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncConfig {
@@ -43,6 +46,9 @@ pub struct SyncConfig {
     /// failure.
     #[serde(default)]
     pub on_file_error: OnFileError,
+    /// Maximum bytes read or hashed per file. Zero disables the limit.
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: u64,
 }
 
 fn default_checkpoint_every_files() -> usize {
@@ -51,6 +57,10 @@ fn default_checkpoint_every_files() -> usize {
 
 fn default_batch_files() -> usize {
     DEFAULT_BATCH_FILES
+}
+
+fn default_max_file_bytes() -> u64 {
+    DEFAULT_MAX_FILE_BYTES
 }
 
 /// What a sync does when one file fails to read, chunk, embed or store.
@@ -70,6 +80,7 @@ impl Default for SyncConfig {
             checkpoint_every_files: DEFAULT_CHECKPOINT_EVERY_FILES,
             batch_files: DEFAULT_BATCH_FILES,
             on_file_error: OnFileError::default(),
+            max_file_bytes: default_max_file_bytes(),
         }
     }
 }

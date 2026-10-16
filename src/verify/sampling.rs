@@ -4,6 +4,7 @@
 use crate::chunker::Chunker;
 use crate::config::Config;
 use crate::error::{MinSyncError, Result};
+use crate::file_size::{read_text_file, size_guard_message, ReadTextError};
 use crate::id::doc_ids_for_chunks;
 use crate::manifest::Manifest;
 use crate::normalize::normalize_text;
@@ -25,10 +26,13 @@ pub(super) fn expected_doc_ids(
     config: &Config,
     chunker: &dyn Chunker,
 ) -> Result<Vec<String>> {
-    let raw_text = match std::fs::read_to_string(root.join(path)) {
+    let raw_text = match read_text_file(&root.join(path), config.sync.max_file_bytes) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::InvalidData => String::new(),
-        Err(error) => return Err(MinSyncError::Io(error)),
+        Err(ReadTextError::TooLarge { size, limit }) => {
+            return Err(MinSyncError::Manifest(size_guard_message(size, limit)))
+        }
+        Err(ReadTextError::Io(error)) if error.kind() == ErrorKind::InvalidData => String::new(),
+        Err(ReadTextError::Io(error)) => return Err(MinSyncError::Io(error)),
     };
     let text = normalize_text(&raw_text, &config.normalize);
     let chunks = chunker.chunk(&text, path)?;

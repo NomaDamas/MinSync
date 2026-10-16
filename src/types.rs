@@ -40,11 +40,11 @@ pub struct SyncResult {
     #[serde(default)]
     pub files_resumed: usize,
     /// Entries the manifest scan could not inspect (unreadable directory,
-    /// I/O error, ...). Their previously indexed chunks are kept untouched.
+    /// I/O error, size guard, ...). Their previously indexed chunks are kept untouched.
     #[serde(default)]
     pub scan_errors: Vec<crate::manifest::ScanError>,
-    /// Files that could not be indexed (unreadable, unparseable, embed or
-    /// store failure) and were skipped when `[sync] on_file_error = "skip"`.
+    /// Files that could not be indexed (size guard, unreadable, unparseable,
+    /// embed or store failure) and were skipped when `[sync] on_file_error = "skip"`.
     /// They are retried by the next sync.
     #[serde(default)]
     pub files_failed: Vec<FileFailure>,
@@ -56,9 +56,10 @@ pub struct SyncResult {
 
 /// Pipeline stage that failed for one file.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum FileStage {
     Read,
+    SizeGuard,
     Chunk,
     Truncate,
     Embed,
@@ -69,6 +70,7 @@ impl std::fmt::Display for FileStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Read => "read",
+            Self::SizeGuard => "size_guard",
             Self::Chunk => "chunk",
             Self::Truncate => "truncate",
             Self::Embed => "embed",

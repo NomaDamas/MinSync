@@ -267,6 +267,7 @@ A sync writes files in batches of `[sync] batch_files` (default 25). Per batch i
 [sync]
 batch_files = 25              # files per store commit; 1 = per-file commits
 checkpoint_every_files = 50   # 0 disables mid-sync checkpoints
+max_file_bytes = 67108864     # 64 MiB per file; 0 disables the size guard
 
 [vectorstore.options]
 compact_fragment_threshold = 64
@@ -302,6 +303,8 @@ minsync sync --progress jsonl --progress-heartbeat-seconds 2
 
 By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. A skipped file is never recorded as done: a new file stays out of the saved manifest and a previously indexed file keeps its previous manifest entry, so the next `minsync sync` retries it automatically. Its old chunks (if it was indexed before) stay searchable until it succeeds, including across full syncs.
 
+Files larger than `[sync] max_file_bytes` (default 64 MiB) are skipped before hashing or reading and reported with stage `size_guard`; other files in the sync continue. Their previous manifest entries and chunks are kept until the file is within the configured limit. Set `max_file_bytes = 0` to disable the guard.
+
 ```json
 "files_failed": [
   { "path": "notes/broken.pdf", "stage": "read", "error": "io error: notes/broken.pdf: Permission denied (os error 13)" }
@@ -309,7 +312,7 @@ By default one bad file does not abort a sync. A file whose read, chunk, token-c
 "partial": true
 ```
 
-`stage` is one of `read`, `chunk`, `truncate`, `embed`, `store`. When `partial` is true the CLI exits with code **6** (completed, files skipped) and text output lists each skipped path on stderr. Hard failures keep their codes (1, 3, 4, 5). An embed/store failure that hits the first few files of a run with nothing indexed yet (for example the embedder being down) is treated as an outage, not as bad files: the sync aborts with that error (exit 5/4) and the file path in the message.
+`stage` is one of `size_guard`, `read`, `chunk`, `truncate`, `embed`, `store`. When `partial` is true the CLI exits with code **6** (completed, files skipped) and text output lists each skipped path on stderr. Hard failures keep their codes (1, 3, 4, 5). An embed/store failure that hits the first few files of a run with nothing indexed yet (for example the embedder being down) is treated as an outage, not as bad files: the sync aborts with that error (exit 5/4) and the file path in the message.
 
 ```toml
 [sync]

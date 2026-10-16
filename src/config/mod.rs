@@ -65,6 +65,7 @@ mod tests {
         assert_eq!(config.embedder.model_cache_dir, None);
         assert_eq!(config.vectorstore.id, "lancedb");
         assert_eq!(config.lexical.language, "simple");
+        assert_eq!(config.sync.max_file_bytes, DEFAULT_MAX_FILE_BYTES);
         assert_eq!(
             config.vectorstore.options["dimension"].as_integer(),
             Some(1024)
@@ -196,6 +197,8 @@ strip_frontmatter = true
         assert_eq!(config.embedder.query_prefix.as_deref(), Some("query: "));
         assert_eq!(config.embedder.passage_prefix.as_deref(), Some("passage: "));
         assert_eq!(config.vectorstore.id, "custom_store");
+        // Configs written before max_file_bytes was added keep the safe default.
+        assert_eq!(config.sync.max_file_bytes, DEFAULT_MAX_FILE_BYTES);
         assert_eq!(
             config.vectorstore.options["url"].as_str(),
             Some("http://localhost:1234")

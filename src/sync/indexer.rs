@@ -17,6 +17,7 @@ use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
+use crate::file_size::{read_text_file, size_guard_message, ReadTextError};
 use crate::id::doc_ids_for_chunks;
 use crate::normalize::normalize_text;
 use crate::types::{Chunk, FileFailure, FileStage, SyncResult};
@@ -139,11 +140,21 @@ async fn prepare_file<'a>(
     item: &'a BatchItem,
     context: &SyncFileContext<'_>,
 ) -> std::result::Result<Prepared<'a>, StageError> {
-    let raw_text = match std::fs::read_to_string(root.join(&item.path)) {
+    let file_path = root.join(&item.path);
+    let raw_text = match read_text_file(&file_path, context.config.sync.max_file_bytes) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => String::new(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Prepared::Gone),
-        Err(error) => return Err(at(FileStage::Read)(MinSyncError::Io(error))),
+        Err(ReadTextError::TooLarge { size, limit }) => {
+            return Err(at(FileStage::SizeGuard)(MinSyncError::Manifest(
+                size_guard_message(size, limit),
+            )))
+        }
+        Err(ReadTextError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+            String::new()
+        }
+        Err(ReadTextError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Prepared::Gone)
+        }
+        Err(ReadTextError::Io(error)) => return Err(at(FileStage::Read)(MinSyncError::Io(error))),
     };
     let text = normalize_text(&raw_text, &context.config.normalize);
     let chunks = context

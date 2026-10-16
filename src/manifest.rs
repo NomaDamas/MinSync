@@ -1,4 +1,5 @@
 use crate::error::{MinSyncError, Result};
+use crate::file_size::size_guard_error;
 use chrono::Utc;
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,8 @@ pub enum ScanErrorKind {
     Transient,
     /// Needs user action (`EACCES`, `EPERM`, `EISDIR`, symlink loops, ...).
     Permanent,
+    /// The file exceeds the configured `[sync] max_file_bytes` limit.
+    SizeGuard,
 }
 
 /// A per-entry scan failure. The scan continues past it; the entry's state
@@ -100,13 +103,25 @@ impl Manifest {
         source_id: &str,
         baseline: Option<&Manifest>,
     ) -> Result<(Self, ScanStats)> {
-        Self::scan_with_fs(root, source_id, baseline, &RealFs)
+        Self::scan_with_baseline_stats_and_max_file_bytes(root, source_id, baseline, 0)
+    }
+
+    /// Scan while skipping files larger than `max_file_bytes`. A value of
+    /// zero keeps the unbounded behavior used by callers without sync config.
+    pub fn scan_with_baseline_stats_and_max_file_bytes(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        max_file_bytes: u64,
+    ) -> Result<(Self, ScanStats)> {
+        Self::scan_with_fs(root, source_id, baseline, max_file_bytes, &RealFs)
     }
 
     fn scan_with_fs(
         root: &Path,
         source_id: &str,
         baseline: Option<&Manifest>,
+        max_file_bytes: u64,
         io: &dyn ScanFs,
     ) -> Result<(Self, ScanStats)> {
         let mut manifest = Self::new(source_id);
@@ -146,6 +161,10 @@ impl Manifest {
                     continue;
                 }
             };
+            if let Some(error) = size_guard_error(metadata.len(), max_file_bytes) {
+                record_error(&mut stats, manifest_path, ScanErrorKind::SizeGuard, error);
+                continue;
+            }
             let mtime_ns = match metadata
                 .modified()
                 .map_err(|error| error.to_string())
@@ -208,7 +227,24 @@ impl Manifest {
         baseline: Option<&Manifest>,
         carry_from: Option<&Manifest>,
     ) -> Result<(Self, ScanStats, Vec<String>)> {
-        let (mut manifest, stats) = Self::scan_with_baseline_stats(root, source_id, baseline)?;
+        Self::scan_keeping_unknown_with_max_file_bytes(root, source_id, baseline, carry_from, 0)
+    }
+
+    /// Scan with a size cap, preserving previous entries that were too large
+    /// to inspect so their existing index rows cannot be swept as deletions.
+    pub fn scan_keeping_unknown_with_max_file_bytes(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        carry_from: Option<&Manifest>,
+        max_file_bytes: u64,
+    ) -> Result<(Self, ScanStats, Vec<String>)> {
+        let (mut manifest, stats) = Self::scan_with_baseline_stats_and_max_file_bytes(
+            root,
+            source_id,
+            baseline,
+            max_file_bytes,
+        )?;
         let carried = match carry_from {
             Some(previous) => manifest.carry_unknown(previous, &stats.errors),
             None => Vec::new(),
@@ -452,7 +488,20 @@ fn metadata_fingerprint(_metadata: &fs::Metadata, _mtime_ns: u128) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_size::size_guard_message;
     use std::fs;
+
+    struct NoHashFs;
+
+    impl ScanFs for NoHashFs {
+        fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+            fs::metadata(path)
+        }
+
+        fn hash_file(&self, _path: &Path) -> std::io::Result<String> {
+            panic!("oversized file must not be hashed")
+        }
+    }
 
     fn entry(hash: &str) -> ManifestFileEntry {
         ManifestFileEntry {
@@ -668,6 +717,47 @@ mod tests {
     }
 
     #[test]
+    fn scan_skips_oversized_files_before_hashing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let contents = "larger than the cap";
+        fs::write(dir.path().join("large.txt"), contents).expect("write file");
+
+        let (manifest, stats) = Manifest::scan_with_fs(dir.path(), "source-1", None, 4, &NoHashFs)
+            .expect("scan records the size guard");
+
+        assert!(!manifest.files.contains_key("large.txt"));
+        assert_eq!(stats.files_rehashed, 0);
+        assert_eq!(stats.bytes_hashed, 0);
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].path, "large.txt");
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::SizeGuard);
+        assert_eq!(
+            stats.errors[0].error,
+            size_guard_message(contents.len() as u64, 4)
+        );
+    }
+
+    #[test]
+    fn capped_scan_carries_an_old_manifest_entry_as_unknown() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("large.txt"), "large content").expect("write file");
+        let previous = Manifest::scan(dir.path(), "source-1").expect("create previous manifest");
+
+        let (manifest, stats, carried) = Manifest::scan_keeping_unknown_with_max_file_bytes(
+            dir.path(),
+            "source-1",
+            None,
+            Some(&previous),
+            4,
+        )
+        .expect("scan preserves the old entry");
+
+        assert_eq!(manifest.files["large.txt"], previous.files["large.txt"]);
+        assert_eq!(carried, vec!["large.txt"]);
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::SizeGuard);
+    }
+
+    #[test]
     fn test_manifest_scan_with_minsyncignore() {
         let dir = tempfile::tempdir().expect("create tempdir");
         fs::write(
@@ -839,7 +929,8 @@ mod tests {
 
     #[cfg(unix)]
     fn scan_faulty(dir: &Path, faulty: &FaultyFs) -> (Manifest, ScanStats) {
-        Manifest::scan_with_fs(dir, "source-1", None, faulty).expect("scan survives entry errors")
+        Manifest::scan_with_fs(dir, "source-1", None, 0, faulty)
+            .expect("scan survives entry errors")
     }
 
     #[cfg(unix)]
