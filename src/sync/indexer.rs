@@ -61,8 +61,9 @@ enum Prepared<'a> {
     File(PreparedFile<'a>),
 }
 
-/// Consecutive embed/store failures, with no success yet in the run, after
-/// which the per-file retry concludes the failure is systemic.
+/// Consecutive embed/store failures (across files and batches, reset by any
+/// success) after which the per-file retry concludes the failure is systemic
+/// and aborts the run. Already-committed batches stay in `progress.jsonl`.
 const SYSTEMIC_STREAK: usize = 3;
 
 /// An error tagged with the pipeline stage that produced it.
@@ -189,11 +190,15 @@ async fn prepare_file<'a>(
 /// Index/delete `items` as one unit. Every item either lands in the store
 /// and in `result.files_processed*`, or (skip mode) in `result.files_failed`;
 /// in fail mode the first error aborts with nothing recorded for the batch.
+///
+/// `systemic_streak` counts consecutive embed/store failures over the whole
+/// run; the caller owns it so it survives from one batch to the next.
 pub(super) async fn index_batch(
     root: &Path,
     items: &[BatchItem],
     mut context: SyncFileContext<'_>,
     result: &mut SyncResult,
+    systemic_streak: &mut usize,
 ) -> Result<()> {
     let skip = context.config.sync.on_file_error == OnFileError::Skip;
     let failed_before = result.files_failed.len();
@@ -216,7 +221,11 @@ pub(super) async fn index_batch(
 
     let prepared_items: Vec<&BatchItem> = prepared.iter().map(|file| file.item).collect();
     match commit(prepared, &delete_paths, &mut context, result).await {
-        Ok(()) => {}
+        Ok(()) => {
+            if !prepared_items.is_empty() {
+                *systemic_streak = 0;
+            }
+        }
         Err(failure) if !skip || matches!(failure.error, MinSyncError::Timeout(_)) => {
             return Err(failure.error)
         }
@@ -226,14 +235,18 @@ pub(super) async fn index_batch(
                 error = %failure.error,
                 "batch commit failed; retrying file by file"
             );
-            // Embed/store failures that hit every file are an outage or a
-            // misconfiguration (embedder down, bad key, disk full), not bad
-            // files. While nothing has succeeded in this run, give up after
-            // a few failures in a row with the original error so the hard
-            // failure (and its exit code) is preserved.
-            let mut succeeded = result.files_processed;
-            let mut streak = 0;
-            let streak_limit = prepared_items.len().min(SYSTEMIC_STREAK);
+            // Embed/store failures that hit file after file are an outage or
+            // a misconfiguration (embedder down, bad key, disk full), not bad
+            // files. Give up after a few in a row, whether or not earlier
+            // batches of this run succeeded, with the original error so the
+            // hard failure (and its exit code) is preserved. While nothing
+            // has succeeded yet, a batch whose every file failed is enough.
+            let nothing_succeeded = result.files_processed == 0;
+            let streak_limit = if nothing_succeeded {
+                prepared_items.len().min(SYSTEMIC_STREAK)
+            } else {
+                SYSTEMIC_STREAK
+            };
             // With one file and nothing else to write, a per-file retry would
             // repeat the identical commit: reuse the failure we already have.
             let mut first_failure =
@@ -259,14 +272,11 @@ pub(super) async fn index_batch(
                     }
                 };
                 match outcome {
-                    Ok(()) => {
-                        succeeded += 1;
-                        streak = 0;
-                    }
+                    Ok(()) => *systemic_streak = 0,
                     Err(failure) => {
                         let systemic = matches!(failure.stage, FileStage::Embed | FileStage::Store);
-                        streak = if systemic { streak + 1 } else { 0 };
-                        if succeeded == 0 && streak >= streak_limit {
+                        *systemic_streak = if systemic { *systemic_streak + 1 } else { 0 };
+                        if *systemic_streak >= streak_limit {
                             result.files_failed.truncate(failed_before);
                             return Err(with_path(failure.error, &item.path));
                         }

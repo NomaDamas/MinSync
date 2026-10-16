@@ -543,6 +543,7 @@ impl MinSync {
 
         let mut processed_this_run = 0usize;
         let mut since_checkpoint = 0usize;
+        let mut systemic_streak = 0usize;
         let mut cursor_at = 0usize;
         while cursor_at < pending.len() {
             // Never let a batch straddle a checkpoint boundary, so the
@@ -572,7 +573,14 @@ impl MinSync {
                 sync_token: &sync_token,
             };
             let failed_before = result.files_failed.len();
-            index_batch(&self.root, &items, context, &mut result).await?;
+            index_batch(
+                &self.root,
+                &items,
+                context,
+                &mut result,
+                &mut systemic_streak,
+            )
+            .await?;
             if let Some(progress) = &self.progress {
                 for failure in &result.files_failed[failed_before..] {
                     progress.file_failed(failure);
@@ -689,7 +697,7 @@ mod tests {
             kind: BatchKind::Index,
             purge_first: false,
         };
-        index_batch(root, &[item], context, result).await
+        index_batch(root, &[item], context, result, &mut 0).await
     }
 
     struct MockEmbedder;
@@ -2171,7 +2179,7 @@ mod tests {
             sync_token: "t1",
         };
 
-        index_batch(dir.path(), &items, context, &mut result)
+        index_batch(dir.path(), &items, context, &mut result, &mut 0)
             .await
             .expect("skip mode swallows the read error");
 
@@ -2405,5 +2413,96 @@ mod tests {
         assert_eq!(error.exit_code(), 5);
         assert!(error.to_string().contains("service unavailable"), "{error}");
         assert!(!sync.minsync_dir.join("cursor.json").exists());
+    }
+
+    /// Embeds normally for its first `healthy_calls` calls, then is down.
+    struct DiesAfter {
+        calls: AtomicUsize,
+        healthy_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for DiesAfter {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call > self.healthy_calls {
+                return Err(MinSyncError::Embedding("service unavailable".into()));
+            }
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embedder_outage_after_a_successful_batch_still_aborts_quickly() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_numbered_files(&dir, 20);
+        init_sync(&sync);
+        set_batch_files(&sync, 2);
+        let dying = DiesAfter {
+            calls: AtomicUsize::new(0),
+            healthy_calls: 1,
+        };
+
+        let error = sync
+            .sync(&chunker, &dying, &mut store, true, false, false)
+            .await
+            .expect_err("outage after the first batch must abort");
+
+        assert_eq!(error.exit_code(), 5, "{error}");
+        assert!(error.to_string().contains("service unavailable"), "{error}");
+        let calls = dying.calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= 10,
+            "embedder was hit {calls} times; the run kept going after the outage"
+        );
+        assert_eq!(
+            store.all_paths().len(),
+            2,
+            "the healthy batch stays committed"
+        );
+        assert!(sync.minsync_dir.join("progress.jsonl").exists());
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_streak_spans_single_file_batches() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_numbered_files(&dir, 20);
+        init_sync(&sync);
+        set_batch_files(&sync, 1);
+        let dying = DiesAfter {
+            calls: AtomicUsize::new(0),
+            healthy_calls: 2,
+        };
+
+        let error = sync
+            .sync(&chunker, &dying, &mut store, true, false, false)
+            .await
+            .expect_err("outage must abort across one-file batches");
+
+        assert_eq!(error.exit_code(), 5, "{error}");
+        let calls = dying.calls.load(Ordering::SeqCst);
+        assert!(calls <= 8, "embedder was hit {calls} times");
+        assert_eq!(store.all_paths().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_isolated_poison_file_after_success_is_still_skipped() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_good_and_poison(&dir);
+        init_sync(&sync);
+        set_batch_files(&sync, 1);
+
+        let result = sync
+            .sync(&chunker, &RejectingEmbedder, &mut store, true, false, false)
+            .await
+            .expect("one bad file among good ones is skipped");
+
+        assert_eq!(result.files_failed.len(), 1);
+        assert_eq!(result.files_failed[0].path, "c-bad.txt");
+        assert_eq!(result.files_processed, 4);
     }
 }
