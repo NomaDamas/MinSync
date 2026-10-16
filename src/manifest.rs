@@ -556,12 +556,19 @@ mod tests {
         );
     }
 
+    /// Filesystems may record ctime at kernel-tick granularity, so a rewrite
+    /// right after the baseline scan can leave the fingerprint unchanged.
+    fn wait_for_coarse_timestamp_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     #[test]
     fn test_scan_with_baseline_rehashes_when_content_hash_is_stale() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("a.txt");
         fs::write(&path, "alpha").expect("write original file");
         let mut baseline = Manifest::scan(dir.path(), "source-1").expect("scan baseline");
+        wait_for_coarse_timestamp_tick();
         fs::write(&path, "bravo").expect("write same-size replacement");
         let replacement_mtime_ns = fs::metadata(&path)
             .expect("read replacement metadata")
@@ -637,6 +644,7 @@ mod tests {
             .expect("read original metadata")
             .modified()
             .expect("read original mtime");
+        wait_for_coarse_timestamp_tick();
         fs::write(&path, "bravo").expect("write replacement");
         filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
             .expect("restore original mtime");
