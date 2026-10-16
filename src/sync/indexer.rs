@@ -305,24 +305,24 @@ async fn commit(
     let store_stage = at(FileStage::Store);
     let embed_stage = at(FileStage::Embed);
 
+    // Files being re-indexed after a resume have old rows that carry this
+    // run's token, so the stale sweep cannot tell them from fresh ones.
+    // Their rows are cleared after embedding succeeded (see below) and their
+    // chunks are all treated as new, so an embed failure leaves them intact.
     let purge: Vec<String> = files
         .iter()
         .filter(|file| file.item.purge_first)
         .map(|file| file.item.path.clone())
         .collect();
     let mut chunks_deleted = 0;
-    if !purge.is_empty() {
-        chunks_deleted += context
-            .store
-            .delete_by_filter(&path_filter(source_id, purge))
-            .map_err(&store_stage)?;
-    }
     let truncated_total: usize = files.iter().map(|file| file.truncated).sum();
     let indexed_paths: Vec<String> = files.iter().map(|file| file.item.path.clone()).collect();
 
-    // One id-only existence check for the whole batch.
+    // One id-only existence check for the whole batch. Purged files skip it:
+    // their rows are cleared before the insert, so every chunk is written new.
     let all_ids: Vec<String> = files
         .iter()
+        .filter(|file| !file.item.purge_first)
         .flat_map(|file| file.chunks.iter().map(|(_, doc_id, _)| doc_id.clone()))
         .collect();
     let existing: HashSet<String> = context.store.existing_ids(&all_ids).map_err(&store_stage)?;
@@ -439,6 +439,12 @@ async fn commit(
         }
     }
 
+    if !purge.is_empty() {
+        chunks_deleted += context
+            .store
+            .delete_by_filter(&path_filter(source_id, purge))
+            .map_err(&store_stage)?;
+    }
     if !reused.is_empty() {
         context.store.update(&reused).map_err(&store_stage)?;
     }

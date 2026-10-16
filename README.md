@@ -256,7 +256,7 @@ compact_fragment_threshold = 64
 
 ## Skipped files
 
-By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. The skipped file is left out of the saved manifest, so the next `minsync sync` retries it automatically, and its old chunks (if it was indexed before) stay searchable until it succeeds.
+By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. A skipped file is never recorded as done: a new file stays out of the saved manifest and a previously indexed file keeps its previous manifest entry, so the next `minsync sync` retries it automatically. Its old chunks (if it was indexed before) stay searchable until it succeeds, including across full syncs.
 
 ```json
 "files_failed": [

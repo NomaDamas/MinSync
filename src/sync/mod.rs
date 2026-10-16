@@ -330,6 +330,8 @@ impl MinSync {
                 initial_sync,
                 ..empty_sync_result(true, false)
             };
+            result.partial = !scan_failures.is_empty();
+            result.files_failed = scan_failures;
             result.files_checked = new_manifest.files.len();
             result.elapsed_seconds = start.elapsed().as_secs_f64();
             return Ok(result);
@@ -499,10 +501,20 @@ impl MinSync {
         }
 
         if full {
-            result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
+            // A skipped file keeps whatever it had indexed before: exclude
+            // it from the stale sweep. (Its manifest entry stays absent, so
+            // the next sync re-adds it and sweeps the old rows then.)
+            let mut sweep = vec![
                 Filter::Eq("source_id".to_string(), config.source_id.clone()),
                 Filter::Neq("seen_token".to_string(), sync_token.clone()),
-            ]))?;
+            ];
+            sweep.extend(
+                result
+                    .files_failed
+                    .iter()
+                    .map(|failure| Filter::Neq("path".to_string(), failure.path.clone())),
+            );
+            result.chunks_deleted += store.delete_by_filter(&Filter::And(sweep))?;
         }
 
         store.flush()?;
@@ -2046,6 +2058,39 @@ mod tests {
         assert!(fixed.files_failed.is_empty());
         assert_eq!(fixed.files_processed_paths, vec!["locked.txt"]);
         assert!(store.all_paths().contains(&"locked.txt".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_full_sync_keeps_old_chunks_of_unreadable_indexed_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        write_numbered_files(&dir, 2);
+        let locked = dir.path().join("locked.txt");
+        std::fs::write(&locked, MULTI_CHUNK).expect("write locked");
+        init_sync(&sync);
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("initial sync");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read(&locked).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+
+        let full = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("full sync completes");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        assert!(full.partial);
+        assert!(
+            store.all_paths().contains(&"locked.txt".to_string()),
+            "full sweep must not delete the skipped file's old chunks"
+        );
     }
 
     #[tokio::test]

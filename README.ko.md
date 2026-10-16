@@ -226,7 +226,7 @@ compact_fragment_threshold = 64
 
 ## 건너뛴 파일
 
-기본 설정에서는 파일 하나가 실패해도 sync 전체가 중단되지 않습니다. read, chunk, token 수 계산, embed 단계에서 실패한 파일(EACCES, EBUSY, EIO, parser 오류, embedder의 입력 거부 등)은 건너뛰고 기록합니다. batch commit이 실패하면 그 batch를 파일 단위로 다시 시도해 원인 파일만 건너뜁니다. 건너뛴 파일은 저장되는 manifest에서 빠지므로 다음 `minsync sync`가 자동으로 다시 시도하고, 이전에 색인된 파일이라면 성공할 때까지 기존 chunk가 검색됩니다.
+기본 설정에서는 파일 하나가 실패해도 sync 전체가 중단되지 않습니다. read, chunk, token 수 계산, embed 단계에서 실패한 파일(EACCES, EBUSY, EIO, parser 오류, embedder의 입력 거부 등)은 건너뛰고 기록합니다. batch commit이 실패하면 그 batch를 파일 단위로 다시 시도해 원인 파일만 건너뜁니다. 건너뛴 파일은 완료로 기록되지 않습니다. 새 파일은 저장되는 manifest에서 빠지고, 이전에 색인된 파일은 이전 manifest 항목을 유지하므로 다음 `minsync sync`가 자동으로 다시 시도하며, 성공할 때까지 기존 chunk가 (full sync 중에도) 검색됩니다.
 
 ```json
 "files_failed": [
