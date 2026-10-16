@@ -1155,6 +1155,72 @@ mod tests {
         assert_eq!(store.doc_count(), 0);
     }
 
+    /// Always emits a non-finite vector for texts containing `poison` and
+    /// counts single-text calls; `deterministic` mirrors in-process backends.
+    struct CountingPoisonEmbedder {
+        deterministic: bool,
+        single_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingPoisonEmbedder {
+        fn id(&self) -> &str {
+            "counting-poison"
+        }
+
+        fn is_deterministic(&self) -> bool {
+            self.deterministic
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if texts.len() == 1 {
+                self.single_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            PoisonEmbedder.embed(texts).await
+        }
+    }
+
+    async fn single_calls_until_non_finite_failure(deterministic: bool) -> usize {
+        let (dir, _sync, chunker, _embedder, mut store) = fixture();
+        let mut config = Config::default_for("source-1");
+        config.sync.on_file_error = crate::config::OnFileError::Fail;
+        config.embedder.max_retries = 3;
+        std::fs::write(dir.path().join("bad.txt"), "poison").expect("write file");
+        let embedder = CountingPoisonEmbedder {
+            deterministic,
+            single_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut result = empty_sync_result(false, false);
+        let context = SyncFileContext {
+            config: &config,
+            chunker: &chunker,
+            embedder: &embedder,
+            store: &mut store,
+            sync_token: "token",
+        };
+
+        index_file(dir.path(), "bad.txt", context, &mut result)
+            .await
+            .expect_err("persistent non-finite vector must fail");
+
+        embedder
+            .single_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_embedder_is_not_re_run_on_identical_non_finite_input() {
+        // The initial embed of a lone chunk is itself a single-text call, so
+        // one extra single-chunk attempt means 2 calls in total.
+        assert_eq!(single_calls_until_non_finite_failure(true).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_non_deterministic_embedder_keeps_max_retries_for_non_finite_chunk() {
+        assert_eq!(single_calls_until_non_finite_failure(false).await, 4);
+    }
+
     /// Emits NaN for the first chunk of every multi-text batch, mimicking a
     /// GPU backend that corrupts one row of a large batch.
     struct NanInBatchEmbedder {

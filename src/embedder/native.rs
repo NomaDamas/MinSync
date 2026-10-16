@@ -294,6 +294,10 @@ impl Embedder for NativeEmbedder {
         Some(self.max_length)
     }
 
+    fn is_deterministic(&self) -> bool {
+        true
+    }
+
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let inputs = texts
             .iter()

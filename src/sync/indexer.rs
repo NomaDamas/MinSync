@@ -500,6 +500,10 @@ fn is_finite_embedding(embedding: &[f32]) -> bool {
 /// the whole sync at write time. Chunks that stay non-finite after
 /// `max_retries` single-text attempts fail with the file path and chunk index
 /// so the offending file can be inspected or excluded.
+///
+/// A deterministic in-process embedder (native) gets exactly one single-chunk
+/// attempt, which rules out cross-batch padding effects; repeating the
+/// identical forward pass on the same device would only burn more passes.
 async fn repair_non_finite_embeddings(
     embedder: &dyn Embedder,
     texts: &[String],
@@ -513,8 +517,13 @@ async fn repair_non_finite_embeddings(
         }
         let (doc, chunk) = located[index];
         let path = doc.path.as_str();
+        let attempt_limit = if embedder.is_deterministic() {
+            1
+        } else {
+            max_retries.max(1)
+        };
         let mut attempts = 0;
-        while attempts < max_retries.max(1) && !is_finite_embedding(&embeddings[index]) {
+        while attempts < attempt_limit && !is_finite_embedding(&embeddings[index]) {
             attempts += 1;
             tracing::warn!(
                 path,

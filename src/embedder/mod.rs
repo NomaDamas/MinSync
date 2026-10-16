@@ -22,6 +22,13 @@ pub trait Embedder: Send + Sync {
         None
     }
 
+    /// True when re-running the same input on this embedder is guaranteed to
+    /// produce the same output (in-process inference on a fixed device). A
+    /// retry of an identical single-chunk request can then never help.
+    fn is_deterministic(&self) -> bool {
+        false
+    }
+
     async fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed(&[text.to_string()]).await?;
         results
@@ -57,6 +64,10 @@ impl Embedder for DeferredEmbedder {
             .id
             .split_once(':')
             .map_or(self.config.embedder.id.as_str(), |(_, id)| id)
+    }
+
+    fn is_deterministic(&self) -> bool {
+        self.config.embedder.id.starts_with("native:")
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -146,6 +157,17 @@ mod factory_tests {
 
         let embedder = create_embedder(&config).expect("create tei embedder");
         assert_eq!(embedder.id(), "intfloat/multilingual-e5-small");
+    }
+
+    #[test]
+    fn test_only_in_process_embedders_are_deterministic() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "tei:foo".to_string();
+        assert!(!create_embedder(&config).unwrap().is_deterministic());
+        assert!(!DeferredEmbedder::new(config.clone()).is_deterministic());
+
+        config.embedder.id = "native:Qwen/Qwen3-Embedding-0.6B".to_string();
+        assert!(DeferredEmbedder::new(config).is_deterministic());
     }
 
     #[test]
