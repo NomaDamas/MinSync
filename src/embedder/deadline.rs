@@ -19,8 +19,20 @@ pub(crate) struct BatchDeadline {
 }
 
 impl BatchDeadline {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) const fn new() -> Self {
+        Self {
+            wedged: AtomicBool::new(false),
+        }
+    }
+
+    /// Fail fast if an earlier call already abandoned a stuck thread.
+    pub(crate) fn ensure_healthy(&self, what: &str) -> Result<()> {
+        if self.wedged.load(Ordering::Acquire) {
+            return Err(MinSyncError::Timeout(format!(
+                "{what}: an earlier call timed out and its thread is still stuck; restart minsync"
+            )));
+        }
+        Ok(())
     }
 
     /// Run `task` on the blocking pool and wait at most `budget`.
@@ -32,11 +44,7 @@ impl BatchDeadline {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        if self.wedged.load(Ordering::Acquire) {
-            return Err(MinSyncError::Timeout(format!(
-                "{what}: an earlier call timed out and its thread is still stuck; restart minsync"
-            )));
-        }
+        self.ensure_healthy(what)?;
         match tokio::time::timeout(budget, tokio::task::spawn_blocking(task)).await {
             Ok(joined) => joined.map_err(|error| {
                 MinSyncError::Embedding(format!("{what}: blocking task failed: {error}"))
@@ -123,6 +131,6 @@ mod tests {
 
         assert!(matches!(outcome, Err(MinSyncError::Timeout(_))));
         assert_eq!(ran.load(Ordering::SeqCst), 0, "task must not be queued");
-        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }

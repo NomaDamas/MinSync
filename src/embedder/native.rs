@@ -76,8 +76,14 @@ pub struct NativeEmbedder {
     passage_prefix: Option<String>,
     inner: OnceCell<LoadedModel>,
     tokenizer: OnceCell<Tokenizer>,
-    deadline: BatchDeadline,
+    deadline: &'static BatchDeadline,
 }
+
+/// Process-wide: a timed-out native forward pass strands a thread (and the
+/// model it holds) until exit, so every `NativeEmbedder` in the process —
+/// including ones rebuilt per call by `DeferredEmbedder` — must fail fast
+/// instead of loading another model.
+static NATIVE_DEADLINE: BatchDeadline = BatchDeadline::new();
 
 impl NativeEmbedder {
     pub fn from_config(settings: &EmbedderConfig) -> Result<Self> {
@@ -88,13 +94,13 @@ impl NativeEmbedder {
             dtype: parse_dtype(settings.dtype.as_deref())?,
             max_length: settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
             batch_size: settings.batch_size,
-            batch_timeout: batch_timeout(settings),
+            batch_timeout: batch_timeout(settings)?,
             cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
             query_prefix: settings.query_prefix.clone(),
             passage_prefix: settings.passage_prefix.clone(),
             inner: OnceCell::new(),
             tokenizer: OnceCell::new(),
-            deadline: BatchDeadline::new(),
+            deadline: &NATIVE_DEADLINE,
         })
     }
 
@@ -208,6 +214,7 @@ impl NativeEmbedder {
                 "batch_size must be greater than 0".to_string(),
             ));
         }
+        self.deadline.ensure_healthy("native embedding")?;
         let loaded = self.model().await?;
         let dtype_bytes = self.dtype.to_candle().size_in_bytes();
         let per_row_attention_bytes = loaded.attention_heads * dtype_bytes;
@@ -220,7 +227,7 @@ impl NativeEmbedder {
             ATTENTION_BYTES_BUDGET,
         );
         embed_in_batches(
-            &self.deadline,
+            self.deadline,
             self.batch_timeout,
             texts,
             batches,
@@ -353,12 +360,16 @@ fn plan_batches(
 
 /// Deadline for one forward pass: `per_batch_timeout_seconds`, else
 /// `timeout_seconds`.
-fn batch_timeout(settings: &EmbedderConfig) -> Duration {
-    Duration::from_secs(
-        settings
-            .per_batch_timeout_seconds
-            .unwrap_or(settings.timeout_seconds),
-    )
+fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
+    let seconds = settings
+        .per_batch_timeout_seconds
+        .unwrap_or(settings.timeout_seconds);
+    if seconds == 0 {
+        return Err(MinSyncError::Config(
+            "embedder.timeout_seconds / per_batch_timeout_seconds must be greater than 0 for the native embedder".to_string(),
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_native_model_id(id: &str) -> Result<&str> {
@@ -610,15 +621,30 @@ mod deadline_tests {
 
     #[test]
     fn batch_timeout_defaults_to_timeout_seconds() {
-        assert_eq!(batch_timeout(&settings(42, None)), Duration::from_secs(42));
+        assert_eq!(
+            batch_timeout(&settings(42, None)).unwrap(),
+            Duration::from_secs(42)
+        );
     }
 
     #[test]
     fn per_batch_timeout_overrides_timeout_seconds() {
         assert_eq!(
-            batch_timeout(&settings(42, Some(3))),
+            batch_timeout(&settings(42, Some(3))).unwrap(),
             Duration::from_secs(3)
         );
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected() {
+        assert!(matches!(
+            batch_timeout(&settings(0, None)),
+            Err(MinSyncError::Config(_))
+        ));
+        assert!(matches!(
+            batch_timeout(&settings(42, Some(0))),
+            Err(MinSyncError::Config(_))
+        ));
     }
 
     #[tokio::test]
