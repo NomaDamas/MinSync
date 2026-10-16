@@ -166,6 +166,12 @@ pub struct EmbedderConfig {
     /// Native tokenizer max length in tokens. Ignored by `openai:` / `tei:`.
     #[serde(default)]
     pub max_length: Option<usize>,
+    /// Native embedder only: cap on padded tokens (`inputs x longest input`)
+    /// in one forward pass. Keeps a single pass short enough to finish well
+    /// inside `per_batch_timeout_seconds` on a loaded machine. Defaults to
+    /// 4096; an input longer than the cap is still embedded alone.
+    #[serde(default)]
+    pub max_batch_tokens: Option<usize>,
     /// Directory for cached native model files. Ignored by `openai:` / `tei:`.
     #[serde(default)]
     pub model_cache_dir: Option<String>,
@@ -291,6 +297,7 @@ impl Config {
                 device: None,
                 dtype: None,
                 max_length: None,
+                max_batch_tokens: None,
                 model_cache_dir: None,
             },
             vectorstore: VectorStoreConfig {

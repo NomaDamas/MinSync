@@ -39,6 +39,16 @@ fn tokenized_length_short_control_stays_below_limit() {
 /// no throughput because attention is already compute-bound there.
 const ATTENTION_BYTES_BUDGET: usize = 1 << 30;
 
+/// Default cap on padded tokens (`inputs x longest input`) per forward pass.
+///
+/// The attention budget alone still lets 64 inputs of ~500 tokens (32k padded
+/// tokens) share one pass, which on a CPU or a contended GPU can outlast the
+/// per-batch deadline even though nothing is stuck. Passes of at most this
+/// many tokens finish in seconds, so the deadline only fires on a real hang.
+/// Splitting costs little throughput: a pass this size already saturates the
+/// device.
+const MAX_BATCH_TOKENS: usize = 4096;
+
 /// Qwen3 uses byte-level BPE, so a text never tokenizes to more tokens than
 /// its UTF-8 byte length. This slack covers template/special tokens.
 const SPECIAL_TOKEN_SLACK: usize = 8;
@@ -70,6 +80,7 @@ pub struct NativeEmbedder {
     dtype: NativeDtype,
     max_length: usize,
     batch_size: usize,
+    max_batch_tokens: usize,
     batch_timeout: Duration,
     cache_dir: Option<PathBuf>,
     query_prefix: Option<String>,
@@ -94,6 +105,7 @@ impl NativeEmbedder {
             dtype: parse_dtype(settings.dtype.as_deref())?,
             max_length: settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
             batch_size: settings.batch_size,
+            max_batch_tokens: settings.max_batch_tokens.unwrap_or(MAX_BATCH_TOKENS),
             batch_timeout: batch_timeout(settings)?,
             cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
             query_prefix: settings.query_prefix.clone(),
@@ -225,6 +237,7 @@ impl NativeEmbedder {
             self.max_length,
             per_row_attention_bytes,
             ATTENTION_BYTES_BUDGET,
+            self.max_batch_tokens,
         );
         embed_in_batches(
             self.deadline,
@@ -319,19 +332,22 @@ impl Embedder for NativeEmbedder {
 }
 
 /// Split `texts` into consecutive batches of at most `batch_size` inputs whose
-/// attention-score tensor stays within `budget_bytes`.
+/// attention-score tensor stays within `budget_bytes` and whose padded token
+/// count stays within `max_batch_tokens`.
 ///
 /// Inputs are left-padded to the longest member, so a batch costs
-/// `len * per_row_bytes * padded^2` where `per_row_bytes` is
-/// `heads * dtype_size` and `padded` is bounded by the byte length of the
-/// longest text (capped at `max_length`). A single input always forms a
-/// batch on its own even when it alone exceeds the budget.
+/// `len * per_row_bytes * padded^2` of attention scores and `len * padded`
+/// tokens, where `per_row_bytes` is `heads * dtype_size` and `padded` is
+/// bounded by the byte length of the longest text (capped at `max_length`).
+/// A single input always forms a batch on its own even when it alone exceeds
+/// either budget.
 fn plan_batches(
     texts: &[String],
     batch_size: usize,
     max_length: usize,
     per_row_bytes: usize,
     budget_bytes: usize,
+    max_batch_tokens: usize,
 ) -> Vec<std::ops::Range<usize>> {
     let token_bound = |text: &String| (text.len() + SPECIAL_TOKEN_SLACK).min(max_length.max(1));
     let mut batches = Vec::new();
@@ -344,7 +360,12 @@ fn plan_batches(
             .saturating_mul(per_row_bytes)
             .saturating_mul(candidate_padded)
             .saturating_mul(candidate_padded);
-        if index > start && (candidate_len > batch_size || attention_bytes > budget_bytes) {
+        let padded_tokens = candidate_len.saturating_mul(candidate_padded);
+        if index > start
+            && (candidate_len > batch_size
+                || attention_bytes > budget_bytes
+                || padded_tokens > max_batch_tokens)
+        {
             batches.push(start..index);
             start = index;
             padded = token_bound(text);
@@ -546,6 +567,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
         );
         assert_eq!(batches, vec![0..64, 64..128, 128..130]);
     }
@@ -561,6 +583,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
         );
         assert!(max_attention_bytes(&inputs, &batches) <= ATTENTION_BYTES_BUDGET);
         assert!(max_attention_bytes(&inputs, &batches) < 1 << 32);
@@ -576,6 +599,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
         );
         let mut next = 0;
         for range in &batches {
@@ -590,7 +614,14 @@ mod tests {
     #[test]
     fn single_oversized_input_still_forms_its_own_batch() {
         let inputs = texts(&[100_000, 100_000]);
-        let batches = plan_batches(&inputs, 64, 32_768, QWEN3_F32_ROW, ATTENTION_BYTES_BUDGET);
+        let batches = plan_batches(
+            &inputs,
+            64,
+            32_768,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
+        );
         assert_eq!(batches, vec![0..1, 1..2]);
     }
 
@@ -602,8 +633,70 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
         );
         assert!(batches.is_empty());
+    }
+
+    fn max_padded_tokens(texts: &[String], batches: &[std::ops::Range<usize>]) -> usize {
+        batches
+            .iter()
+            .map(|range| {
+                let padded = texts[range.clone()]
+                    .iter()
+                    .map(|text| (text.len() + SPECIAL_TOKEN_SLACK).min(DEFAULT_MAX_LENGTH))
+                    .max()
+                    .unwrap();
+                range.len() * padded
+            })
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn mid_length_chunks_are_capped_by_padded_token_budget_not_just_batch_size() {
+        // 64 chunks of ~1000 tokens fit the 1 GiB attention budget (64 MB per
+        // row of attention x 16 rows) yet are 64k padded tokens in one pass.
+        let inputs = texts(&[1_000; 64]);
+        let batches = plan_batches(
+            &inputs,
+            64,
+            DEFAULT_MAX_LENGTH,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
+        );
+        assert!(
+            max_padded_tokens(&inputs, &batches) <= MAX_BATCH_TOKENS,
+            "{batches:?}"
+        );
+        assert!(batches.iter().all(|range| range.len() <= 8), "{batches:?}");
+        assert_eq!(batches.iter().map(|range| range.len()).sum::<usize>(), 64);
+    }
+
+    #[test]
+    fn token_budget_is_checked_against_the_padded_longest_member() {
+        // One long text in a run of short ones raises the padded length of
+        // every row of its batch.
+        let mut lengths = vec![40; 20];
+        lengths[10] = 4_000;
+        let inputs = texts(&lengths);
+        let batches = plan_batches(
+            &inputs,
+            64,
+            DEFAULT_MAX_LENGTH,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+            MAX_BATCH_TOKENS,
+        );
+        assert!(max_padded_tokens(&inputs, &batches) <= MAX_BATCH_TOKENS);
+    }
+
+    #[test]
+    fn single_input_over_token_budget_still_forms_its_own_batch() {
+        let inputs = texts(&[100_000, 100_000]);
+        let batches = plan_batches(&inputs, 64, 32_768, QWEN3_F32_ROW, usize::MAX, 4_096);
+        assert_eq!(batches, vec![0..1, 1..2]);
     }
 }
 

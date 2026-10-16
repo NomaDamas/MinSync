@@ -62,6 +62,7 @@ mod tests {
         assert_eq!(config.embedder.device, None);
         assert_eq!(config.embedder.dtype, None);
         assert_eq!(config.embedder.max_length, None);
+        assert_eq!(config.embedder.max_batch_tokens, None);
         assert_eq!(config.embedder.model_cache_dir, None);
         assert_eq!(config.vectorstore.id, "lancedb");
         assert_eq!(config.lexical.language, "simple");

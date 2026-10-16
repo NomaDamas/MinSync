@@ -329,10 +329,13 @@ max_concurrent = 1
 
 `timeout_seconds` also bounds the native (in-process) embedder: each forward pass (one batch) must finish within `per_batch_timeout_seconds` (default: `timeout_seconds`); `0` is rejected. A blocked native kernel cannot be cancelled, so on expiry `minsync sync` aborts with exit code `7` (`embedder timeout`) instead of hanging; the stuck thread dies with the process, and once it happens every later native call in that process fails fast. `progress.jsonl` keeps every file committed before the timeout, so re-running `minsync sync` resumes without re-embedding them. `minsync check` forward passes are bounded the same way. Model download/load is not bounded. On CPU, large batches can legitimately take long; raise `per_batch_timeout_seconds` there.
 
+Each native forward pass is also planned to stay within `max_batch_tokens` padded tokens (inputs × longest input, default 4096) on top of `batch_size` and an attention-memory cap, so a pass of long chunks finishes in seconds instead of approaching the deadline. An input longer than the cap is still embedded alone.
+
 ```toml
 [embedder]
 timeout_seconds = 60
 per_batch_timeout_seconds = 120   # optional, native only
+max_batch_tokens = 4096           # optional, native only
 ```
 
 `base_url` also works for OpenAI-compatible gateways.
