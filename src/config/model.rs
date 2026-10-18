@@ -153,7 +153,8 @@ pub struct EmbedderConfig {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     /// Native embedder only: deadline in seconds for a single forward pass
-    /// (one batch). Defaults to `timeout_seconds`.
+    /// (one batch). Defaults to `timeout_seconds`, but at least 900 on CPU,
+    /// where a pass is slow rather than stuck.
     #[serde(default)]
     pub per_batch_timeout_seconds: Option<u64>,
     #[serde(default)]

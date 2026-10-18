@@ -76,6 +76,8 @@ struct LoadedModel {
     attention_heads: usize,
     dtype: DType,
     backend: AttentionBackend,
+    /// Deadline for one forward pass on the device the model loaded onto.
+    batch_timeout: Duration,
 }
 
 pub struct NativeEmbedder {
@@ -87,7 +89,10 @@ pub struct NativeEmbedder {
     max_length: usize,
     batch_size: usize,
     max_batch_tokens: usize,
+    /// Deadline from the config (`per_batch_timeout_seconds`, else
+    /// `timeout_seconds`); see [`effective_batch_timeout`] for the CPU default.
     batch_timeout: Duration,
+    batch_timeout_explicit: bool,
     cache_dir: Option<PathBuf>,
     query_prefix: Option<String>,
     passage_prefix: Option<String>,
@@ -114,6 +119,7 @@ impl NativeEmbedder {
             batch_size: settings.batch_size,
             max_batch_tokens: settings.max_batch_tokens.unwrap_or(MAX_BATCH_TOKENS),
             batch_timeout: batch_timeout(settings)?,
+            batch_timeout_explicit: settings.per_batch_timeout_seconds.is_some(),
             cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
             query_prefix: settings.query_prefix.clone(),
             passage_prefix: settings.passage_prefix.clone(),
@@ -204,6 +210,8 @@ impl NativeEmbedder {
                 let attention = self.attention;
                 let max_length = self.max_length;
                 let cache_dir = self.cache_dir.clone();
+                let batch_timeout = self.batch_timeout;
+                let batch_timeout_explicit = self.batch_timeout_explicit;
                 tokio::task::spawn_blocking(move || {
                     apply_cache_dir(cache_dir.as_deref());
                     let device = resolve_device(device)?;
@@ -217,16 +225,23 @@ impl NativeEmbedder {
                         max_length,
                         attention,
                     })?;
+                    let batch_timeout = effective_batch_timeout(
+                        batch_timeout,
+                        batch_timeout_explicit,
+                        device.is_cpu(),
+                    );
                     tracing::debug!(
                         device = ?device.location(),
                         ?dtype,
                         attention = ?model.backend(),
+                        batch_timeout_seconds = batch_timeout.as_secs(),
                         "native embedder ready"
                     );
                     Ok(LoadedModel {
                         attention_heads: model.config().num_attention_heads.max(1),
                         dtype,
                         backend: model.backend(),
+                        batch_timeout,
                         model: Arc::new(Mutex::new(model)),
                     })
                 })
@@ -252,6 +267,7 @@ impl NativeEmbedder {
         let loaded = self.model().await?;
         let per_row_attention_bytes = loaded.attention_heads * loaded.dtype.size_in_bytes();
         let backend = loaded.backend;
+        let batch_timeout = loaded.batch_timeout;
         let model = loaded.model;
         let batches = plan_batches(
             &texts,
@@ -264,7 +280,7 @@ impl NativeEmbedder {
         );
         embed_in_batches(
             self.deadline,
-            self.batch_timeout,
+            batch_timeout,
             texts,
             batches,
             move |chunk: &[String]| {
@@ -410,8 +426,8 @@ fn plan_batches(
     batches
 }
 
-/// Deadline for one forward pass: `per_batch_timeout_seconds`, else
-/// `timeout_seconds`.
+/// Deadline for one forward pass in the config: `per_batch_timeout_seconds`,
+/// else `timeout_seconds`.
 fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
     let seconds = settings
         .per_batch_timeout_seconds
@@ -422,6 +438,24 @@ fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
         ));
     }
     Ok(Duration::from_secs(seconds))
+}
+
+/// Per-pass deadline on CPU when `per_batch_timeout_seconds` is not set. A CPU
+/// pass is slow but does not hang: a 2-chunk pass of long inputs needs minutes
+/// on a mid-range desktop CPU, which the 60 s default meant for a stuck GPU
+/// kernel would abort as a timeout.
+const CPU_BATCH_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The deadline a loaded model runs under. An explicit
+/// `per_batch_timeout_seconds` always wins; otherwise CPU gets at least
+/// [`CPU_BATCH_TIMEOUT`] (a larger `timeout_seconds` is kept) and GPUs keep the
+/// configured value.
+fn effective_batch_timeout(configured: Duration, explicit: bool, on_cpu: bool) -> Duration {
+    if on_cpu && !explicit {
+        configured.max(CPU_BATCH_TIMEOUT)
+    } else {
+        configured
+    }
 }
 
 fn parse_native_model_id(id: &str) -> Result<&str> {
@@ -863,6 +897,35 @@ mod deadline_tests {
             batch_timeout(&settings(42, Some(0))),
             Err(MinSyncError::Config(_))
         ));
+    }
+
+    #[test]
+    fn cpu_defaults_to_a_longer_deadline_unless_one_is_configured() {
+        let configured = Duration::from_secs(60);
+        // CPU without per_batch_timeout_seconds: 900 s.
+        assert_eq!(
+            effective_batch_timeout(configured, false, true),
+            Duration::from_secs(900)
+        );
+        // A larger timeout_seconds is not shortened.
+        assert_eq!(
+            effective_batch_timeout(Duration::from_secs(1200), false, true),
+            Duration::from_secs(1200)
+        );
+        // An explicit per_batch_timeout_seconds wins, even when shorter.
+        assert_eq!(
+            effective_batch_timeout(Duration::from_secs(30), true, true),
+            Duration::from_secs(30)
+        );
+        // GPUs keep the configured value (60 s by default).
+        assert_eq!(
+            effective_batch_timeout(configured, false, false),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            effective_batch_timeout(configured, true, false),
+            Duration::from_secs(60)
+        );
     }
 
     #[tokio::test]
