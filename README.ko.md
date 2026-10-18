@@ -274,7 +274,7 @@ max_concurrent = 1
 
 ## 로컬 Embedding
 
-기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)(candle)로 프로세스 안에서 실행됩니다. `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
+기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 실행됩니다(모델 코드는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)에서 가져왔으며 `THIRD_PARTY_NOTICES.md`에 표기했습니다). `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
 
 첫 embedding 호출이 Apache-2.0 모델을 Hugging Face Hub에서 `~/.cache/minsync/models`로 받습니다. `config.toml`의 `model_cache_dir`, `FASTEMBED_CACHE_DIR`, `HF_HOME`으로 경로를 바꿀 수 있습니다. 이후 실행은 캐시에서 로드합니다.
 
@@ -289,6 +289,29 @@ minsync query "검색어" --k 5
 ```bash
 minsync sync --full
 ```
+
+### Native 런타임
+
+`[embedder]`의 선택 설정 두 가지로 native 런타임을 조정합니다. 대부분은 기본값이면 충분합니다.
+
+```toml
+[embedder]
+dtype = "auto"      # auto | f32 | f16 | bf16
+attention = "auto"  # auto | eager | tiled | fused
+```
+
+- `dtype`: `auto`는 Metal에서 `f16`, 그 외에는 `f32`입니다. 반정밀도는 모델 메모리를 약 3분의 1 줄이며, 벡터는 `f32` 결과와 코사인 유사도 0.0001 이내로 유지되고 테스트한 검색 결과는 바뀌지 않았습니다. 전체 정밀도가 필요하면 `dtype = "f32"`로 두세요. 기존 인덱스는 그대로 유효합니다.
+- `attention`: `auto`는 장치의 fused 커널(Metal scaled-dot-product attention, CPU flash attention)을 쓰고, 그 외 장치(CUDA 빌드)에서는 점수 행렬을 블록 단위로 계산해 chunk 길이의 제곱에 비례하던 피크 메모리를 없앱니다. `eager`는 점수 행렬 전체를 만드는 기준 구현(긴 chunk에서 수 GiB)이고, `tiled`는 어느 장치에서나 블록 단위로 계산하며, `fused`는 장치에 fused 커널이 없으면 오류를 냅니다.
+
+Apple M4 Max(macOS, Metal)에서 기본 chunk 크기로 `minsync sync`를 세 번 실행한 중앙값이며, 이전 릴리스(f32, eager attention)와 비교한 결과입니다.
+
+| 코퍼스 | 이전 | 이후(기본값) | 이후(`dtype = "f32"`) |
+|---|---|---|---|
+| 한국어 문단 600개(약 550자) | 125초, 6.3 GiB | 58초, 3.0 GiB | 61초, 4.6 GiB |
+| 영어 초록 1000개 | 173초, 4.9 GiB | 83초, 3.0 GiB | 89초, 4.5 GiB |
+| 약 3.7k자 chunk 48개 | 97초, 7.3 GiB | 26초, 3.2 GiB | 29초, 4.9 GiB |
+
+### 다른 provider
 
 `openai:`와 `tei:`는 그대로 사용할 수 있습니다. 로컬 TEI + EmbeddingGemma를 유지하려면:
 

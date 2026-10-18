@@ -347,7 +347,7 @@ max_batch_tokens = 4096           # optional, native only
 
 ## Local Embeddings
 
-The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process through [fastembed-rs](https://github.com/Anush008/fastembed-rs) (candle). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
+The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process on [candle](https://github.com/huggingface/candle) (the model code is ported from [fastembed-rs](https://github.com/Anush008/fastembed-rs); see `THIRD_PARTY_NOTICES.md`). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
 
 The first embedding call downloads the Apache-2.0 model via Hugging Face Hub into `~/.cache/minsync/models` (override with `model_cache_dir` in `config.toml`, `FASTEMBED_CACHE_DIR`, or `HF_HOME`). Later runs load from cache.
 
@@ -362,6 +362,29 @@ Existing indexes built with a 768-d TEI model must not mix 1024-d vectors. Switc
 ```bash
 minsync sync --full
 ```
+
+### Native runtime
+
+Two optional `[embedder]` settings tune the native runtime; the defaults are what most setups want.
+
+```toml
+[embedder]
+dtype = "auto"      # auto | f32 | f16 | bf16
+attention = "auto"  # auto | eager | tiled | fused
+```
+
+- `dtype`: `auto` is `f16` on Metal and `f32` elsewhere. Half precision shrinks the model's footprint by a third; the vector stays within 0.0001 cosine similarity of its `f32` counterpart, which did not change retrieval results in our tests. Set `dtype = "f32"` for full precision. Existing indexes stay valid.
+- `attention`: `auto` uses the device's fused kernel (Metal scaled-dot-product attention, CPU flash attention) and tiles the score matrix on other devices (CUDA builds), so peak memory no longer grows with the square of the chunk length. `eager` is the reference implementation that materializes the whole score matrix (several GiB for long chunks); `tiled` computes it block by block on any device; `fused` fails if the device has no fused kernel.
+
+Median of three `minsync sync` runs at the default chunk size on an Apple M4 Max (macOS, Metal), compared with the previous release (f32, eager attention):
+
+| Corpus | Before | After (defaults) | After (`dtype = "f32"`) |
+|---|---|---|---|
+| 600 Korean passages (~550 characters) | 125 s, 6.3 GiB | 58 s, 3.0 GiB | 61 s, 4.6 GiB |
+| 1000 English abstracts | 173 s, 4.9 GiB | 83 s, 3.0 GiB | 89 s, 4.5 GiB |
+| 48 chunks of ~3.7k characters | 97 s, 7.3 GiB | 26 s, 3.2 GiB | 29 s, 4.9 GiB |
+
+### Other providers
 
 `openai:` and `tei:` remain first-class. To keep using a local TEI server with EmbeddingGemma:
 

@@ -131,7 +131,7 @@ Use this checklist when adding an embedding provider or model family:
 6. Document the model dimension and tell agents to update `[vectorstore.options].dimension`, then run `minsync sync --full`.
 7. Add tests for prefix stripping, batching, retryable errors, fatal errors, timeout retry, and query/document prefix behavior.
 
-The default embedder is `native:Qwen/Qwen3-Embedding-0.6B` with dimension `1024`, loaded in-process via fastembed-rs. OpenAI is supported with ids like `openai:text-embedding-3-small`. TEI models use ids like `tei:google/embeddinggemma-300m`, `tei:intfloat/multilingual-e5-small`, and `tei:BAAI/bge-m3`.
+The default embedder is `native:Qwen/Qwen3-Embedding-0.6B` with dimension `1024`, loaded in-process on candle (Metal on Apple Silicon, CPU elsewhere). OpenAI is supported with ids like `openai:text-embedding-3-small`. TEI models use ids like `tei:google/embeddinggemma-300m`, `tei:intfloat/multilingual-e5-small`, and `tei:BAAI/bge-m3`.
 
 For a longer implementation checklist, read `docs/EXTENDING.md` in the MinSync repository.
 
