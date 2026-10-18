@@ -1,0 +1,6 @@
+node_modules/
+*.node
+binding.js
+binding.d.ts
+npm/
+artifacts/

@@ -13,6 +13,7 @@ exclude = [
     ".github/",
     ".idea/",
     "AGENTS.md",
+    "bindings/",
     "CLAUDE.md",
     "runs/",
     "evidence/",
@@ -20,6 +21,9 @@ exclude = [
     "scripts/",
     "tests/",
 ]
+
+[workspace]
+members = [".", "bindings/node"]
 
 [dependencies]
 chunk = "0.10"

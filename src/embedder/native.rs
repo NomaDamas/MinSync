@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
 pub(crate) const DEFAULT_MAX_LENGTH: usize = 2048;
 
@@ -84,6 +84,67 @@ struct LoadedModel {
     backend: AttentionBackend,
     /// Deadline for one forward pass on the device the model loaded onto.
     batch_timeout: Duration,
+    /// Embedding output dimension (the model's hidden size).
+    dimension: usize,
+    device: &'static str,
+}
+
+/// A lazily loaded value that can be dropped again and reloaded on demand.
+///
+/// Concurrent callers share one load; a failed load is not cached.
+struct LoadSlot<T> {
+    value: AsyncMutex<Option<T>>,
+}
+
+impl<T: Clone> LoadSlot<T> {
+    fn new() -> Self {
+        Self {
+            value: AsyncMutex::new(None),
+        }
+    }
+
+    async fn get_or_load<F, Fut>(&self, load: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut slot = self.value.lock().await;
+        if let Some(value) = slot.as_ref() {
+            return Ok(value.clone());
+        }
+        let value = load().await?;
+        *slot = Some(value.clone());
+        Ok(value)
+    }
+
+    /// Drop the held value; true when one was resident. Waits for an
+    /// in-progress load first, so the load's value is dropped too.
+    async fn unload(&self) -> bool {
+        self.value.lock().await.take().is_some()
+    }
+
+    /// True when a value is resident. A load or unload in progress reports
+    /// false.
+    fn is_loaded(&self) -> bool {
+        self.value
+            .try_lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+}
+
+/// What a host needs to record which embedding space the vectors belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeIdentity {
+    /// The embedder id as written in `config.toml`, e.g.
+    /// `native:Qwen/Qwen3-Embedding-0.6B`.
+    pub id: String,
+    pub dimension: usize,
+    /// Resolved precision: `f32`, `f16` or `bf16`.
+    pub dtype: &'static str,
+    /// Resolved device: `cpu`, `metal` or `cuda`.
+    pub device: &'static str,
+    pub max_length: usize,
 }
 
 pub struct NativeEmbedder {
@@ -102,7 +163,7 @@ pub struct NativeEmbedder {
     cache_dir: Option<PathBuf>,
     query_prefix: Option<String>,
     passage_prefix: Option<String>,
-    inner: OnceCell<LoadedModel>,
+    inner: LoadSlot<LoadedModel>,
     tokenizer: OnceCell<Tokenizer>,
     deadline: &'static BatchDeadline,
 }
@@ -129,7 +190,7 @@ impl NativeEmbedder {
             cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
             query_prefix: settings.query_prefix.clone(),
             passage_prefix: settings.passage_prefix.clone(),
-            inner: OnceCell::new(),
+            inner: LoadSlot::new(),
             tokenizer: OnceCell::new(),
             deadline: &NATIVE_DEADLINE,
         })
@@ -209,7 +270,7 @@ impl NativeEmbedder {
 
     async fn model(&self) -> Result<LoadedModel> {
         self.inner
-            .get_or_try_init(|| async {
+            .get_or_load(|| async {
                 let repo = self.model_id.clone();
                 let device = self.device;
                 let dtype = self.dtype;
@@ -250,6 +311,8 @@ impl NativeEmbedder {
                         dtype,
                         backend: model.backend(),
                         batch_timeout,
+                        dimension: model.config().hidden_size,
+                        device: device_name(&device),
                         model: Arc::new(Mutex::new(model)),
                         gate: Arc::new(tokio::sync::Mutex::new(())),
                     })
@@ -260,7 +323,32 @@ impl NativeEmbedder {
                 })?
             })
             .await
-            .cloned()
+    }
+
+    /// The embedding space this embedder produces. Loads the model if it is
+    /// not resident, because the device, dtype and dimension are only known
+    /// once it is.
+    pub async fn identity(&self) -> Result<NativeIdentity> {
+        let loaded = self.model().await?;
+        Ok(NativeIdentity {
+            id: format!("native:{}", self.model_id),
+            dimension: loaded.dimension,
+            dtype: dtype_name(loaded.dtype),
+            device: loaded.device,
+            max_length: self.max_length,
+        })
+    }
+
+    /// Release the model weights. The next embed reloads them. A forward pass
+    /// already running keeps its own handle and finishes first. Returns true
+    /// when a model was resident.
+    pub async fn unload(&self) -> bool {
+        self.inner.unload().await
+    }
+
+    /// True while the model weights are resident.
+    pub fn is_loaded(&self) -> bool {
+        self.inner.is_loaded()
     }
 
     /// Tokens per text as the model sees it before truncation.
@@ -602,6 +690,25 @@ impl NativeDtype {
             Self::F16 => DType::F16,
             Self::Bf16 => DType::BF16,
         }
+    }
+}
+
+fn dtype_name(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        other => other.as_str(),
+    }
+}
+
+fn device_name(device: &Device) -> &'static str {
+    if device.is_metal() {
+        "metal"
+    } else if device.is_cuda() {
+        "cuda"
+    } else {
+        "cpu"
     }
 }
 
@@ -1108,6 +1215,80 @@ mod deadline_tests {
         for handle in handles {
             let outcome = handle.await.unwrap();
             assert!(outcome.is_ok(), "{outcome:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_load() {
+        let slot: LoadSlot<Arc<u32>> = LoadSlot::new();
+        let loads = AtomicUsize::new(0);
+        let load = || async {
+            loads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(Arc::new(7))
+        };
+
+        let (a, b, c) = tokio::join!(
+            slot.get_or_load(load),
+            slot.get_or_load(load),
+            slot.get_or_load(load)
+        );
+
+        assert_eq!((*a.unwrap(), *b.unwrap(), *c.unwrap()), (7, 7, 7));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(slot.is_loaded());
+    }
+
+    #[tokio::test]
+    async fn unload_releases_the_value_and_the_next_call_reloads() {
+        let slot: LoadSlot<Arc<u32>> = LoadSlot::new();
+        let loads = AtomicUsize::new(0);
+        let load = || async {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(1))
+        };
+
+        let first = slot.get_or_load(load).await.unwrap();
+        assert_eq!(Arc::strong_count(&first), 2);
+
+        assert!(slot.unload().await);
+        assert!(!slot.is_loaded());
+        assert_eq!(Arc::strong_count(&first), 1, "slot must drop its handle");
+        assert!(!slot.unload().await, "second unload is a no-op");
+
+        slot.get_or_load(load).await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert!(slot.is_loaded());
+    }
+
+    #[tokio::test]
+    async fn failed_load_is_not_cached() {
+        let slot: LoadSlot<u32> = LoadSlot::new();
+
+        let failed = slot
+            .get_or_load(|| async { Err(MinSyncError::Embedding("no weights".to_string())) })
+            .await;
+        assert!(matches!(failed, Err(MinSyncError::Embedding(_))));
+        assert!(!slot.is_loaded());
+
+        assert_eq!(slot.get_or_load(|| async { Ok(5) }).await.unwrap(), 5);
+    }
+
+    #[test]
+    fn identity_names_match_the_config_vocabulary() {
+        assert_eq!(dtype_name(DType::F32), "f32");
+        assert_eq!(dtype_name(DType::F16), "f16");
+        assert_eq!(dtype_name(DType::BF16), "bf16");
+        assert_eq!(device_name(&Device::Cpu), "cpu");
+        #[cfg(target_os = "macos")]
+        if let Ok(metal) = Device::new_metal(0) {
+            assert_eq!(device_name(&metal), "metal");
         }
     }
 }

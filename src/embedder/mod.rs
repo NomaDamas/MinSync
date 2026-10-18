@@ -4,6 +4,7 @@ pub mod openai;
 mod qwen3;
 pub mod retry;
 pub mod served;
+pub mod session;
 pub mod tei;
 
 use crate::config::Config;

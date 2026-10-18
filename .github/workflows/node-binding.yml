@@ -1,0 +1,188 @@
+name: Node binding
+
+on:
+  pull_request:
+    paths:
+      - "bindings/node/**"
+      - "src/embedder/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/node-binding.yml"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    defaults:
+      run:
+        working-directory: bindings/node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Kiwi
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash ../../scripts/install-kiwi.sh >> "$GITHUB_ENV"
+
+      - name: Install Kiwi
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          KIWI_VERSION: 0.22.2
+        run: |
+          ../../scripts/install-kiwi.ps1 | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - run: npm ci
+
+      - run: cargo clippy -p minsync-node --target ${{ matrix.target }} -- -D warnings
+
+      - run: npm run build -- --target ${{ matrix.target }}
+
+      # No model weights needed: settings validation, lazy state, dispose,
+      # abort, error codes, failed-load handling.
+      - name: Contract tests
+        run: node --test __test__/contract.test.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: bindings/node/*.node
+          if-no-files-found: error
+
+  # Real model on CPU: lifecycle, abort, deadline, and bit-for-bit parity with
+  # the CLI's `native:` embedder (examples/embed_reference.rs).
+  live:
+    name: live (cpu, ubuntu)
+    runs-on: ubuntu-latest
+
+    env:
+      MINSYNC_LIVE: "1"
+      MINSYNC_TEST_DEVICE: cpu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-live
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Kiwi
+        shell: bash
+        run: |
+          bash scripts/install-kiwi.sh >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/minsync/models
+          key: qwen3-embedding-0.6b-v1
+
+      - working-directory: bindings/node
+        run: npm ci && npm run build
+
+      - name: Reference vectors from the CLI embedder
+        run: >
+          cargo run --release -p minsync --example embed_reference --
+          bindings/node/__test__/fixtures/texts.json "$RUNNER_TEMP/reference.json"
+
+      - name: Live and parity tests
+        working-directory: bindings/node
+        env:
+          MINSYNC_REFERENCE_VECTORS: ${{ runner.temp }}/reference.json
+        run: node --test --test-concurrency=1 __test__/
+
+  publish:
+    name: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, live]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        working-directory: bindings/node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: bindings/node/artifacts
+
+      - name: Assemble per-platform packages
+        run: |
+          npx napi create-npm-dirs
+          npx napi artifacts -d artifacts --npm-dir npm
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+        # `prepublishOnly` (napi pre-publish) publishes the per-platform
+        # packages and pins them as optionalDependencies of this one.
+        run: npm publish --access public

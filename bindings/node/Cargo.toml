@@ -1,0 +1,21 @@
+[package]
+name = "minsync-node"
+version = "0.4.9"
+edition = "2021"
+rust-version = "1.91"
+description = "Node-API binding exposing MinSync's native embedder for in-process use"
+license = "MIT"
+repository = "https://github.com/NomaDamas/MinSync"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+minsync = { path = "../.." }
+napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[build-dependencies]
+napi-build = "2"

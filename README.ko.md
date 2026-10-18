@@ -311,6 +311,22 @@ Apple M4 Max(macOS, Metal)에서 기본 chunk 크기로 `minsync sync`를 세 �
 | 영어 초록 1000개 | 173초, 4.9 GiB | 83초, 3.0 GiB | 89초, 4.5 GiB |
 | 약 3.7k자 chunk 48개 | 97초, 7.3 GiB | 26초, 3.2 GiB | 29초, 4.9 GiB |
 
+### Node.js에서 사용
+
+`@nomadamas/minsync-native`([`bindings/node`](bindings/node))는 같은 native embedder를 프로세스 내부 Node-API addon으로 제공합니다. 오래 실행되는 Node/Electron 호스트가 별도 프로세스나 호출마다의 콜드 모델 로드 없이 임베딩할 수 있습니다. 이 런타임과 같은 가중치, 캐시 디렉터리, 배치 planner, deadline을 쓰며, 같은 텍스트·장치·배치 구성에서는 CLI와 비트 단위로 동일한 벡터를 반환합니다.
+
+```ts
+import { NativeEmbedder } from '@nomadamas/minsync-native'
+
+const embedder = new NativeEmbedder({ idleUnloadSeconds: 600 })
+const { id, dimension, dtype, device } = await embedder.identity()
+const passages = await embedder.embed(['첫 번째 문단', '두 번째 문단']) // Float32Array[]
+const query = await embedder.embedQuery('어느 문단?')
+await embedder.dispose()
+```
+
+Apple M 시리즈 Mac에서 모델은 한 번(약 2.2초) 로드되고, 이후 warm 쿼리는 약 17ms이며, `unload()`는 RSS 약 2.7 GB를 반환합니다. 옵션과 abort·deadline 동작은 [`bindings/node/README.md`](bindings/node/README.md)를 참고하세요.
+
 ### 다른 provider
 
 `openai:`와 `tei:`는 그대로 사용할 수 있습니다. 로컬 TEI + EmbeddingGemma를 유지하려면:

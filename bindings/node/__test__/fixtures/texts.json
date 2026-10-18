@@ -1,0 +1,17 @@
+{
+  "queryPrefix": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+  "passagePrefix": null,
+  "passages": [
+    "MinSync indexes text files incrementally using a manifest of mtime, size and content hash.",
+    "한국어 문장도 같은 모델로 임베딩됩니다. 형태소 분석과는 무관합니다.",
+    "fn main() { println!(\"hello, world\"); }",
+    "Metal returns different low bits when the batch composition changes, so parity needs the same batches.",
+    "Short.",
+    "A longer passage that repeats itself so the padded width of the batch is dominated by this entry. A longer passage that repeats itself so the padded width of the batch is dominated by this entry. A longer passage that repeats itself so the padded width of the batch is dominated by this entry."
+  ],
+  "queries": [
+    "how does incremental indexing detect changes?",
+    "한국어 임베딩",
+    "hello world program"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "name": "@nomadamas/minsync-native",
+  "version": "0.4.9",
+  "description": "MinSync's native embedder (Qwen3 on candle, Metal on macOS) as an in-process Node-API addon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NomaDamas/MinSync.git",
+    "directory": "bindings/node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "binding.js",
+    "binding.d.ts"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "napi": {
+    "binaryName": "minsync-native",
+    "packageName": "@nomadamas/minsync-native",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --js binding.js --dts binding.d.ts",
+    "artifacts": "napi artifacts",
+    "prepublishOnly": "napi pre-publish -t npm",
+    "test": "node --test __test__/"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.8"
+  }
+}

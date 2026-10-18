@@ -384,6 +384,22 @@ Median of three `minsync sync` runs at the default chunk size on an Apple M4 Max
 | 1000 English abstracts | 173 s, 4.9 GiB | 83 s, 3.0 GiB | 89 s, 4.5 GiB |
 | 48 chunks of ~3.7k characters | 97 s, 7.3 GiB | 26 s, 3.2 GiB | 29 s, 4.9 GiB |
 
+### Use from Node.js
+
+`@nomadamas/minsync-native` ([`bindings/node`](bindings/node)) exposes the same native embedder as an in-process Node-API addon, so a long-lived Node or Electron host embeds without a second process or a cold model load per call. It shares this runtime's weights, cache directory, batch planner and deadline, and returns vectors bit-for-bit identical to the CLI's for the same text, device and batch composition.
+
+```ts
+import { NativeEmbedder } from '@nomadamas/minsync-native'
+
+const embedder = new NativeEmbedder({ idleUnloadSeconds: 600 })
+const { id, dimension, dtype, device } = await embedder.identity()
+const passages = await embedder.embed(['first passage', 'second passage']) // Float32Array[]
+const query = await embedder.embedQuery('which passage?')
+await embedder.dispose()
+```
+
+On an Apple M-series Mac the model loads once (about 2.2 s), a warm query then takes about 17 ms, and `unload()` returns about 2.7 GB of RSS. See [`bindings/node/README.md`](bindings/node/README.md) for the options, abort and deadline behavior.
+
 ### Other providers
 
 `openai:` and `tei:` remain first-class. To keep using a local TEI server with EmbeddingGemma:
