@@ -32,7 +32,7 @@
     "build": "napi build --platform --release --js binding.js --dts binding.d.ts",
     "artifacts": "napi artifacts",
     "prepublishOnly": "napi pre-publish -t npm",
-    "test": "node --test __test__/"
+    "test": "node --test \"__test__/*.test.mjs\""
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.10.8"

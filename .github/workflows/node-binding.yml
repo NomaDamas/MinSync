@@ -144,7 +144,7 @@ jobs:
         working-directory: bindings/node
         env:
           MINSYNC_REFERENCE_VECTORS: ${{ runner.temp }}/reference.json
-        run: node --test --test-concurrency=1 __test__/
+        run: node --test --test-concurrency=1 "__test__/*.test.mjs"
 
   publish:
     name: publish

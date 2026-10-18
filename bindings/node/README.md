@@ -95,7 +95,7 @@ npm run build                      # release build of the addon for this platfor
 node --test __test__/contract.test.mjs   # no model needed
 
 # Real model (downloads ~1.2 GB into the cache on first run):
-MINSYNC_LIVE=1 MINSYNC_TEST_DEVICE=cpu node --test --test-concurrency=1 __test__/
+MINSYNC_LIVE=1 MINSYNC_TEST_DEVICE=cpu node --test --test-concurrency=1 "__test__/*.test.mjs"
 
 # Parity with the CLI embedder:
 MINSYNC_TEST_DEVICE=cpu cargo run --release -p minsync --example embed_reference -- \
