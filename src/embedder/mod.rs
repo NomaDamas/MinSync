@@ -1,6 +1,7 @@
 pub mod deadline;
 pub mod native;
 pub mod openai;
+mod qwen3;
 pub mod retry;
 pub mod tei;
 

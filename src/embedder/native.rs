@@ -1,12 +1,14 @@
-//! In-process native embedder backed by fastembed-rs (Qwen3 / candle).
+//! In-process native embedder (Qwen3 on candle). The model lives in
+//! [`super::qwen3`]; this module owns device/dtype selection, batching and the
+//! per-batch deadline.
 
 use crate::config::EmbedderConfig;
 use crate::embedder::deadline::BatchDeadline;
+use crate::embedder::qwen3::{AttentionBackend, AttentionRequest, LoadOptions, Qwen3Embedder};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
 use candle_core::{DType, Device};
-use fastembed::Qwen3TextEmbedding;
 use hf_hub::api::sync::ApiBuilder;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -70,14 +72,18 @@ enum NativeDtype {
 
 #[derive(Clone)]
 struct LoadedModel {
-    model: Arc<Mutex<Qwen3TextEmbedding>>,
+    model: Arc<Mutex<Qwen3Embedder>>,
     attention_heads: usize,
+    dtype: DType,
+    backend: AttentionBackend,
 }
 
 pub struct NativeEmbedder {
     model_id: String,
     device: NativeDevice,
-    dtype: NativeDtype,
+    /// `None` picks the device's default (see [`default_dtype`]).
+    dtype: Option<NativeDtype>,
+    attention: AttentionRequest,
     max_length: usize,
     batch_size: usize,
     max_batch_tokens: usize,
@@ -103,6 +109,7 @@ impl NativeEmbedder {
             model_id,
             device: parse_device(settings.device.as_deref())?,
             dtype: parse_dtype(settings.dtype.as_deref())?,
+            attention: AttentionRequest::parse(settings.attention.as_deref())?,
             max_length: settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
             batch_size: settings.batch_size,
             max_batch_tokens: settings.max_batch_tokens.unwrap_or(MAX_BATCH_TOKENS),
@@ -126,7 +133,7 @@ impl NativeEmbedder {
                     let api = if std::env::var_os("HF_HOME").is_some() {
                         ApiBuilder::from_env()
                     } else {
-                        ApiBuilder::new().with_cache_dir(PathBuf::from(fastembed::get_cache_dir()))
+                        ApiBuilder::new().with_cache_dir(PathBuf::from(model_cache_dir()))
                     }
                     .with_progress(false)
                     .build()
@@ -194,24 +201,39 @@ impl NativeEmbedder {
                 let repo = self.model_id.clone();
                 let device = self.device;
                 let dtype = self.dtype;
+                let attention = self.attention;
                 let max_length = self.max_length;
                 let cache_dir = self.cache_dir.clone();
-                let loaded = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     apply_cache_dir(cache_dir.as_deref());
                     let device = resolve_device(device)?;
-                    Qwen3TextEmbedding::from_hf(&repo, &device, dtype.to_candle(), max_length)
-                        .map_err(|error| {
-                            MinSyncError::Embedding(format!("native model load failed: {error}"))
-                        })
+                    let dtype =
+                        dtype.map_or_else(|| default_dtype(&device), NativeDtype::to_candle);
+                    let model = Qwen3Embedder::from_hf(&LoadOptions {
+                        repo_id: &repo,
+                        default_cache_dir: PathBuf::from(model_cache_dir()),
+                        device: &device,
+                        dtype,
+                        max_length,
+                        attention,
+                    })?;
+                    tracing::debug!(
+                        device = ?device.location(),
+                        ?dtype,
+                        attention = ?model.backend(),
+                        "native embedder ready"
+                    );
+                    Ok(LoadedModel {
+                        attention_heads: model.config().num_attention_heads.max(1),
+                        dtype,
+                        backend: model.backend(),
+                        model: Arc::new(Mutex::new(model)),
+                    })
                 })
                 .await
                 .map_err(|error| {
                     MinSyncError::Embedding(format!("native model load join failed: {error}"))
-                })??;
-                Ok(LoadedModel {
-                    attention_heads: loaded.config().num_attention_heads.max(1),
-                    model: Arc::new(Mutex::new(loaded)),
-                })
+                })?
             })
             .await
             .cloned()
@@ -228,8 +250,8 @@ impl NativeEmbedder {
         }
         self.deadline.ensure_healthy("native embedding")?;
         let loaded = self.model().await?;
-        let dtype_bytes = self.dtype.to_candle().size_in_bytes();
-        let per_row_attention_bytes = loaded.attention_heads * dtype_bytes;
+        let per_row_attention_bytes = loaded.attention_heads * loaded.dtype.size_in_bytes();
+        let backend = loaded.backend;
         let model = loaded.model;
         let batches = plan_batches(
             &texts,
@@ -238,6 +260,7 @@ impl NativeEmbedder {
             per_row_attention_bytes,
             ATTENTION_BYTES_BUDGET,
             self.max_batch_tokens,
+            backend,
         );
         embed_in_batches(
             self.deadline,
@@ -336,13 +359,16 @@ impl Embedder for NativeEmbedder {
 }
 
 /// Split `texts` into consecutive batches of at most `batch_size` inputs whose
-/// attention-score tensor stays within `budget_bytes` and whose padded token
-/// count stays within `max_batch_tokens`.
+/// attention scratch stays within `budget_bytes` and whose padded token count
+/// stays within `max_batch_tokens`.
 ///
-/// Inputs are left-padded to the longest member, so a batch costs
-/// `len * per_row_bytes * padded^2` of attention scores and `len * padded`
-/// tokens, where `per_row_bytes` is `heads * dtype_size` and `padded` is
-/// bounded by the byte length of the longest text (capped at `max_length`).
+/// Inputs are left-padded to the longest member, so a batch costs `len * padded`
+/// tokens, where `padded` is bounded by the byte length of the longest text
+/// (capped at `max_length`), and
+/// `len * per_row_bytes * padded * backend.score_rows(padded)` bytes of
+/// attention scores, where `per_row_bytes` is `heads * dtype_size`. The
+/// eager backend keeps `padded` score rows alive, the tiled one a fixed tile,
+/// and the fused kernels none, so they differ in how much the budget binds.
 /// A single input always forms a batch on its own even when it alone exceeds
 /// either budget.
 fn plan_batches(
@@ -352,6 +378,7 @@ fn plan_batches(
     per_row_bytes: usize,
     budget_bytes: usize,
     max_batch_tokens: usize,
+    backend: AttentionBackend,
 ) -> Vec<std::ops::Range<usize>> {
     let token_bound = |text: &String| (text.len() + SPECIAL_TOKEN_SLACK).min(max_length.max(1));
     let mut batches = Vec::new();
@@ -363,7 +390,7 @@ fn plan_batches(
         let attention_bytes = candidate_len
             .saturating_mul(per_row_bytes)
             .saturating_mul(candidate_padded)
-            .saturating_mul(candidate_padded);
+            .saturating_mul(backend.score_rows(candidate_padded));
         let padded_tokens = candidate_len.saturating_mul(candidate_padded);
         if index > start
             && (candidate_len > batch_size
@@ -449,14 +476,27 @@ fn parse_device(value: Option<&str>) -> Result<NativeDevice> {
     }
 }
 
-fn parse_dtype(value: Option<&str>) -> Result<NativeDtype> {
+fn parse_dtype(value: Option<&str>) -> Result<Option<NativeDtype>> {
     match value {
-        None | Some("f32") => Ok(NativeDtype::F32),
-        Some("f16") => Ok(NativeDtype::F16),
-        Some("bf16") => Ok(NativeDtype::Bf16),
+        None | Some("auto") => Ok(None),
+        Some("f32") => Ok(Some(NativeDtype::F32)),
+        Some("f16") => Ok(Some(NativeDtype::F16)),
+        Some("bf16") => Ok(Some(NativeDtype::Bf16)),
         Some(other) => Err(MinSyncError::Config(format!(
-            "invalid native dtype '{other}': expected f32, f16, or bf16"
+            "invalid native dtype '{other}': expected auto, f32, f16, or bf16"
         ))),
+    }
+}
+
+/// Weight/activation precision when the config does not name one: half
+/// precision on Metal, where it cuts the model's footprint by a third at no
+/// measurable retrieval cost; f32 elsewhere, where half-precision kernels are
+/// either slow (CPU, pre-Volta CUDA) or not worth the precision.
+fn default_dtype(device: &Device) -> DType {
+    if device.is_metal() {
+        DType::F16
+    } else {
+        DType::F32
     }
 }
 
@@ -504,6 +544,12 @@ fn metal_device() -> Result<Device> {
             "device metal is only available on macOS".to_string(),
         ))
     }
+}
+
+/// Cache directory for model files. `FASTEMBED_CACHE_DIR` is the name earlier
+/// releases used (and documented), so it stays the override.
+fn model_cache_dir() -> String {
+    std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".to_string())
 }
 
 fn apply_cache_dir(configured: Option<&std::path::Path>) {
@@ -572,6 +618,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         assert_eq!(batches, vec![0..64, 64..128, 128..130]);
     }
@@ -588,6 +635,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         assert!(max_attention_bytes(&inputs, &batches) <= ATTENTION_BYTES_BUDGET);
         assert!(max_attention_bytes(&inputs, &batches) < 1 << 32);
@@ -604,6 +652,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         let mut next = 0;
         for range in &batches {
@@ -625,6 +674,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         assert_eq!(batches, vec![0..1, 1..2]);
     }
@@ -638,6 +688,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         assert!(batches.is_empty());
     }
@@ -669,6 +720,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         assert!(
             max_padded_tokens(&inputs, &batches) <= MAX_BATCH_TOKENS,
@@ -692,6 +744,7 @@ mod tests {
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
             MAX_BATCH_TOKENS,
+            AttentionBackend::Eager,
         );
         assert!(max_padded_tokens(&inputs, &batches) <= MAX_BATCH_TOKENS);
     }
@@ -699,8 +752,76 @@ mod tests {
     #[test]
     fn single_input_over_token_budget_still_forms_its_own_batch() {
         let inputs = texts(&[100_000, 100_000]);
-        let batches = plan_batches(&inputs, 64, 32_768, QWEN3_F32_ROW, usize::MAX, 4_096);
+        let batches = plan_batches(
+            &inputs,
+            64,
+            32_768,
+            QWEN3_F32_ROW,
+            usize::MAX,
+            4_096,
+            AttentionBackend::Eager,
+        );
         assert_eq!(batches, vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn fused_kernels_are_not_limited_by_the_attention_budget() {
+        // Four 2048-token inputs: eager attention scores are 256 MiB each, so a
+        // 256 MiB budget splits them one per batch; a fused kernel holds none.
+        let inputs = texts(&[200_000; 4]);
+        let plan = |backend| {
+            plan_batches(
+                &inputs,
+                64,
+                DEFAULT_MAX_LENGTH,
+                QWEN3_F32_ROW,
+                ATTENTION_BYTES_BUDGET / 4,
+                usize::MAX,
+                backend,
+            )
+        };
+        assert_eq!(plan(AttentionBackend::Eager).len(), 4);
+        assert_eq!(plan(AttentionBackend::MetalSdpa), vec![0..4]);
+        assert_eq!(plan(AttentionBackend::CpuFlash), vec![0..4]);
+    }
+
+    #[test]
+    fn tiled_attention_scratch_binds_far_later_than_eager() {
+        let inputs = texts(&[200_000; 16]);
+        let plan = |backend| {
+            plan_batches(
+                &inputs,
+                64,
+                DEFAULT_MAX_LENGTH,
+                QWEN3_F32_ROW,
+                ATTENTION_BYTES_BUDGET,
+                usize::MAX,
+                backend,
+            )
+        };
+        let eager = plan(AttentionBackend::Eager);
+        let tiled = plan(AttentionBackend::Tiled);
+        assert!(eager.iter().all(|range| range.len() <= 4), "{eager:?}");
+        // 256 rows of 2048 keys per tile keep scratch at 2048 x 256 x 64 B = 32 MiB per input.
+        assert!(tiled.iter().all(|range| range.len() <= 32), "{tiled:?}");
+        assert!(tiled.len() < eager.len());
+    }
+
+    #[test]
+    fn dtype_and_attention_settings_are_validated() {
+        assert_eq!(parse_dtype(None).unwrap(), None);
+        assert_eq!(parse_dtype(Some("auto")).unwrap(), None);
+        assert_eq!(parse_dtype(Some("f16")).unwrap(), Some(NativeDtype::F16));
+        assert!(parse_dtype(Some("int8")).is_err());
+    }
+
+    #[test]
+    fn default_dtype_is_f32_unless_the_device_is_metal() {
+        assert_eq!(default_dtype(&Device::Cpu), DType::F32);
+        #[cfg(target_os = "macos")]
+        if let Ok(metal) = Device::new_metal(0) {
+            assert_eq!(default_dtype(&metal), DType::F16);
+        }
     }
 }
 
