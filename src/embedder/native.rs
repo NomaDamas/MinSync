@@ -84,9 +84,6 @@ struct LoadedModel {
     backend: AttentionBackend,
     /// Deadline for one forward pass on the device the model loaded onto.
     batch_timeout: Duration,
-    /// Embedding output dimension (the model's hidden size).
-    dimension: usize,
-    device: &'static str,
 }
 
 /// A lazily loaded value that can be dropped again and reloaded on demand.
@@ -311,8 +308,6 @@ impl NativeEmbedder {
                         dtype,
                         backend: model.backend(),
                         batch_timeout,
-                        dimension: model.config().hidden_size,
-                        device: device_name(&device),
                         model: Arc::new(Mutex::new(model)),
                         gate: Arc::new(tokio::sync::Mutex::new(())),
                     })
@@ -334,7 +329,7 @@ impl NativeEmbedder {
             id: format!("native:{}", self.model_id),
             dimension: loaded.dimension,
             dtype: dtype_name(loaded.dtype),
-            device: loaded.device,
+            device: device_kind(&loaded.device),
             max_length: self.max_length,
         })
     }
@@ -702,13 +697,12 @@ fn dtype_name(dtype: DType) -> &'static str {
     }
 }
 
-fn device_name(device: &Device) -> &'static str {
-    if device.is_metal() {
-        "metal"
-    } else if device.is_cuda() {
-        "cuda"
-    } else {
-        "cpu"
+/// `cpu`, `metal` or `cuda`, from a [`device_label`] such as `metal:0`.
+fn device_kind(label: &str) -> &'static str {
+    match label.split(':').next() {
+        Some("metal") => "metal",
+        Some("cuda") => "cuda",
+        _ => "cpu",
     }
 }
 
@@ -1285,10 +1279,12 @@ mod lifecycle_tests {
         assert_eq!(dtype_name(DType::F32), "f32");
         assert_eq!(dtype_name(DType::F16), "f16");
         assert_eq!(dtype_name(DType::BF16), "bf16");
-        assert_eq!(device_name(&Device::Cpu), "cpu");
+        assert_eq!(device_kind(&device_label(&Device::Cpu)), "cpu");
+        assert_eq!(device_kind("metal:0"), "metal");
+        assert_eq!(device_kind("cuda:1"), "cuda");
         #[cfg(target_os = "macos")]
         if let Ok(metal) = Device::new_metal(0) {
-            assert_eq!(device_name(&metal), "metal");
+            assert_eq!(device_kind(&device_label(&metal)), "metal");
         }
     }
 }
