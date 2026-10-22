@@ -216,6 +216,16 @@ fn default_timeout_seconds() -> u64 {
 /// works with no API key, TEI server, or Hugging Face gate.
 pub const DEFAULT_EMBEDDER_ID: &str = "native:Qwen/Qwen3-Embedding-0.6B";
 
+/// Reserved embedder id for BM25-only workspaces: no model, no API key, no
+/// ANN index. `sync` writes chunks with a placeholder vector and queries
+/// default to `--mode bm25`; `vector` and `hybrid` queries are rejected.
+pub const NONE_EMBEDDER_ID: &str = "none";
+
+/// Width of the placeholder vector stored for each chunk when the embedder
+/// is [`NONE_EMBEDDER_ID`]. The LanceDB schema requires a vector column; a
+/// single float is the smallest valid one.
+pub const LEXICAL_ONLY_DIMENSION: usize = 1;
+
 /// Local TEI EmbeddingGemma id. `minsync init --embedder` of this value
 /// still writes the Gemma retrieval prefixes and dimension 768.
 pub const EMBEDDINGGEMMA_ID: &str = "tei:google/embeddinggemma-300m";
@@ -231,6 +241,7 @@ pub const EMBEDDINGGEMMA_PASSAGE_PREFIX: &str = "title: none | text: ";
 /// manually for those.
 pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
     match embedder_id {
+        NONE_EMBEDDER_ID => Some(LEXICAL_ONLY_DIMENSION),
         "native:Qwen/Qwen3-Embedding-0.6B" => Some(1024),
         "tei:google/embeddinggemma-300m" => Some(768),
         "openai:text-embedding-3-small" | "openai:text-embedding-ada-002" => Some(1536),
@@ -288,6 +299,12 @@ impl Default for NormalizeConfig {
 }
 
 impl Config {
+    /// True when this workspace indexes and searches with BM25 only
+    /// (`embedder.id = "none"`).
+    pub fn is_lexical_only(&self) -> bool {
+        self.embedder.id == NONE_EMBEDDER_ID
+    }
+
     pub fn default_for(source_id: &str) -> Self {
         let prefix: String = source_id.chars().take(8).collect();
 

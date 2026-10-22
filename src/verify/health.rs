@@ -16,15 +16,20 @@ pub async fn check(
     }
 
     let mut errors = Vec::new();
-    let embedder_ok = match embedder.embed_single("hello").await {
-        Ok(vector) if vector.is_empty() => {
-            errors.push("embedder returned empty embedding".to_string());
-            false
-        }
-        Ok(_) => true,
-        Err(error) => {
-            errors.push(format!("embedder check failed: {error}"));
-            false
+    // A BM25-only workspace has no model to probe.
+    let embedder_ok = if embedder.is_lexical_only() {
+        true
+    } else {
+        match embedder.embed_single("hello").await {
+            Ok(vector) if vector.is_empty() => {
+                errors.push("embedder returned empty embedding".to_string());
+                false
+            }
+            Ok(_) => true,
+            Err(error) => {
+                errors.push(format!("embedder check failed: {error}"));
+                false
+            }
         }
     };
 

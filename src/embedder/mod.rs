@@ -25,6 +25,13 @@ pub trait Embedder: Send + Sync {
         None
     }
 
+    /// True for the reserved `none` embedder of a BM25-only workspace. Sync
+    /// then stores a placeholder vector instead of calling [`Embedder::embed`],
+    /// and `check` has no model to probe.
+    fn is_lexical_only(&self) -> bool {
+        false
+    }
+
     /// True when re-running the same input on this embedder is guaranteed to
     /// produce the same output (in-process inference on a fixed device). A
     /// retry of an identical single-chunk request can then never help.
@@ -59,6 +66,31 @@ impl DeferredEmbedder {
     }
 }
 
+/// The `none` embedder: BM25-only workspaces have no model. Sync and check
+/// bypass it via [`Embedder::is_lexical_only`]; any other use (vector or
+/// hybrid queries) fails with a pointer to `--mode bm25`.
+pub struct LexicalOnlyEmbedder;
+
+#[async_trait]
+impl Embedder for LexicalOnlyEmbedder {
+    fn id(&self) -> &str {
+        crate::config::NONE_EMBEDDER_ID
+    }
+
+    fn is_lexical_only(&self) -> bool {
+        true
+    }
+
+    async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Err(MinSyncError::Embedding(
+            "this workspace has no embedder (`embedder.id = \"none\"`), so it only supports \
+             BM25 search: use `--mode bm25`, or re-run `minsync init --force --embedder <id>` \
+             to enable vector search"
+                .to_string(),
+        ))
+    }
+}
+
 #[async_trait]
 impl Embedder for DeferredEmbedder {
     fn id(&self) -> &str {
@@ -73,6 +105,10 @@ impl Embedder for DeferredEmbedder {
         self.config.embedder.id.starts_with("native:")
     }
 
+    fn is_lexical_only(&self) -> bool {
+        self.config.is_lexical_only()
+    }
+
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         create_embedder(&self.config)?.embed(texts).await
     }
@@ -84,6 +120,9 @@ impl Embedder for DeferredEmbedder {
 pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
     let settings = &config.embedder;
     let id = settings.id.as_str();
+    if config.is_lexical_only() {
+        return Ok(Box::new(LexicalOnlyEmbedder));
+    }
     let timeout = std::time::Duration::from_secs(settings.timeout_seconds);
     if id.starts_with("openai:") {
         let mut embedder = openai::OpenAiEmbedder::from_env(id, settings.batch_size)?
@@ -175,6 +214,21 @@ mod factory_tests {
 
         config.embedder.id = "native:Qwen/Qwen3-Embedding-0.6B".to_string();
         assert!(DeferredEmbedder::new(config).is_deterministic());
+    }
+
+    #[tokio::test]
+    async fn test_create_embedder_none_is_lexical_only_and_refuses_to_embed() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "none".to_string();
+
+        let embedder = create_embedder(&config).expect("none needs no model or key");
+        assert!(embedder.is_lexical_only());
+        assert!(DeferredEmbedder::new(config.clone()).is_lexical_only());
+        let message = embedder.embed_query("x").await.unwrap_err().to_string();
+        assert!(message.contains("--mode bm25"), "{message}");
+
+        config.embedder.id = "tei:foo".to_string();
+        assert!(!create_embedder(&config).unwrap().is_lexical_only());
     }
 
     #[test]

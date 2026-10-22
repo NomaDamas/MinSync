@@ -160,6 +160,7 @@ Run `minsync sync` after edits. It re-embeds only changed chunks and sweeps stal
 ## Troubleshooting
 
 - `not initialized`: run `minsync init`.
+- No model/API key available: `minsync init --embedder none` indexes and searches with BM25 only (`query` defaults to `--mode bm25`).
 - Embedding request fails: make sure the local TEI server is running for the default embedder, or export `OPENAI_API_KEY` when using an `openai:` embedder.
 - Vector dimension mismatch: set `[vectorstore.options].dimension` to the embedder dimension and run `minsync sync --full`.
 - Binary files appear empty: this is expected; MinSync only reads UTF-8 text.

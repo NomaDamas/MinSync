@@ -52,6 +52,8 @@ pub enum Commands {
     Init {
         #[arg(long)]
         force: bool,
+        /// Embedder id (`native:`, `tei:`, `openai:`), or `none` for a
+        /// BM25-only index that needs no model or API key.
         #[arg(long, default_value = crate::config::DEFAULT_EMBEDDER_ID)]
         embedder: String,
         #[arg(long, default_value = "recursive")]
@@ -91,8 +93,10 @@ pub enum Commands {
         text: String,
         #[arg(long, short, default_value = "10")]
         k: usize,
-        #[arg(long, value_enum, default_value = "vector")]
-        mode: QueryMode,
+        /// Retrieval mode. Defaults to `vector`, or to `bm25` in a workspace
+        /// initialised with `--embedder none`.
+        #[arg(long, value_enum)]
+        mode: Option<QueryMode>,
     },
     /// Show sync status
     Status,

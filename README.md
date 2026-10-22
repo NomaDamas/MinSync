@@ -53,6 +53,16 @@ cargo build --release
 
 MinSync embeds in-process with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) by default. No API key, TEI server, or Hugging Face gate is required. The first `minsync sync` downloads the model into the local cache.
 
+No model at all? Use the BM25-only mode, which needs no embedder, API key, model download or network:
+
+```bash
+minsync init --embedder none
+minsync sync                          # chunks + full-text index only; nothing is embedded
+minsync query "exact terms"           # --mode defaults to bm25 in this workspace
+```
+
+`--embedder none` stores a 1-float placeholder vector per chunk (the LanceDB schema requires the column) and never builds an ANN index. `--mode vector` and `--mode hybrid` fail with a pointer to `--mode bm25`; `minsync check` skips the embedder probe. To add vector search later, run `minsync init --force --embedder <id>` and re-sync.
+
 For OpenAI embeddings instead:
 
 ```bash

@@ -41,6 +41,16 @@ cargo build --release
 
 MinSync는 기본적으로 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)를 프로세스 안에서 embedding합니다. API key, TEI 서버, Hugging Face 게이트가 필요 없습니다. 첫 `minsync sync`에서 모델을 로컬 캐시로 받습니다.
 
+모델 없이 BM25만 쓰려면 embedder, API 키, 모델 다운로드, 네트워크가 모두 필요 없는 `none` 모드를 사용하세요.
+
+```bash
+minsync init --embedder none
+minsync sync                          # chunk와 full-text 인덱스만 생성하며 임베딩은 하지 않음
+minsync query "정확한 단어"           # 이 workspace에서는 --mode 기본값이 bm25
+```
+
+`--embedder none`은 chunk마다 1차원 placeholder 벡터를 저장하고(LanceDB 스키마에 벡터 컬럼이 필요) ANN 인덱스는 만들지 않습니다. `--mode vector`와 `--mode hybrid`는 `--mode bm25`를 안내하며 실패합니다. 나중에 벡터 검색을 추가하려면 `minsync init --force --embedder <id>` 후 다시 sync하세요.
+
 OpenAI embedding을 사용할 경우:
 
 ```bash

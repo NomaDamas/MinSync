@@ -396,6 +396,71 @@ mod tests {
         assert!(result.errors.is_empty());
     }
 
+    struct LexicalOnly;
+
+    #[async_trait::async_trait]
+    impl Embedder for LexicalOnly {
+        fn id(&self) -> &str {
+            "none"
+        }
+
+        fn is_lexical_only(&self) -> bool {
+            true
+        }
+
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("check must not probe a lexical-only embedder");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_lexical_only_skips_embedder_probe() {
+        let (dir, sync, _chunker, _embedder, store) = fixture();
+        sync.init(false, "none", "recursive")
+            .expect("init succeeds");
+
+        let result = check(&dir.path().join(".minsync"), &LexicalOnly, &store)
+            .await
+            .expect("check succeeds");
+
+        assert!(result.embedder_ok);
+        assert!(result.all_passed);
+    }
+
+    #[tokio::test]
+    async fn test_verify_lexical_only_placeholder_vectors_are_not_flagged() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "alpha beta gamma delta epsilon zeta",
+        )
+        .expect("write a");
+        std::fs::write(
+            dir.path().join("b.txt"),
+            "completely different words about oceans",
+        )
+        .expect("write b");
+        sync.init(false, "none", "recursive")
+            .expect("init succeeds");
+        sync.sync(&chunker, &LexicalOnly, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+
+        let result = verify(
+            &dir.path().join(".minsync"),
+            dir.path(),
+            &chunker,
+            &mut store,
+            false,
+            None,
+        )
+        .await
+        .expect("verify succeeds");
+
+        assert!(result.embedding_integrity.flagged_pairs.is_empty());
+        assert!(result.all_passed, "{:?}", result.basic_checks);
+    }
+
     #[tokio::test]
     async fn test_verify_clean() {
         let (dir, sync, chunker, embedder, mut store) = fixture();

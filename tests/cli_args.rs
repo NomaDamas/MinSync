@@ -23,9 +23,20 @@ fn query_accepts_all_modes() {
             .expect("query mode should parse");
 
         match cli.command {
-            Commands::Query { mode: actual, .. } => assert_eq!(actual.as_str(), expected.as_str()),
+            Commands::Query { mode: actual, .. } => {
+                assert_eq!(actual.expect("mode given").as_str(), expected.as_str())
+            }
             _ => panic!("expected query command"),
         }
+    }
+}
+
+#[test]
+fn query_mode_is_unset_unless_given() {
+    let cli = Cli::try_parse_from(["minsync", "query", "alpha"]).expect("query parses");
+    match cli.command {
+        Commands::Query { mode, .. } => assert!(mode.is_none()),
+        _ => panic!("expected query command"),
     }
 }
 

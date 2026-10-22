@@ -395,7 +395,12 @@ async fn commit(
     // Identical chunk text (same content hash) embeds once, and vectors the
     // store already holds for that hash are reused. The rest go to the
     // embedder longest first so consecutive batches pad far less.
-    if !docs_to_embed.is_empty() {
+    if context.embedder.is_lexical_only() {
+        // BM25-only workspace: the vector column is a required placeholder.
+        for doc in &mut docs_to_embed {
+            doc.embedding = vec![0.0; crate::config::LEXICAL_ONLY_DIMENSION];
+        }
+    } else if !docs_to_embed.is_empty() {
         let mut seen_hashes: HashSet<&str> = HashSet::new();
         let mut unique: Vec<usize> = Vec::new();
         for (index, doc) in docs_to_embed.iter().enumerate() {

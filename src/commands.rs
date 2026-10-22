@@ -318,7 +318,7 @@ async fn query(
     minsync_dir: &std::path::Path,
     text: &str,
     k: usize,
-    mode: QueryMode,
+    mode: Option<QueryMode>,
 ) -> Result<()> {
     require_initialized(minsync_dir)?;
     // No writer lock here: querying only reads. LanceDB gives snapshot
@@ -327,6 +327,11 @@ async fn query(
     // available while a sync holds the lock. Results may lag the in-flight
     // sync; they are always consistent.
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
+    let mode = mode.unwrap_or(if config.is_lexical_only() {
+        QueryMode::Bm25
+    } else {
+        QueryMode::Vector
+    });
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore_readonly(&config, &store_path)?;
     let results = match mode {

@@ -676,6 +676,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ann_index_skipped_when_disabled_even_above_threshold() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = LanceDbStore::open_with_indexing(
+            dir.path(),
+            4,
+            IndexingConfig {
+                index_build_threshold: 10,
+                build_ann_index: false,
+                ..IndexingConfig::default()
+            },
+        )
+        .expect("create store");
+        let docs: Vec<_> = (0..50).map(spread_doc).collect();
+        store.upsert(&docs).expect("upsert docs");
+        store.flush().expect("flush");
+        let indices = store.index_names().expect("list indices");
+        assert!(
+            !indices.iter().any(|name| name.contains("vector")),
+            "disabled ANN must not be built, got {indices:?}"
+        );
+        assert!(store.index_state().expect("state").fts_indexed);
+    }
+
+    #[test]
     fn test_no_index_built_below_threshold() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mut store = indexed_store(&dir, 1000);

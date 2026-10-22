@@ -102,6 +102,20 @@ mod tests {
         );
         assert_eq!(known_embedding_dimension("tei:BAAI/bge-m3"), Some(1024));
         assert_eq!(known_embedding_dimension("tei:custom/model"), None);
+        assert_eq!(
+            known_embedding_dimension(NONE_EMBEDDER_ID),
+            Some(LEXICAL_ONLY_DIMENSION)
+        );
+    }
+
+    #[test]
+    fn test_is_lexical_only_only_for_none_embedder() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        assert!(!config.is_lexical_only());
+        config.embedder.id = "none".to_string();
+        assert!(config.is_lexical_only());
+        config.embedder.id = "none:foo".to_string();
+        assert!(!config.is_lexical_only());
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub struct IndexingConfig {
     /// fragments. Bounds how fragmented the store can get inside one long
     /// sync (and so how slow a killed-and-restarted sync is to reopen).
     pub compact_fragment_threshold: usize,
+    /// Build and maintain the ANN index over the vector column. Off for
+    /// BM25-only stores, whose vectors are placeholders: an HNSW build over
+    /// identical zero vectors is meaningless and can fail.
+    pub build_ann_index: bool,
 }
 
 impl Default for IndexingConfig {
@@ -52,6 +56,7 @@ impl Default for IndexingConfig {
             index_build_threshold: DEFAULT_INDEX_BUILD_THRESHOLD,
             index_optimize_delta_threshold: DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD,
             compact_fragment_threshold: DEFAULT_COMPACT_FRAGMENT_THRESHOLD,
+            build_ann_index: true,
         }
     }
 }
@@ -188,6 +193,10 @@ pub(super) async fn maintain_index(table: &Table, indexing: &IndexingConfig) -> 
             .execute()
             .await
             .map_err(to_store_error)?;
+    }
+
+    if !indexing.build_ann_index {
+        return Ok(());
     }
 
     let existing = indices

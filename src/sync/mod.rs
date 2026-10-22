@@ -1070,6 +1070,67 @@ mod tests {
         assert_eq!(store.doc_count(), result.chunks_added);
     }
 
+    struct ForbiddenLexicalOnlyEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for ForbiddenLexicalOnlyEmbedder {
+        fn id(&self) -> &str {
+            "none"
+        }
+
+        fn is_lexical_only(&self) -> bool {
+            true
+        }
+
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("a lexical-only sync must never embed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_lexical_only_stores_chunks_without_embedding() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma delta").expect("write file");
+        sync.init(false, "none", "recursive")
+            .expect("init succeeds");
+
+        let result = sync
+            .sync(
+                &chunker,
+                &ForbiddenLexicalOnlyEmbedder,
+                &mut store,
+                true,
+                false,
+                false,
+            )
+            .await
+            .expect("sync succeeds without embedding");
+
+        assert!(result.chunks_added > 0);
+        assert_eq!(result.embedded_texts, 0);
+        assert_eq!(result.embedding_api_calls, 0);
+        assert_eq!(store.doc_count(), result.chunks_added);
+        let cursor = Cursor::load(&sync.minsync_dir.join("cursor.json")).expect("cursor");
+        assert_eq!(cursor.embedder_id, "none");
+        let placeholder = vec![0.0; crate::config::LEXICAL_ONLY_DIMENSION];
+        assert!(store
+            .all_embeddings()
+            .iter()
+            .all(|embedding| embedding == &placeholder));
+    }
+
+    #[tokio::test]
+    async fn test_init_none_sets_placeholder_dimension() {
+        let (_dir, sync, _chunker, _embedder, _store) = fixture();
+        let config = sync.init(false, "none", "recursive").expect("init");
+        assert_eq!(config.embedder.id, "none");
+        assert!(config.is_lexical_only());
+        assert_eq!(
+            config.vectorstore.options["dimension"].as_integer(),
+            Some(crate::config::LEXICAL_ONLY_DIMENSION as i64)
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_incremental_add() {
         let (dir, sync, chunker, embedder, mut store) = fixture();

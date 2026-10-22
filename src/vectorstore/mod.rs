@@ -130,8 +130,15 @@ fn create_vectorstore_with_mode(
     match config.vectorstore.id.as_str() {
         "lancedb" => {
             let options = Some(&config.vectorstore.options);
-            let dimension = lancedb_store::LanceDbStore::dimension_from_options(options)?;
-            let indexing = lancedb_store::IndexingConfig::from_options(options)?;
+            let mut indexing = lancedb_store::IndexingConfig::from_options(options)?;
+            let dimension = if config.is_lexical_only() {
+                // Vectors are placeholders: pin the width so a stale
+                // `dimension` option cannot reject them, and skip ANN.
+                indexing.build_ann_index = false;
+                crate::config::LEXICAL_ONLY_DIMENSION
+            } else {
+                lancedb_store::LanceDbStore::dimension_from_options(options)?
+            };
             let store = if read_only {
                 lancedb_store::LanceDbStore::open_readonly(
                     store_path,
@@ -170,6 +177,41 @@ mod factory_tests {
         config.vectorstore.options = toml::Value::Table(table);
         let store = create_vectorstore(&config, dir.path()).expect("create lancedb store");
         assert_eq!(store.doc_count(), 0);
+    }
+
+    #[test]
+    fn test_create_vectorstore_lexical_only_ignores_dimension_and_skips_ann() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "none".to_string();
+        // A stale dimension (e.g. left over from `init --force`) must not matter.
+        let mut table = toml::value::Table::new();
+        table.insert("dimension".into(), toml::Value::Integer(1024));
+        table.insert("index_build_threshold".into(), toml::Value::Integer(1));
+        config.vectorstore.options = toml::Value::Table(table);
+
+        let mut store = create_vectorstore(&config, dir.path()).expect("create store");
+        let docs: Vec<Document> = (0..4)
+            .map(|i| Document {
+                id: format!("id-{i}"),
+                embedding: vec![0.0; crate::config::LEXICAL_ONLY_DIMENSION],
+                text: format!("lexical row {i}"),
+                source_id: "s".to_string(),
+                path: format!("{i}.txt"),
+                chunk_schema_id: "recursive".to_string(),
+                chunk_type: "text".to_string(),
+                heading_path: String::new(),
+                content_hash: format!("h{i}"),
+                seen_token: "t".to_string(),
+            })
+            .collect();
+        store.upsert(&docs).expect("upsert placeholder vectors");
+        store.flush().expect("flush must not build an ANN index");
+
+        let state = store.index_state().expect("state").expect("lancedb state");
+        assert!(state.fts_indexed);
+        assert!(!state.ann_indexed);
+        assert_eq!(store.query_text("row", None, 10).expect("bm25").len(), 4);
     }
 
     #[test]
