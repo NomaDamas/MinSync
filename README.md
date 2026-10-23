@@ -82,7 +82,7 @@ minsync query "search text" --mode hybrid --k 5
 minsync watch                         # initial sync, then re-index on file changes
 minsync watch --watch-on-sync-error   # stay alive and retry after initial sync errors
 minsync status                        # sync state
-minsync check                         # health check
+minsync check                         # health check; exit 5 if the embedder fails, 4 if the vector store fails (the report is still printed)
 minsync verify --fix                  # consistency check + repair
 minsync optimize                      # compact + re-index + prune the store
 ```

@@ -63,6 +63,9 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         };
         return serve(&cli.format, &minsync_dir, options).await;
     }
+    if matches!(cli.command, Commands::Check) {
+        return check(&cli.format, &minsync_dir).await;
+    }
     run_other(cli, root, minsync_dir).await.map(|()| 0)
 }
 
@@ -78,7 +81,7 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
         Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
         Commands::Status => status(&cli.format, &minsync_dir).await,
         Commands::Optimize => optimize(&cli.format, &minsync_dir),
-        Commands::Check => check(&cli.format, &minsync_dir).await,
+        Commands::Check => unreachable!("handled by run"),
         Commands::Verify { fix, all, sample } => {
             verify(&cli.format, root, &minsync_dir, fix, all, sample).await
         }
@@ -424,7 +427,7 @@ fn optimize(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> 
     Ok(())
 }
 
-async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> {
+async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i32> {
     require_initialized(minsync_dir)?;
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
@@ -456,7 +459,23 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
-    Ok(())
+    // The report above is for a person or a host that reads it; the exit code is for the host that does not.
+    // `sync` already exits with these codes when the same stage fails, so a host maps them the same way.
+    // The reason goes to stderr as it is: `result.errors` already says which stage failed.
+    let failed = if !result.embedder_ok {
+        Some(MinSyncError::Embedding(String::new()).exit_code())
+    } else if !result.vectorstore_ok {
+        Some(MinSyncError::VectorStore(String::new()).exit_code())
+    } else {
+        None
+    };
+    if let Some(code) = failed {
+        for error in &result.errors {
+            eprintln!("Error: {error}");
+        }
+        return Ok(code);
+    }
+    Ok(0)
 }
 
 async fn verify(
