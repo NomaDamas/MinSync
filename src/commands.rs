@@ -42,6 +42,9 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         )
         .await;
     }
+    if let Commands::Stage { state_dir } = cli.command {
+        return stage(&state_dir);
+    }
     if let Commands::Serve {
         host,
         port,
@@ -77,7 +80,9 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
             chunker,
             language,
         } => init(&cli.format, root, force, &embedder, &chunker, &language),
-        Commands::Sync { .. } | Commands::Serve { .. } => unreachable!("handled by run"),
+        Commands::Sync { .. } | Commands::Serve { .. } | Commands::Stage { .. } => {
+            unreachable!("handled by run")
+        }
         Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
         Commands::Status => status(&cli.format, &minsync_dir).await,
         Commands::Optimize => optimize(&cli.format, &minsync_dir),
@@ -425,6 +430,16 @@ fn optimize(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> 
         ),
     }
     Ok(())
+}
+
+/// One materialization-stage session over stdin/stdout. Needs no initialized
+/// workspace: the stage keeps its own state under `state_dir`. Exit code: 0
+/// after `finish`, 3 when another run holds the stage lock, 1 when input ended
+/// before `finish` (the run stays resumable).
+fn stage(state_dir: &std::path::Path) -> Result<i32> {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    crate::incremental::protocol::serve(state_dir, stdin.lock(), &mut stdout)
 }
 
 async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i32> {

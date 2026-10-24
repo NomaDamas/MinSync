@@ -19,4 +19,9 @@
 //! query code or parsers.
 
 mod fsio;
+pub mod item;
 pub mod journal;
+pub mod plan;
+pub mod protocol;
+pub mod snapshot;
+pub mod stage;
