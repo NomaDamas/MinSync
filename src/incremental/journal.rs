@@ -404,10 +404,11 @@ impl Journal {
             Ok(header) => header,
             Err(error) => return Load::Invalid(format!("bad header: {error}")),
         };
-        if header.format > FORMAT_VERSION {
+        if header.format < legacy_format() || header.format > FORMAT_VERSION {
             return Load::Invalid(format!(
-                "format {} is newer than supported format {FORMAT_VERSION}",
-                header.format
+                "format {} is outside the supported range {}..={FORMAT_VERSION}",
+                header.format,
+                legacy_format()
             ));
         }
         let mut ledger = Ledger::new(header);
@@ -632,6 +633,22 @@ mod tests {
         assert!(matches!(Journal::load(&path), Load::Invalid(_)));
 
         std::fs::write(&path, r#"{"source_id":"s","sta"#).expect("write torn header");
+        assert!(matches!(Journal::load(&path), Load::Invalid(_)));
+    }
+
+    #[test]
+    fn an_unsupported_older_ledger_format_is_not_trusted() {
+        // Logs from before the field existed are format 1 (the serde
+        // default); an explicit 0 never existed and must not be trusted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = log_path(&dir);
+        let mut zero = header();
+        zero.format = 0;
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&zero).expect("header")),
+        )
+        .expect("write");
         assert!(matches!(Journal::load(&path), Load::Invalid(_)));
     }
 

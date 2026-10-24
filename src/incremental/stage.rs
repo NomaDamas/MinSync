@@ -27,7 +27,7 @@
 //! `output_missing`, `output_not_file`, `output_mismatch`, `output_conflict`,
 //! `still_present`, `preserved_item`, `source_mismatch`, `corrupt_state`.
 
-use super::fsio::sha256_file;
+use super::fsio::{open_no_follow, sha256_file, sha256_reader};
 use super::item::{validate_item_key, validate_output_path};
 use super::journal::{Journal, Ledger, Outcome, OutputRef, Record, RunHeader, JOURNAL_FILE};
 use super::plan::{completion, plan, Action, Decision, PlanInput, SourceItem};
@@ -416,7 +416,7 @@ impl StageRun {
 
     /// The output file at `path`: a regular file whose real location is
     /// inside the output root (no symlink may lead out of it).
-    fn resolve_output(&self, path: &str) -> Result<(PathBuf, std::fs::Metadata)> {
+    fn resolve_output(&self, path: &str) -> Result<PathBuf> {
         validate_output_path(path)?;
         let candidate = self.output_root.join(path);
         let metadata = match std::fs::symlink_metadata(&candidate) {
@@ -447,7 +447,7 @@ impl StageRun {
                 format!("output {path:?} resolves outside the output root"),
             ));
         }
-        Ok((candidate, metadata))
+        Ok(candidate)
     }
 
     /// Record `key` as committed for `version` once its output verifies.
@@ -473,14 +473,36 @@ impl StageRun {
                 format!("output {:?} already belongs to another item", claim.path),
             ));
         }
-        let (path, metadata) = self.resolve_output(&claim.path)?;
+        let path = self.resolve_output(&claim.path)?;
+        // One descriptor for everything below, opened without following a
+        // symlink: the size, mtime and digest recorded all describe the same
+        // bytes, and a link swapped in after the checks above is refused.
+        let mut file = open_no_follow(&path).map_err(|error| match error.raw_os_error() {
+            #[cfg(unix)]
+            Some(code) if code == libc::ELOOP => MinSyncError::stage(
+                "invalid_output_path",
+                format!("output {:?} is a symlink", claim.path),
+            ),
+            _ if error.kind() == std::io::ErrorKind::NotFound => MinSyncError::stage(
+                "output_missing",
+                format!("output {:?} does not exist", claim.path),
+            ),
+            _ => MinSyncError::Io(error),
+        })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(MinSyncError::stage(
+                "output_not_file",
+                format!("output {:?} is not a regular file", claim.path),
+            ));
+        }
         // The host renamed it into place; make sure the bytes behind that
         // name survive a power loss before anything points at them.
-        std::fs::File::open(&path)?.sync_all()?;
+        file.sync_all()?;
         let output = OutputRef {
             path: claim.path.clone(),
             size: metadata.len(),
-            digest: sha256_file(&path)?,
+            digest: sha256_reader(&mut file)?,
             mtime_ns: mtime_ns(&metadata),
         };
         if claim.size.is_some_and(|size| size != output.size) {

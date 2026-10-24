@@ -32,10 +32,33 @@ pub(crate) fn sync_dir(dir: &Path) {
     }
 }
 
+/// `sha256:<hex>` of everything `reader` yields, streamed.
+pub(crate) fn sha256_reader(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    std::io::copy(reader, &mut hasher)?;
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
 /// `sha256:<hex>` of the file's bytes, streamed.
 pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    sha256_reader(&mut std::fs::File::open(path)?)
+}
+
+/// Open `path` for reading, refusing a symlink as its last component. The
+/// refusal is part of the `open` itself (`O_NOFOLLOW`), so a link swapped in
+/// after an earlier check cannot be followed. Parent directories are still
+/// resolved normally: the output root is host-managed, not adversarial.
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
 }

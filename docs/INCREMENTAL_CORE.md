@@ -172,8 +172,13 @@ and the session continues. Codes: `invalid_request`, `invalid_item_key`,
 `commit` accepts an output only if the path is relative with plain components
 only, the file is a regular file (not a symlink) whose real location is inside
 `output_root`, no other item owns that path, and the claimed size and digest
-match. Output paths of one item should stay the same across runs; an item that
-moves to a new path leaves its old file behind.
+match. The file is opened once without following a symlink, and its size, mtime
+and digest are taken from that one descriptor. The output root is host-managed:
+MinSync guards against a buggy host (traversal, stray symlinks, collisions) but
+not against another process that rewrites directories under `output_root`
+while a run is in progress (a parent directory swapped for a symlink between
+validation and `open`/`delete`). Output paths of one item should stay the same
+across runs; an item that moves to a new path leaves its old file behind.
 
 Exit codes: `0` after `finish`, `3` when another run holds the lock (a
 `lock_failed` response first), `1` when stdin ends before `finish`. In that
