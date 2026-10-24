@@ -3,7 +3,6 @@
 //! result accounting helpers live in [`result`].
 
 mod indexer;
-mod progress;
 mod reporter;
 mod result;
 
@@ -11,12 +10,12 @@ use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
+use crate::incremental::journal::{Journal, Record, RunHeader, Status, JOURNAL_FILE};
 use crate::manifest::{FileChange, Manifest, ScanErrorKind};
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
 use indexer::{index_batch, BatchItem, BatchKind, SyncFileContext};
-use progress::{ProgressHeader, ProgressLog, PROGRESS_FILE};
 use result::{change_path, empty_sync_result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -129,7 +128,7 @@ impl MinSync {
             .join(format!(".reset-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&staging)?;
 
-        for state_file in ["cursor.json", "txn.json", progress::PROGRESS_FILE] {
+        for state_file in ["cursor.json", "txn.json", JOURNAL_FILE] {
             let path = self.minsync_dir.join(state_file);
             if path.exists() {
                 std::fs::rename(&path, staging.join(state_file))?;
@@ -265,7 +264,7 @@ impl MinSync {
         let txn_path = self.minsync_dir.join("txn.json");
         let cursor_path = self.minsync_dir.join("cursor.json");
         let manifest_path = self.minsync_dir.join("manifest.json");
-        let progress_path = self.minsync_dir.join(PROGRESS_FILE);
+        let progress_path = self.minsync_dir.join(JOURNAL_FILE);
 
         let stored_manifest = if manifest_path.exists() {
             Some(Manifest::load(&manifest_path)?)
@@ -298,7 +297,7 @@ impl MinSync {
         let full = full || initial_sync || lexical_rebuild;
 
         // Read the interrupted run's log BEFORE clearing its txn marker.
-        let resume_state = ProgressLog::load(&progress_path);
+        let resume_state = Journal::load(&progress_path).into_ledger(&progress_path);
         if txn_path.exists() {
             Transaction::remove(&txn_path)?;
         }
@@ -453,16 +452,23 @@ impl MinSync {
         // earlier run already committed must keep carrying it) and skip the
         // files it logged as done.
         let fingerprint = config_fingerprint(&config, chunker, embedder);
-        let resume = resume_state.filter(|state| {
-            state.header.source_id == config.source_id
-                && state.header.full == full
-                && state.header.manifest_hash_from == old_manifest.manifest_hash()
-                && state.header.config_fingerprint == fingerprint
-        });
-        let sync_token = match &resume {
-            Some(state) => state.header.sync_token.clone(),
-            None => uuid::Uuid::new_v4().to_string().replace('-', ""),
+        let expected = RunHeader::new(
+            VECTOR_STAGE,
+            &config.source_id,
+            full,
+            &old_manifest.manifest_hash(),
+            &fingerprint,
+        );
+        let resume = resume_state.filter(|ledger| ledger.header.resumes(&expected));
+        let header = match &resume {
+            Some(ledger) => RunHeader {
+                run_token: ledger.header.run_token.clone(),
+                created_at: ledger.header.created_at.clone(),
+                ..expected
+            },
+            None => expected,
         };
+        let sync_token = header.run_token.clone();
         Transaction::new(
             &config.source_id,
             &sync_token,
@@ -470,18 +476,7 @@ impl MinSync {
             &new_manifest.manifest_hash(),
         )
         .save(&txn_path)?;
-        let header = ProgressHeader {
-            source_id: config.source_id.clone(),
-            sync_token: sync_token.clone(),
-            full,
-            manifest_hash_from: old_manifest.manifest_hash(),
-            config_fingerprint: fingerprint,
-        };
-        let carried = resume
-            .as_ref()
-            .map(|state| state.processed.clone())
-            .unwrap_or_default();
-        let mut progress = ProgressLog::create(&progress_path, &header, &carried)?;
+        let mut journal = Journal::create(&progress_path, &header, resume.as_ref())?;
 
         let mut result = empty_sync_result(false, false);
         result.files_failed = scan_failures;
@@ -527,10 +522,10 @@ impl MinSync {
                     (path, BatchKind::Delete, None)
                 }
             };
-            if resume
-                .as_ref()
-                .is_some_and(|state| state.is_done(path, content_hash.as_deref()))
-            {
+            let status = resume.as_ref().map_or(Status::Unseen, |ledger| {
+                ledger.status(path, content_hash.as_deref())
+            });
+            if status == Status::Committed {
                 result.files_resumed += 1;
                 continue;
             }
@@ -541,9 +536,7 @@ impl MinSync {
                     // Logged by the interrupted run but changed since: its old
                     // rows carry the reused token, so the stale sweep cannot
                     // tell them from fresh ones. Clear the path first.
-                    purge_first: resume
-                        .as_ref()
-                        .is_some_and(|state| state.processed.contains_key(path)),
+                    purge_first: status == Status::Superseded,
                 },
                 content_hash,
             ));
@@ -609,19 +602,17 @@ impl MinSync {
                 }
             }
 
-            // Logged only after the store commits returned: a logged path is
-            // always safe to skip on resume. One fsync for the whole batch.
-            // Failed files stay unlogged so a resumed run retries them.
-            let failed_now: HashSet<&str> = result.files_failed[failed_before..]
-                .iter()
-                .map(|failure| failure.path.as_str())
-                .collect();
-            let logged: Vec<(String, Option<String>)> = group
-                .iter()
-                .filter(|(item, _)| !failed_now.contains(item.path.as_str()))
-                .map(|(item, hash)| (item.path.clone(), hash.clone()))
-                .collect();
-            progress.append(&logged)?;
+            // Phase two of the stage commit contract. The store commits of
+            // this batch have returned (`index_batch` above), and only now
+            // are completions made durable, so a recorded path is always safe
+            // to skip on resume. A crash right here repeats the batch, which
+            // is harmless because the commits are idempotent. One fsync for
+            // the whole batch. Failures are recorded as failures and never
+            // count as done, so a resumed run retries them.
+            journal.append(&completion_records(
+                group,
+                &result.files_failed[failed_before..],
+            ))?;
 
             processed_this_run += take;
             since_checkpoint += take;
@@ -695,7 +686,7 @@ impl MinSync {
             },
         }
         .save(&cursor_path)?;
-        ProgressLog::remove(&progress_path)?;
+        Journal::remove(&progress_path)?;
         Transaction::remove(&txn_path)?;
 
         result.elapsed_seconds = start.elapsed().as_secs_f64();
@@ -704,6 +695,40 @@ impl MinSync {
         }
         Ok(result)
     }
+}
+
+/// Stage identity in the run ledger header.
+const VECTOR_STAGE: &str = "vector";
+
+/// Completion records for one batch whose store commits have returned: a
+/// committed (or deleted) record per file that made it, and a failure record
+/// — never a completion — per file listed in `failures`.
+fn completion_records(
+    group: &[(BatchItem, Option<String>)],
+    failures: &[FileFailure],
+) -> Vec<Record> {
+    let failed: std::collections::HashMap<&str, &FileFailure> = failures
+        .iter()
+        .map(|failure| (failure.path.as_str(), failure))
+        .collect();
+    group
+        .iter()
+        .map(|(item, version)| {
+            if let Some(failure) = failed.get(item.path.as_str()) {
+                return Record::failed(
+                    &item.path,
+                    version.as_deref(),
+                    format!("{}: {}", failure.stage, failure.error),
+                );
+            }
+            match version {
+                Some(version) if item.kind == BatchKind::Index => {
+                    Record::committed(&item.path, version, None)
+                }
+                _ => Record::deleted(&item.path),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2005,6 +2030,91 @@ mod tests {
         assert_eq!(
             store.doc_count(),
             uninterrupted_doc_count(&chunker, 6).await
+        );
+    }
+
+    /// The store commit of batch 3 succeeds, then the process dies before
+    /// the journal append (the at-least-once window): the batch is redone,
+    /// and because the commit is idempotent nothing is duplicated.
+    #[tokio::test]
+    async fn test_crash_between_store_commit_and_journal_append_is_repaired_by_the_retry() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        write_numbered_files(&dir, 6);
+        init_sync(&sync);
+        set_batch_files(&sync, 2);
+        set_on_file_error(&sync, crate::config::OnFileError::Fail);
+        let mut store = SpyStore::default();
+
+        crate::incremental::journal::fail_append_after(2);
+        let error = sync
+            .sync(&chunker, &MockEmbedder, &mut store, true, false, false)
+            .await
+            .expect_err("the process dies before the third record");
+        assert!(error.to_string().contains("injected crash"), "{error}");
+
+        assert_eq!(
+            store.inner.all_paths().len(),
+            6,
+            "all three batches reached the store"
+        );
+        let progress_path = sync.minsync_dir.join(JOURNAL_FILE);
+        let ledger = match Journal::load(&progress_path) {
+            crate::incremental::journal::Load::Loaded(ledger) => ledger,
+            other => panic!("ledger must survive the crash: {other:?}"),
+        };
+        assert_eq!(
+            ledger.records().count(),
+            4,
+            "only two batches were recorded"
+        );
+        assert!(sync.minsync_dir.join("txn.json").exists());
+        assert!(!sync.minsync_dir.join("cursor.json").exists());
+
+        let (embedder, embedded) = counting_embedder();
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("retry repairs the missing record");
+
+        assert_eq!(result.files_resumed, 4);
+        assert_eq!(result.files_processed, 2, "the unrecorded batch is redone");
+        assert_eq!(embedded.load(Ordering::SeqCst), result.embedded_texts);
+        assert_eq!(
+            store.doc_count(),
+            uninterrupted_doc_count(&chunker, 6).await,
+            "an idempotent re-commit must not duplicate rows"
+        );
+        assert!(sync.minsync_dir.join("cursor.json").exists());
+        assert!(!progress_path.exists());
+    }
+
+    #[test]
+    fn test_completion_records_keep_successes_failures_and_deletions_apart() {
+        use crate::types::{FileFailure, FileStage};
+        let item = |path: &str, kind| BatchItem {
+            path: path.to_string(),
+            kind,
+            purge_first: false,
+        };
+        let group = vec![
+            (item("a.txt", BatchKind::Index), Some("h1".to_string())),
+            (item("b.txt", BatchKind::Index), Some("h2".to_string())),
+            (item("gone.txt", BatchKind::Delete), None),
+        ];
+        let failures = vec![FileFailure {
+            path: "b.txt".to_string(),
+            stage: FileStage::Embed,
+            error: "request too large".to_string(),
+        }];
+
+        assert_eq!(
+            completion_records(&group, &failures),
+            vec![
+                Record::committed("a.txt", "h1", None),
+                Record::failed("b.txt", Some("h2"), "embed: request too large"),
+                Record::deleted("gone.txt"),
+            ],
+            "a failed file is never recorded as committed"
         );
     }
 
