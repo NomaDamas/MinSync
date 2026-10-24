@@ -153,6 +153,17 @@ pub enum Commands {
         #[arg(long)]
         embedder: Option<String>,
     },
+    /// Run one materialization-stage session: JSONL requests on stdin,
+    /// responses on stdout. Tracks which source items an external host
+    /// (a parser) has already turned into output files, so a killed or
+    /// failed run resumes with only the pending items.
+    Stage {
+        /// Directory for the stage's lock, run marker, journal and snapshot.
+        /// One stage and one corpus per directory; keep it outside the
+        /// output root.
+        #[arg(long, value_name = "DIR")]
+        state_dir: std::path::PathBuf,
+    },
 }
 
 #[cfg(test)]

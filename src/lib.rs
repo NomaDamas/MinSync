@@ -6,6 +6,7 @@ pub mod embedder;
 pub mod error;
 pub(crate) mod file_size;
 pub mod id;
+pub mod incremental;
 pub mod manifest;
 pub mod normalize;
 pub mod query;

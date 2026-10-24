@@ -55,6 +55,11 @@ a general dataflow runtime.
 - Embedding-provider adapters.
 - Index or vector-store adapters that preserve MinSync's incremental contract.
 - Deterministic deletion, stale-record sweeping, recovery, and verification.
+- A small incremental core (per-item completion records, resume planning,
+  commit-then-record ordering) shared by the indexing stage and by an external
+  text-producing stage that talks to it over the `minsync stage` protocol. The
+  core records and validates; it never parses. See
+  [INCREMENTAL_CORE.md](INCREMENTAL_CORE.md).
 - Performance work directly related to text scanning, chunking, embedding, and
   index mutation.
 
@@ -71,7 +76,9 @@ a general dataflow runtime.
 - Reimplementing CocoIndex under a MinSync-specific API.
 
 Binary-document support should remain external: another tool may extract or
-render content and write UTF-8 text for MinSync to index.
+render content and write UTF-8 text for MinSync to index. The materialization
+protocol lets such a tool reuse MinSync's completion state and crash recovery;
+it does not make MinSync an extraction framework.
 
 ## Extension Boundary
 

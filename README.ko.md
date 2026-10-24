@@ -148,7 +148,7 @@ MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일
 | `manifest.json` | 마지막으로 확인한 파일 metadata와 content hash |
 | `cursor.json` | 마지막으로 완료된 processing point |
 | `txn.json` | 진행 중 transaction marker |
-| `progress.jsonl` | 중단된 sync가 이미 commit한 파일 목록(resume log) |
+| `progress.jsonl` | 중단된 sync가 이미 commit한 파일 목록(resume log), [Incremental core](docs/INCREMENTAL_CORE.md) 참고 |
 | `lock` | process lock |
 
 처음부터 다시 시작하려면 `.minsync/`를 삭제하세요.
@@ -268,6 +268,16 @@ compact_fragment_threshold = 64
 [sync]
 on_file_error = "skip"   # "fail"이면 첫 실패 파일에서 중단(기존 동작)
 ```
+
+## Materialization stage (parse 후 index)
+
+MinSync는 UTF-8 텍스트를 읽을 뿐 내용을 추출하지 않습니다. PDF, DOCX 같은 원본을 텍스트로 바꾸는 앞 단계는 `minsync stage`로 MinSync의 항목별 완료 상태와 crash 복구를 그대로 쓸 수 있습니다. parser는 host가 가지고 있고, MinSync는 어떤 원본 버전에 commit된 출력 파일이 있는지 추적하고 commit을 검증합니다.
+
+```bash
+minsync stage --state-dir ./.parse-state     # stdin으로 JSON 요청, stdout으로 JSON 응답
+```
+
+host는 출력을 최종 경로 옆에 쓴 뒤 rename하고 `commit`을 보냅니다. 검증을 통과한 commit(`output_root` 안의 일반 파일, 경로 이탈·symlink 탈출 없음, size/digest 일치, 올바른 원본 버전과 fingerprint)만 기록됩니다. host나 `minsync stage`가 강제 종료되면 journal이 남고, 다음 `open`은 `resumed: true`와 함께 남은 항목만 돌려줍니다. 실패한 항목은 이전 출력을 유지한 채 재시도되고, `unknown`으로 알린 항목(읽을 수 없는 원본)은 삭제되지 않으며, `items`에서 빠진 항목의 출력은 `delete`로 제거됩니다. `fingerprint`(parser 이름/버전, 출력 형식)를 바꾸면 이 단계만 다시 처리됩니다. 결과 색인은 `output_root`를 일반 `minsync` workspace로 지정해 별도 단계로 수행하며, 그 resume log는 독립적입니다. protocol 명세, 파일 형식, 장애 처리: [docs/INCREMENTAL_CORE.md](docs/INCREMENTAL_CORE.md).
 
 ## Embedding 안정성
 

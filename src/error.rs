@@ -49,9 +49,21 @@ pub enum MinSyncError {
 
     #[error("{0}")]
     Other(String),
+
+    /// A refusal by the incremental core or the materialization protocol,
+    /// with a stable machine-readable `code` (see `incremental::stage`).
+    #[error("{message}")]
+    Stage { code: &'static str, message: String },
 }
 
 impl MinSyncError {
+    pub fn stage(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Stage {
+            code,
+            message: message.into(),
+        }
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::LockFailed => 3,

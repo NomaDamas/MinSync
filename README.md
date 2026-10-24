@@ -161,7 +161,7 @@ State lives in `.minsync/`:
 | `manifest.json` | last known file metadata and content hashes |
 | `cursor.json` | last completed processing point |
 | `txn.json` | in-progress transaction marker |
-| `progress.jsonl` | files already committed by an interrupted sync (resume log) |
+| `progress.jsonl` | files already committed by an interrupted sync (resume log); see [Incremental core](docs/INCREMENTAL_CORE.md) |
 | `lock` | process lock |
 
 Delete `.minsync/` to start fresh.
@@ -330,6 +330,25 @@ Files larger than `[sync] max_file_bytes` (default 64 MiB) are skipped before ha
 [sync]
 on_file_error = "skip"   # "fail" aborts on the first failing file (the pre-0.5 behavior)
 ```
+
+## Materialization stage (parse, then index)
+
+MinSync reads UTF-8 text and does no extraction. When an upstream step turns PDFs, DOCX or other sources into text, that step can reuse MinSync's per-item completion state and crash recovery instead of building its own, with `minsync stage`. The host keeps its parser; MinSync tracks which source versions already have a committed output file and validates each commit.
+
+```bash
+minsync stage --state-dir ./.parse-state     # JSON requests on stdin, JSON responses on stdout
+```
+
+```text
+-> {"op":"open","stage":"parse","source_id":"corpus","fingerprint":"parser-1","output_root":"./mirror",
+    "items":[{"key":"a.pdf","version":"sha256:…"}]}
+<- {"ok":true,"op":"open","resumed":false,"counts":{…},"decisions":[{"key":"a.pdf","action":"process","version":"sha256:…"}]}
+-> {"op":"commit","key":"a.pdf","version":"sha256:…","output":{"path":"a.pdf.md"}}
+<- {"ok":true,"op":"commit","key":"a.pdf","output":{"path":"a.pdf.md","size":123,"digest":"sha256:…"}}
+-> {"op":"finish"}
+```
+
+The host writes each output beside its final path and renames it into place, then sends `commit`; only a validated commit (regular file inside `output_root`, no traversal or symlink escape, matching size/digest, right source version and fingerprint) is recorded. A killed host or a killed `minsync stage` leaves a journal: the next `open` reports `resumed: true` and returns only the pending items. A failed item keeps its previous output and is retried; an item listed in `unknown` (unreadable source) is never deleted; an item missing from `items` has its output removed through `delete`. Changing `fingerprint` (parser name/version, output format) reprocesses this stage only. Point a normal `minsync` workspace at `output_root` to index the result as a separate stage; its own resume log is independent. Protocol reference, file formats and failure semantics: [docs/INCREMENTAL_CORE.md](docs/INCREMENTAL_CORE.md).
 
 ## Embedding Reliability
 
