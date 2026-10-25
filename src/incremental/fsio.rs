@@ -62,3 +62,26 @@ pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         std::fs::File::open(path)
     }
 }
+
+/// Flush an output file's data to stable storage before a completion points
+/// at it. `file` is the read-only handle used for hashing; Windows only
+/// flushes a handle opened for writing, so there the file is reopened that
+/// way. A file that cannot be reopened for writing (read-only attribute) is
+/// left unflushed: the completion record is still verified against the
+/// file's size and digest on every later run, so the worst case is a redo.
+pub(crate) fn sync_for_commit(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = file;
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(writable) => writable.sync_all(),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        file.sync_all()
+    }
+}

@@ -27,7 +27,7 @@
 //! `output_missing`, `output_not_file`, `output_mismatch`, `output_conflict`,
 //! `still_present`, `preserved_item`, `source_mismatch`, `corrupt_state`.
 
-use super::fsio::{open_no_follow, sha256_file, sha256_reader};
+use super::fsio::{open_no_follow, sha256_file, sha256_reader, sync_for_commit};
 use super::item::{validate_item_key, validate_output_path};
 use super::journal::{Journal, Ledger, Outcome, OutputRef, Record, RunHeader, JOURNAL_FILE};
 use super::plan::{completion, plan, Action, Decision, PlanInput, SourceItem};
@@ -498,7 +498,7 @@ impl StageRun {
         }
         // The host renamed it into place; make sure the bytes behind that
         // name survive a power loss before anything points at them.
-        file.sync_all()?;
+        sync_for_commit(&file, &path)?;
         let output = OutputRef {
             path: claim.path.clone(),
             size: metadata.len(),
@@ -619,6 +619,9 @@ impl StageRun {
     /// not committed keep their previous completion and are reported as
     /// pending; they are simply retried by the next run.
     pub fn finish(mut self) -> Result<FinishReport> {
+        // Every record is already durable and held in `self.ledger`; close
+        // the journal handle so removing the file below works on Windows too.
+        drop(self.journal);
         let pending = plan(&PlanInput {
             items: &self
                 .items
@@ -1257,7 +1260,7 @@ mod tests {
         produce(&env, &mut run, "b", "v1", "beta");
         run.finish().unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         write_output(&env, "a.md", "ALPHA"); // same size, different bytes
         write_output(&env, "b.md", "beta"); // new mtime, identical bytes
 

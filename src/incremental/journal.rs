@@ -779,6 +779,7 @@ mod tests {
             .open(&path)
             .expect("open");
         raw.write_all(b"{\"item\":\"b.txt\",\"vers").expect("torn");
+        drop(raw); // Windows cannot replace a file another handle holds open
         let carried = load_ledger(&path);
 
         let mut journal = Journal::create(&path, &header(), Some(&carried)).expect("recreate");
