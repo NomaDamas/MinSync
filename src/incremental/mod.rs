@@ -14,9 +14,10 @@
 //! a crash can cause duplicate work (the commit must be idempotent) but never
 //! a missing output that is treated as done.
 //!
-//! The core owns item identity, the append-only [`journal`], and resume
-//! classification. It must not import embedders, chunkers, vector stores,
-//! query code or parsers.
+//! The core owns item identity, the append-only [`journal`], resume
+//! classification, and the read-only [`view`]s a host uses to see a stage's
+//! durable state without opening a run. It must not import embedders,
+//! chunkers, vector stores, query code or parsers.
 
 mod fsio;
 pub mod item;
@@ -25,3 +26,4 @@ pub mod plan;
 pub mod protocol;
 pub mod snapshot;
 pub mod stage;
+pub mod view;

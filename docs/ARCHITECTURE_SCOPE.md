@@ -57,9 +57,11 @@ a general dataflow runtime.
 - Deterministic deletion, stale-record sweeping, recovery, and verification.
 - A small incremental core (per-item completion records, resume planning,
   commit-then-record ordering) shared by the indexing stage and by an external
-  text-producing stage that talks to it over the `minsync stage` protocol. The
-  core records and validates; it never parses. See
-  [INCREMENTAL_CORE.md](INCREMENTAL_CORE.md).
+  text-producing stage that talks to it over the `minsync stage` protocol. It
+  owns the durable outcome of each item — committed, deliberately omitted or
+  failed, including failures the host asked not to retry — and can
+  reconstruct that state read-only for a host. The core records and validates;
+  it never parses. See [INCREMENTAL_CORE.md](INCREMENTAL_CORE.md).
 - Performance work directly related to text scanning, chunking, embedding, and
   index mutation.
 

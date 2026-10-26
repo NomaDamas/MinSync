@@ -10,18 +10,69 @@
 //! ```text
 //! -> {"op":"open","stage":"parse","source_id":"corpus","fingerprint":"parser-1",
 //!     "output_root":"/data/mirror","items":[{"key":"a.pdf","version":"sha256:.."}],
-//!     "unknown":["b.pdf"],"full":false,"verify":"fast","wait":false}
+//!     "unknown":["b.pdf"],"full":false,"verify":"fast","wait":false,
+//!     "retry_fingerprint":"retry-1","retry_failed":false}
 //! <- {"ok":true,"op":"open","run_token":"..","resumed":false,
 //!     "counts":{"process":1,"retry":0,"skip":0,"resumed":0,"delete":0,"preserve":1},
 //!     "decisions":[{"key":"a.pdf","action":"process","version":"sha256:.."}]}
 //! -> {"op":"commit","key":"a.pdf","version":"sha256:..",
 //!     "output":{"path":"a.pdf.md","size":123,"digest":"sha256:.."}}
 //! <- {"ok":true,"op":"commit","key":"a.pdf","output":{"path":"a.pdf.md","size":123,"digest":".."}}
-//! -> {"op":"fail","key":"c.pdf","version":"..","error":"parser crashed"}
+//! -> {"op":"fail","key":"c.pdf","version":"..","error":"parser crashed",
+//!     "defer":true,"discard_output":false}
+//! -> {"op":"skip","key":"d.pdf","version":"..","reason":"unsupported type"}
 //! -> {"op":"delete","key":"gone.pdf"}
 //! -> {"op":"finish"}
 //! <- {"ok":true,"op":"finish","committed":1,"deleted":0,"failed":0,"pending":0}
 //! ```
+//!
+//! `plan` and `inspect` are read-only and need no open run (they are also
+//! accepted in the middle of one). Neither takes the stage lock, creates
+//! state or writes anything.
+//!
+//! `capabilities` is the same kind of request and answers what this build
+//! supports:
+//!
+//! ```text
+//! -> {"op":"capabilities"}
+//! <- {"ok":true,"op":"capabilities","protocol":2,
+//!     "features":["retry_fingerprint","retry_failed","deferred_failure",
+//!                 "discard_output","deliberate_skip","plan","inspect"],
+//!     "journal_format":3,"snapshot_format":2}
+//! ```
+//!
+//! A host must ask for it before sending the newer fields (`retry_fingerprint`,
+//! `retry_failed`, `defer`, `discard_output`) or ops (`skip`, `plan`,
+//! `inspect`): an older binary parses the known ops with unknown fields
+//! *ignored*, so it would silently hold nothing, discard nothing and retry at
+//! the wrong time. Against an older binary this request itself is refused with
+//! `invalid_request` — that refusal is the marker.
+//!
+//! ```text
+//! -> {"op":"plan","stage":"parse","source_id":"corpus","fingerprint":"parser-1",
+//!     "output_root":"/data/mirror","items":[...],"unknown":["b.pdf"]}
+//! <- {"ok":true,"op":"plan","counts":{...},
+//!     "decisions":[{"key":"a.pdf","action":"skip","version":"sha256:.."},
+//!                  {"key":"c.pdf","action":"skip","version":"sha256:..",
+//!                   "deferred":true,"error":"parser crashed"}]}
+//! -> {"op":"inspect","stage":"parse","source_id":"corpus",
+//!     "output_root":"/data/mirror","verify":"fast"}
+//! <- {"ok":true,"op":"inspect",
+//!     "items":[{"key":"a.pdf","version":"sha256:..","fingerprint":"parser-1",
+//!               "output":{"path":"a.pdf.md","size":123,"digest":"sha256:..",
+//!                         "mtime_ns":"1761300000000000000"},
+//!               "updated_at":"2026-10-24T09:20:00+00:00"}],
+//!     "failed":[{"key":"c.pdf","version":"sha256:..","error":"parser crashed",
+//!                "deferred":true}],
+//!     "skipped":[{"key":"d.pdf","version":"sha256:..","reason":"unsupported type",
+//!                 "fingerprint":"parser-1"}]}
+//! ```
+//!
+//! `open` and `plan` return decisions for work to do (`process`, `retry`,
+//! `delete`) and, so the host can tell a held item from an up-to-date one,
+//! for skips that rest on a deferred failure. `plan` additionally returns
+//! every other item's decision, so a host can report staleness; those skips
+//! carry no `deferred`/`error`.
 //!
 //! A refused request is answered with
 //! `{"ok":false,"op":"..","error":{"code":"..","message":".."}}` and the
@@ -29,8 +80,11 @@
 //! (exit code 3), a clean `finish` exits 0, and input that ends mid-run
 //! exits 1 with the run left resumable.
 
+use super::journal::FORMAT_VERSION;
 use super::plan::SourceItem;
-use super::stage::{OutputClaim, StageRun, StageSpec, VerifyMode};
+use super::snapshot::SNAPSHOT_FORMAT;
+use super::stage::{FailOptions, OutputClaim, StageRun, StageSpec, VerifyMode};
+use super::view;
 use crate::error::{MinSyncError, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,6 +112,13 @@ struct OpenRequest {
     wait: bool,
     #[serde(default)]
     verify: VerifyMode,
+    /// The host's retry policy identity; a deferred failure is released when
+    /// it changes.
+    #[serde(default)]
+    retry_fingerprint: Option<String>,
+    /// Retry deferred failures now.
+    #[serde(default)]
+    retry_failed: bool,
 }
 
 #[derive(Deserialize)]
@@ -86,17 +147,66 @@ struct FailRequest {
     fingerprint: Option<String>,
     #[serde(default)]
     error: String,
+    /// Hold the failure instead of retrying it on the next run.
+    #[serde(default)]
+    defer: bool,
+    /// Throw the item's previous output away with the failure.
+    #[serde(default)]
+    discard_output: bool,
+}
+
+#[derive(Deserialize)]
+struct SkipRequest {
+    key: String,
+    version: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct InspectRequest {
+    stage: String,
+    source_id: String,
+    output_root: PathBuf,
+    #[serde(default)]
+    verify: VerifyMode,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
+    /// Report what this build can do, so a host never silently relies on a
+    /// field or op an older binary would ignore.
+    Capabilities,
     Open(OpenRequest),
+    Plan(OpenRequest),
+    Inspect(InspectRequest),
     Commit(CommitRequest),
     Fail(FailRequest),
-    Delete { key: String },
+    Skip(SkipRequest),
+    Delete {
+        key: String,
+    },
     Finish,
 }
+
+/// Protocol revision this build speaks. A host must ask `capabilities` (and
+/// refuse to run when it is not answered) before sending `retry_fingerprint`,
+/// `retry_failed`, `defer`, `discard_output`, `skip`, `plan` or `inspect`: an
+/// older binary parses `open` and `fail` with unknown fields *ignored*, and
+/// would silently hold nothing, discard nothing and retry at the wrong time.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Capabilities of this build, in the order they were added.
+pub const FEATURES: [&str; 7] = [
+    "retry_fingerprint",
+    "retry_failed",
+    "deferred_failure",
+    "discard_output",
+    "deliberate_skip",
+    "plan",
+    "inspect",
+];
 
 fn error_code(error: &MinSyncError) -> &'static str {
     match error {
@@ -126,40 +236,73 @@ fn decision_json(decision: &super::plan::Decision) -> Value {
     if let Some(version) = &decision.version {
         value["version"] = json!(version);
     }
+    if let Some(error) = &decision.deferred_error {
+        // The item is not work: it has a held failure and, if it ever had
+        // one, its last good output is still in place.
+        value["deferred"] = json!(true);
+        value["error"] = json!(error);
+    }
     value
 }
 
 impl Request {
     fn op(&self) -> &'static str {
         match self {
+            Request::Capabilities => "capabilities",
             Request::Open(_) => "open",
+            Request::Plan(_) => "plan",
+            Request::Inspect(_) => "inspect",
             Request::Commit(_) => "commit",
             Request::Fail(_) => "fail",
+            Request::Skip(_) => "skip",
             Request::Delete { .. } => "delete",
             Request::Finish => "finish",
         }
     }
 }
 
-fn open_run(state_dir: &Path, open: OpenRequest) -> Result<(StageRun, Value)> {
-    let spec = StageSpec {
-        stage: open.stage,
-        source_id: open.source_id,
-        fingerprint: open.fingerprint,
-        output_root: open.output_root,
-        full: open.full,
-        verify: open.verify,
-        wait: open.wait,
-    };
-    let items = open
-        .items
+/// The `capabilities` answer: what a host may rely on from this build. A host
+/// that asks and gets `invalid_request` back is talking to an older binary and
+/// must not send the newer fields or ops at all.
+fn capabilities() -> Value {
+    json!({
+        "ok": true,
+        "op": "capabilities",
+        "protocol": PROTOCOL_VERSION,
+        "features": FEATURES,
+        "journal_format": FORMAT_VERSION,
+        "snapshot_format": SNAPSHOT_FORMAT,
+    })
+}
+
+fn source_items(items: Vec<ItemRequest>) -> Vec<SourceItem> {
+    items
         .into_iter()
         .map(|item| SourceItem {
             key: item.key,
             version: item.version,
         })
-        .collect();
-    let (run, report) = StageRun::open(state_dir, spec, items, open.unknown)?;
+        .collect()
+}
+
+fn stage_spec(request: &OpenRequest) -> StageSpec {
+    StageSpec {
+        stage: request.stage.clone(),
+        source_id: request.source_id.clone(),
+        fingerprint: request.fingerprint.clone(),
+        retry_fingerprint: request.retry_fingerprint.clone(),
+        retry_failed: request.retry_failed,
+        output_root: request.output_root.clone(),
+        full: request.full,
+        verify: request.verify,
+        wait: request.wait,
+    }
+}
+
+fn open_run(state_dir: &Path, open: OpenRequest) -> Result<(StageRun, Value)> {
+    let spec = stage_spec(&open);
+    let unknown = open.unknown.clone();
+    let (run, report) = StageRun::open(state_dir, spec, source_items(open.items), unknown)?;
     let response = json!({
         "ok": true,
         "op": "open",
@@ -169,6 +312,81 @@ fn open_run(state_dir: &Path, open: OpenRequest) -> Result<(StageRun, Value)> {
         "decisions": report.decisions.iter().map(decision_json).collect::<Vec<_>>(),
     });
     Ok((run, response))
+}
+
+/// Read-only: what a run of the same request would decide.
+fn plan_run(state_dir: &Path, open: OpenRequest) -> Result<Value> {
+    let spec = stage_spec(&open);
+    let unknown = open.unknown;
+    let preview = view::preview(state_dir, &spec, &source_items(open.items), &unknown)?;
+    Ok(json!({
+        "ok": true,
+        "op": "plan",
+        "counts": preview.counts,
+        "decisions": preview.decisions.iter().map(decision_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// Read-only: what the stage durably holds.
+fn inspect_run(state_dir: &Path, request: InspectRequest) -> Result<Value> {
+    let inspection = view::inspect(
+        state_dir,
+        &request.stage,
+        &request.source_id,
+        &request.output_root,
+        request.verify,
+    )?;
+    // `mtime_ns` goes out as a decimal string: a nanosecond timestamp does
+    // not fit a JSON number without losing precision in a JavaScript host.
+    let items: Vec<Value> = inspection
+        .items
+        .iter()
+        .map(|item| {
+            json!({
+                "key": item.key,
+                "version": item.version,
+                "fingerprint": item.fingerprint,
+                "output": {
+                    "path": item.output.path,
+                    "size": item.output.size,
+                    "digest": item.output.digest,
+                    "mtime_ns": item.output.mtime_ns.to_string(),
+                },
+                "updated_at": item.updated_at,
+            })
+        })
+        .collect();
+    let failed: Vec<Value> = inspection
+        .failed
+        .iter()
+        .map(|failure| {
+            json!({
+                "key": failure.key,
+                "version": failure.version,
+                "error": failure.error,
+                "deferred": failure.deferred,
+            })
+        })
+        .collect();
+    let skipped: Vec<Value> = inspection
+        .skipped
+        .iter()
+        .map(|skipped| {
+            json!({
+                "key": skipped.key,
+                "version": skipped.version,
+                "reason": skipped.reason,
+                "fingerprint": skipped.fingerprint,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "op": "inspect",
+        "items": items,
+        "failed": failed,
+        "skipped": skipped,
+    }))
 }
 
 /// Answer a request that works on an open run and does not end it.
@@ -201,16 +419,25 @@ fn handle(run: &mut StageRun, request: Request) -> Value {
             }
         }
         Request::Fail(fail) => {
+            let options = FailOptions {
+                defer: fail.defer,
+                discard_output: fail.discard_output,
+            };
             match run.fail(
                 &fail.key,
                 &fail.version,
                 fail.fingerprint.as_deref(),
                 &fail.error,
+                options,
             ) {
                 Ok(()) => json!({"ok": true, "op": op, "key": fail.key}),
                 Err(error) => refusal(op, &error),
             }
         }
+        Request::Skip(skip) => match run.skip(&skip.key, &skip.version, &skip.reason) {
+            Ok(()) => json!({"ok": true, "op": op, "key": skip.key}),
+            Err(error) => refusal(op, &error),
+        },
         Request::Delete { key } => match run.delete(&key) {
             Ok(removed) => json!({
                 "ok": true,
@@ -220,7 +447,11 @@ fn handle(run: &mut StageRun, request: Request) -> Value {
             }),
             Err(error) => refusal(op, &error),
         },
-        Request::Open(_) | Request::Finish => refusal(
+        Request::Capabilities
+        | Request::Open(_)
+        | Request::Plan(_)
+        | Request::Inspect(_)
+        | Request::Finish => refusal(
             op,
             &MinSyncError::Other(format!("`{op}` is not handled on an open run")),
         ),
@@ -246,6 +477,12 @@ pub fn serve(state_dir: &Path, input: impl BufRead, output: &mut impl Write) -> 
             }
         };
 
+        // The read-only requests never touch the stage lock or its state, so
+        // they are answered the same way before, during and after a run.
+        if matches!(request, Request::Capabilities) {
+            respond(output, &capabilities())?;
+            continue;
+        }
         if let Request::Open(open) = request {
             if run.is_some() {
                 let error = MinSyncError::stage("already_open", "a run is already open");
@@ -264,6 +501,22 @@ pub fn serve(state_dir: &Path, input: impl BufRead, output: &mut impl Write) -> 
                     }
                 }
             }
+            continue;
+        }
+        if let Request::Plan(open) = request {
+            let response = match plan_run(state_dir, open) {
+                Ok(response) => response,
+                Err(error) => refusal("plan", &error),
+            };
+            respond(output, &response)?;
+            continue;
+        }
+        if let Request::Inspect(request) = request {
+            let response = match inspect_run(state_dir, request) {
+                Ok(response) => response,
+                Err(error) => refusal("inspect", &error),
+            };
+            respond(output, &response)?;
             continue;
         }
 
@@ -314,6 +567,7 @@ pub fn serve(state_dir: &Path, input: impl BufRead, output: &mut impl Write) -> 
 mod tests {
     use super::*;
     use crate::incremental::journal::JOURNAL_FILE;
+    use crate::incremental::snapshot::SNAPSHOT_FILE;
     use serde_json::{json, Value};
     use std::io::Cursor;
 
@@ -520,6 +774,8 @@ mod tests {
                 stage: "parse".into(),
                 source_id: "corpus".into(),
                 fingerprint: "parser-1".into(),
+                retry_fingerprint: None,
+                retry_failed: false,
                 output_root: env.out.clone(),
                 full: false,
                 verify: VerifyMode::Fast,
@@ -534,6 +790,288 @@ mod tests {
         assert_eq!(code, 3);
         assert_eq!(error_code(&responses[0]), "lock_failed");
         drop(first);
+    }
+
+    #[test]
+    fn plan_and_inspect_answer_without_opening_a_run_or_touching_state() {
+        let env = env();
+        write_output(&env, "a.md", "alpha");
+        session(
+            &env,
+            &[
+                open_request(&env, &[("a", "v1")]),
+                commit_request("a", "v1", "a.md"),
+                json!({"op": "finish"}),
+            ],
+        );
+        let snapshot = std::fs::read(env.state.join(SNAPSHOT_FILE)).expect("snapshot");
+
+        // Read-only requests need no `open`, and leave every file alone.
+        let inspect = json!({
+            "op": "inspect",
+            "stage": "parse",
+            "source_id": "corpus",
+            "output_root": env.out,
+        });
+        let plan = json!({
+            "op": "plan",
+            "stage": "parse",
+            "source_id": "corpus",
+            "fingerprint": "parser-1",
+            "output_root": env.out,
+            "items": [{"key": "a", "version": "v1"}],
+        });
+        let wrong_stage = json!({
+            "op": "inspect",
+            "stage": "chunk",
+            "source_id": "corpus",
+            "output_root": env.out,
+        });
+        let (responses, code) = session(&env, &[inspect, plan, wrong_stage]);
+        assert_eq!(code, 0, "a read-only session ends cleanly");
+
+        let inspect = &responses[0];
+        assert_eq!(inspect["ok"], true);
+        assert_eq!(inspect["op"], "inspect");
+        assert_eq!(inspect["items"][0]["key"], "a");
+        assert_eq!(inspect["items"][0]["version"], "v1");
+        assert_eq!(inspect["items"][0]["fingerprint"], "parser-1");
+        assert_eq!(inspect["items"][0]["output"]["path"], "a.md");
+        assert_eq!(inspect["items"][0]["output"]["size"], 5);
+        assert!(inspect["items"][0]["output"]["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert!(
+            inspect["items"][0]["output"]["mtime_ns"].is_string(),
+            "the mtime is a decimal string on the wire: {}",
+            inspect["items"][0]["output"]["mtime_ns"]
+        );
+        assert!(inspect["items"][0]["updated_at"].is_string());
+        assert_eq!(inspect["failed"], json!([]));
+        assert_eq!(inspect["skipped"], json!([]));
+
+        assert_eq!(responses[1]["op"], "plan");
+        assert_eq!(
+            responses[1]["decisions"],
+            json!([{"key": "a", "action": "skip", "version": "v1"}])
+        );
+        assert_eq!(responses[1]["counts"]["skip"], 1);
+        assert_eq!(
+            error_code(&responses[2]),
+            "source_mismatch",
+            "another stage's state is not ours to describe"
+        );
+
+        assert!(
+            !env.state.join("txn.json").exists(),
+            "a read-only request writes no run marker"
+        );
+        assert!(
+            !env.state.join(JOURNAL_FILE).exists(),
+            "a read-only request writes no journal"
+        );
+        assert_eq!(
+            std::fs::read(env.state.join(SNAPSHOT_FILE)).expect("snapshot"),
+            snapshot,
+            "a read-only request leaves the snapshot byte for byte"
+        );
+    }
+
+    #[test]
+    fn capabilities_identify_this_build_without_touching_state() {
+        let env = env();
+        let (responses, code) = session(&env, &[json!({"op": "capabilities"})]);
+        assert_eq!(code, 0);
+        let response = &responses[0];
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["op"], "capabilities");
+        assert_eq!(response["protocol"], 2);
+        assert_eq!(response["journal_format"], 3);
+        assert_eq!(response["snapshot_format"], 2);
+        assert_eq!(
+            response["features"],
+            json!([
+                "retry_fingerprint",
+                "retry_failed",
+                "deferred_failure",
+                "discard_output",
+                "deliberate_skip",
+                "plan",
+                "inspect",
+            ])
+        );
+        assert!(!env.state.exists(), "probing creates no state directory");
+    }
+
+    #[test]
+    fn read_only_requests_on_a_missing_stage_report_nothing_and_create_nothing() {
+        let env = env();
+        let inspect = json!({
+            "op": "inspect",
+            "stage": "parse",
+            "source_id": "corpus",
+            "output_root": env.out,
+        });
+        let plan = json!({
+            "op": "plan",
+            "stage": "parse",
+            "source_id": "corpus",
+            "fingerprint": "parser-1",
+            "output_root": env.out,
+            "items": [{"key": "a", "version": "v1"}],
+        });
+        let (responses, code) = session(&env, &[inspect, plan]);
+        assert_eq!(code, 0);
+        assert_eq!(responses[0]["items"], json!([]));
+        assert_eq!(responses[0]["failed"], json!([]));
+        assert_eq!(responses[0]["skipped"], json!([]));
+        assert_eq!(
+            responses[1]["decisions"],
+            json!([{"key": "a", "action": "process", "version": "v1"}])
+        );
+        assert!(
+            !env.state.exists(),
+            "a read-only request creates no state directory"
+        );
+    }
+
+    #[test]
+    fn a_deferred_failure_is_held_and_reported_and_a_skip_is_accepted() {
+        let env = env();
+        write_output(&env, "a.md", "alpha");
+        let hold = json!({
+            "op": "fail",
+            "key": "b",
+            "version": "v1",
+            "error": "bad xref",
+            "defer": true,
+        });
+        let (responses, code) = session(
+            &env,
+            &[
+                open_request(&env, &[("a", "v1"), ("b", "v1")]),
+                commit_request("a", "v1", "a.md"),
+                hold,
+                json!({"op": "finish"}),
+            ],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(responses[2], json!({"ok": true, "op": "fail", "key": "b"}));
+        assert_eq!(responses[3]["failed"], 1);
+        assert_eq!(responses[3]["pending"], 0, "a held failure is not work");
+
+        // The next run holds the failure, keeps the item out of the work
+        // list, and says why.
+        let (responses, _) = session(
+            &env,
+            &[
+                open_request(&env, &[("a", "v1"), ("b", "v1")]),
+                json!({"op": "finish"}),
+            ],
+        );
+        assert_eq!(responses[0]["counts"]["skip"], 2);
+        assert_eq!(
+            responses[0]["decisions"],
+            json!([{"key": "b", "action": "skip", "version": "v1",
+                    "deferred": true, "error": "bad xref"}])
+        );
+
+        // `retry_failed` releases it.
+        let mut open = open_request(&env, &[("a", "v1"), ("b", "v1")]);
+        open["retry_failed"] = json!(true);
+        let (responses, _) = session(&env, &[open, json!({"op": "finish"})]);
+        assert_eq!(
+            responses[0]["decisions"],
+            json!([{"key": "b", "action": "retry", "version": "v1"}])
+        );
+
+        // A deliberate omission is accepted and removes the old output.
+        let (responses, code) = session(
+            &env,
+            &[
+                open_request(&env, &[("a", "v2"), ("b", "v1")]),
+                json!({"op": "skip", "key": "a", "version": "v2", "reason": "unsupported type"}),
+                json!({"op": "finish"}),
+            ],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(responses[1], json!({"ok": true, "op": "skip", "key": "a"}));
+        assert!(
+            !env.out.join("a.md").exists(),
+            "an omission removes the output a completion left behind"
+        );
+
+        // inspect reports exactly what the stage now holds: no live output,
+        // the held failure, and the omission.
+        let inspect = json!({
+            "op": "inspect",
+            "stage": "parse",
+            "source_id": "corpus",
+            "output_root": env.out,
+        });
+        let (responses, _) = session(&env, &[inspect]);
+        assert_eq!(responses[0]["items"], json!([]));
+        assert_eq!(
+            responses[0]["failed"],
+            json!([{"key": "b", "version": "v1", "error": "bad xref", "deferred": true}])
+        );
+        assert_eq!(
+            responses[0]["skipped"],
+            json!([{"key": "a", "version": "v2", "reason": "unsupported type",
+                    "fingerprint": "parser-1"}])
+        );
+    }
+
+    #[test]
+    fn a_discarding_failure_removes_the_output_and_the_completion() {
+        let env = env();
+        write_output(&env, "a.md", "alpha");
+        let (_, code) = session(
+            &env,
+            &[
+                open_request(&env, &[("a", "v1")]),
+                commit_request("a", "v1", "a.md"),
+                json!({"op": "finish"}),
+            ],
+        );
+        assert_eq!(code, 0);
+        assert!(env.out.join("a.md").exists());
+
+        let discard = json!({
+            "op": "fail",
+            "key": "a",
+            "version": "v2",
+            "error": "corrupt",
+            "discard_output": true,
+        });
+        let (responses, code) = session(
+            &env,
+            &[
+                open_request(&env, &[("a", "v2")]),
+                discard,
+                json!({"op": "finish"}),
+            ],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(responses[1], json!({"ok": true, "op": "fail", "key": "a"}));
+        assert!(!env.out.join("a.md").exists(), "the output is discarded");
+
+        let inspect = json!({
+            "op": "inspect",
+            "stage": "parse",
+            "source_id": "corpus",
+            "output_root": env.out,
+        });
+        let (responses, _) = session(&env, &[inspect]);
+        assert_eq!(
+            responses[0]["items"],
+            json!([]),
+            "the completion went with the output"
+        );
+        assert_eq!(
+            responses[0]["failed"],
+            json!([{"key": "a", "version": "v2", "error": "corrupt", "deferred": false}])
+        );
     }
 
     #[test]

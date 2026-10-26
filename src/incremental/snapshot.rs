@@ -7,7 +7,7 @@
 //! resumable journal, or the new snapshot.
 
 use super::fsio::atomic_write;
-use super::journal::OutputRef;
+use super::journal::{Outcome, OutputRef, Record};
 use crate::error::{MinSyncError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const SNAPSHOT_FILE: &str = "snapshot.json";
-pub const SNAPSHOT_FORMAT: u32 = 1;
+/// Snapshot format written by this build. Format 1 stored only committed
+/// items and failures; format 2 adds deliberate omissions (`skipped`) and the
+/// deferred-failure fields. A snapshot from a newer build is refused.
+pub const SNAPSHOT_FORMAT: u32 = 2;
 
 /// A committed item: the source version and processing fingerprint it was
 /// built under, and the output that holds the result.
@@ -31,6 +34,31 @@ pub struct SnapshotItem {
 pub struct FailedItem {
     pub version: Option<String>,
     pub error: String,
+    /// The processing fingerprint the item failed under; `None` in snapshots
+    /// written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// The failure is deferred: it is not retried while the source version,
+    /// processing fingerprint and retry fingerprint stay the same.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deferred: bool,
+    /// The retry fingerprint in effect when the failure was deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_fingerprint: Option<String>,
+}
+
+/// A deliberate, successful omission: the item has no output and none is
+/// expected while its source version and processing fingerprint stay the
+/// same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedItem {
+    pub version: String,
+    pub fingerprint: String,
+    pub reason: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +68,8 @@ pub struct Snapshot {
     pub stage: String,
     pub updated_at: String,
     pub items: BTreeMap<String, SnapshotItem>,
+    #[serde(default)]
+    pub skipped: BTreeMap<String, SkippedItem>,
     pub failed: BTreeMap<String, FailedItem>,
 }
 
@@ -51,6 +81,7 @@ impl Snapshot {
             stage: stage.to_string(),
             updated_at: chrono::Utc::now().to_rfc3339(),
             items: BTreeMap::new(),
+            skipped: BTreeMap::new(),
             failed: BTreeMap::new(),
         }
     }
@@ -88,8 +119,78 @@ impl Snapshot {
         atomic_write(path, &serde_json::to_vec(self)?)
     }
 
+    /// One ledger record's effect on the durable state: the single rule the
+    /// running [`Ledger`](super::journal::Ledger) and the committed snapshot
+    /// agree on.
+    ///
+    /// * a completion replaces an omission and clears the failure;
+    /// * an omission replaces a completion and clears the failure;
+    /// * a failure is kept without erasing an earlier completion, unless it
+    ///   discarded that completion's output.
+    ///
+    /// `fingerprint` is the processing fingerprint of the run that wrote
+    /// `record`, which is what a completion or omission is reused under.
+    /// Returns the record's outcome so a caller can count what it folded.
+    pub(super) fn apply_record(&mut self, record: &Record, fingerprint: &str) -> Outcome {
+        match record.outcome {
+            Outcome::Committed => {
+                self.failed.remove(&record.item);
+                self.skipped.remove(&record.item);
+                if let (Some(version), Some(output)) = (&record.version, &record.output) {
+                    self.items.insert(
+                        record.item.clone(),
+                        SnapshotItem {
+                            version: version.clone(),
+                            fingerprint: fingerprint.to_string(),
+                            output: output.clone(),
+                        },
+                    );
+                }
+            }
+            Outcome::Deleted => {
+                self.items.remove(&record.item);
+                self.skipped.remove(&record.item);
+                self.failed.remove(&record.item);
+            }
+            Outcome::Skipped => {
+                self.failed.remove(&record.item);
+                self.items.remove(&record.item);
+                self.skipped.insert(
+                    record.item.clone(),
+                    SkippedItem {
+                        version: record.version.clone().unwrap_or_default(),
+                        fingerprint: fingerprint.to_string(),
+                        reason: record.reason.clone().unwrap_or_default(),
+                    },
+                );
+            }
+            Outcome::Failed => {
+                if record.discard_output {
+                    self.items.remove(&record.item);
+                    self.skipped.remove(&record.item);
+                }
+                self.failed.insert(
+                    record.item.clone(),
+                    FailedItem {
+                        version: record.version.clone(),
+                        error: record.error.clone().unwrap_or_default(),
+                        fingerprint: Some(fingerprint.to_string()),
+                        deferred: record.deferred,
+                        retry_fingerprint: record.retry_fingerprint.clone(),
+                    },
+                );
+            }
+        }
+        record.outcome
+    }
+
     /// Identity of the committed state, for a run header's `baseline`. It
-    /// covers what was committed and failed, not when the file was written.
+    /// covers what was committed, omitted and failed, not when the file was
+    /// written.
+    ///
+    /// A snapshot written before deliberate omissions and deferred failures
+    /// existed hashes exactly as it did then (their maps and fields are
+    /// absent), so a run interrupted by an older build still resumes.
     pub fn hash(&self) -> String {
         let mut hasher = Sha256::new();
         for (key, item) in &self.items {
@@ -108,6 +209,19 @@ impl Snapshot {
             }
             hasher.update(b"\n");
         }
+        for (key, skipped) in &self.skipped {
+            for part in [
+                "skipped",
+                key,
+                &skipped.version,
+                &skipped.fingerprint,
+                &skipped.reason,
+            ] {
+                hasher.update(part.as_bytes());
+                hasher.update([0]);
+            }
+            hasher.update(b"\n");
+        }
         for (key, failure) in &self.failed {
             let version = failure
                 .version
@@ -116,6 +230,17 @@ impl Snapshot {
             for part in ["failed", key, &version, &failure.error] {
                 hasher.update(part.as_bytes());
                 hasher.update([0]);
+            }
+            if failure.deferred || failure.retry_fingerprint.is_some() {
+                for part in [
+                    "deferred",
+                    if failure.deferred { "1" } else { "0" },
+                    failure.retry_fingerprint.as_deref().unwrap_or("-"),
+                    failure.fingerprint.as_deref().unwrap_or("-"),
+                ] {
+                    hasher.update(part.as_bytes());
+                    hasher.update([0]);
+                }
             }
             hasher.update(b"\n");
         }
@@ -156,6 +281,17 @@ mod tests {
             FailedItem {
                 version: Some("v2".into()),
                 error: "bad xref".into(),
+                fingerprint: Some("fp".into()),
+                deferred: false,
+                retry_fingerprint: None,
+            },
+        );
+        snapshot.skipped.insert(
+            "c.pdf".into(),
+            SkippedItem {
+                version: "v1".into(),
+                fingerprint: "fp".into(),
+                reason: "unsupported type".into(),
             },
         );
         snapshot.save(&path).expect("save");
@@ -221,9 +357,66 @@ mod tests {
             FailedItem {
                 version: None,
                 error: "e".into(),
+                fingerprint: None,
+                deferred: false,
+                retry_fingerprint: None,
             },
         );
         assert_ne!(a.hash(), c.hash());
         assert!(a.hash().starts_with("sha256:"));
+    }
+
+    /// A snapshot written before omissions and deferral existed hashed only
+    /// its items and plain failures; the extended hash must not move.
+    #[test]
+    fn hash_of_a_legacy_shaped_snapshot_is_unchanged() {
+        let mut snapshot = Snapshot::new("parse", "corpus");
+        snapshot.items.insert("a.pdf".into(), item("v1"));
+        snapshot.format = 1;
+        snapshot.failed.insert(
+            "b.pdf".into(),
+            FailedItem {
+                version: Some("v2".into()),
+                error: "bad xref".into(),
+                fingerprint: None,
+                deferred: false,
+                retry_fingerprint: None,
+            },
+        );
+        assert_eq!(snapshot.hash(), legacy_hash(&snapshot));
+    }
+
+    /// The pre-extension hash, kept here as the oracle for the test above.
+    fn legacy_hash(snapshot: &Snapshot) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (key, item) in &snapshot.items {
+            for part in [
+                "item",
+                key,
+                &item.version,
+                &item.fingerprint,
+                &item.output.path,
+                &item.output.size.to_string(),
+                &item.output.digest,
+                &item.output.mtime_ns.to_string(),
+            ] {
+                hasher.update(part.as_bytes());
+                hasher.update([0]);
+            }
+            hasher.update(b"\n");
+        }
+        for (key, failure) in &snapshot.failed {
+            let version = failure
+                .version
+                .as_deref()
+                .map_or_else(|| "-".to_string(), |version| format!("+{version}"));
+            for part in ["failed", key, &version, &failure.error] {
+                hasher.update(part.as_bytes());
+                hasher.update([0]);
+            }
+            hasher.update(b"\n");
+        }
+        format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 }

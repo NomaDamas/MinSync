@@ -31,7 +31,7 @@ use super::fsio::{open_no_follow, sha256_file, sha256_reader, sync_for_commit};
 use super::item::{validate_item_key, validate_output_path};
 use super::journal::{Journal, Ledger, Outcome, OutputRef, Record, RunHeader, JOURNAL_FILE};
 use super::plan::{completion, plan, Action, Decision, PlanInput, SourceItem};
-use super::snapshot::{FailedItem, Snapshot, SnapshotItem, SNAPSHOT_FILE};
+use super::snapshot::{Snapshot, SNAPSHOT_FILE};
 use crate::error::{MinSyncError, Result};
 use crate::state::{FileLock, Transaction};
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,12 @@ pub struct StageSpec {
     /// Everything that changes what the stage produces (parser name and
     /// version, normalization, output format, ...).
     pub fingerprint: String,
+    /// The host's retry policy identity. A deferred failure is held only
+    /// while this, the source version and the processing fingerprint stay
+    /// the same.
+    pub retry_fingerprint: Option<String>,
+    /// The host asked for deferred failures to be retried after all.
+    pub retry_failed: bool,
     /// Directory that holds every output. Created if missing.
     pub output_root: PathBuf,
     pub full: bool,
@@ -79,6 +85,17 @@ pub struct OutputClaim {
     pub size: Option<u64>,
     /// `sha256:<hex>`.
     pub digest: Option<String>,
+}
+
+/// What the host wants a failure to do besides recording it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailOptions {
+    /// Hold the failure: it is not retried while the source version, the
+    /// processing fingerprint and the retry fingerprint stay the same.
+    pub defer: bool,
+    /// Throw the item's previous completion and output away instead of
+    /// leaving the last good output in place.
+    pub discard_output: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -130,7 +147,7 @@ fn invalid(message: impl Into<String>) -> MinSyncError {
     MinSyncError::stage("invalid_request", message)
 }
 
-fn validate_spec(spec: &StageSpec) -> Result<()> {
+pub(super) fn validate_spec(spec: &StageSpec) -> Result<()> {
     let name_ok = !spec.stage.is_empty()
         && spec.stage.len() <= 64
         && spec
@@ -158,7 +175,7 @@ fn validate_spec(spec: &StageSpec) -> Result<()> {
     Ok(())
 }
 
-fn validate_items(
+pub(super) fn validate_items(
     items: &[SourceItem],
     unknown: Vec<String>,
 ) -> Result<(BTreeMap<String, String>, BTreeSet<String>)> {
@@ -188,7 +205,7 @@ fn validate_items(
     Ok((map, set))
 }
 
-fn mtime_ns(metadata: &std::fs::Metadata) -> u128 {
+pub(super) fn mtime_ns(metadata: &std::fs::Metadata) -> u128 {
     metadata
         .modified()
         .ok()
@@ -197,7 +214,7 @@ fn mtime_ns(metadata: &std::fs::Metadata) -> u128 {
 }
 
 /// Whether a recorded output is still on disk and unchanged.
-fn output_matches(root: &Path, output: &OutputRef, mode: VerifyMode) -> bool {
+pub(super) fn output_matches(root: &Path, output: &OutputRef, mode: VerifyMode) -> bool {
     if validate_output_path(&output.path).is_err() {
         return false;
     }
@@ -228,6 +245,42 @@ fn source_hash(items: &BTreeMap<String, String>) -> String {
 
 fn truncate_error(error: &str) -> String {
     error.chars().take(MAX_ERROR_CHARS).collect()
+}
+
+/// Tally one decision into a report's counts. A skip that rests on a
+/// deferred failure is still a skip, and is counted like any other.
+pub(super) fn tally(counts: &mut Counts, decision: &Decision) {
+    match decision.action {
+        Action::Process => counts.process += 1,
+        Action::Retry => counts.retry += 1,
+        Action::Skip => {
+            counts.skip += 1;
+            counts.resumed += usize::from(decision.resumed);
+        }
+        Action::Delete => counts.delete += 1,
+        Action::Preserve => counts.preserve += 1,
+    }
+}
+
+/// Remove one relative output file, refusing to leave the root through a
+/// symlinked parent directory. Idempotent: a missing file is not an error.
+fn unlink_output(root: &Path, path: &str) -> Result<bool> {
+    validate_output_path(path)?;
+    let target = root.join(path);
+    // A symlinked directory must not let the unlink leave the root.
+    match target.parent().unwrap_or(root).canonicalize() {
+        Ok(parent) if !parent.starts_with(root) => Err(MinSyncError::stage(
+            "invalid_output_path",
+            format!("output {path:?} resolves outside the output root"),
+        )),
+        Ok(_) => match std::fs::remove_file(&target) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl StageRun {
@@ -316,7 +369,9 @@ impl StageRun {
             items: &items,
             unknown: &unknown_set,
             fingerprint: &spec.fingerprint,
+            retry_fingerprint: spec.retry_fingerprint.as_deref(),
             full: spec.full,
+            retry_failed: spec.retry_failed,
             snapshot: &snapshot,
             ledger: &ledger,
             output_ok: &|output| output_matches(&output_root, output, verify),
@@ -328,6 +383,12 @@ impl StageRun {
                 Action::Skip => {
                     counts.skip += 1;
                     counts.resumed += usize::from(decision.resumed);
+                    // A skip that rests on a deferred failure has to be
+                    // visible to the host, which otherwise cannot tell it
+                    // from an item that is simply up to date.
+                    if decision.deferred_error.is_some() {
+                        decisions.push(decision);
+                    }
                 }
                 Action::Preserve => counts.preserve += 1,
                 Action::Process => {
@@ -545,17 +606,55 @@ impl StageRun {
         Ok(output)
     }
 
-    /// Record that processing `key` failed. Nothing is committed and the
-    /// item's previous output, if any, is left alone.
+    /// Record that processing `key` failed. Nothing is committed and, unless
+    /// `options.discard_output` says otherwise, the item's previous output is
+    /// left alone: a failure never erases a last good result by accident.
+    ///
+    /// With `options.defer` the failure is held: it is not retried while the
+    /// source version, the processing fingerprint and the run's retry
+    /// fingerprint stay the same.
     pub fn fail(
         &mut self,
         key: &str,
         version: &str,
         fingerprint: Option<&str>,
         error: &str,
+        options: FailOptions,
     ) -> Result<()> {
         self.check_item(key, version, fingerprint)?;
-        let record = Record::failed(key, Some(version), truncate_error(error));
+        if options.discard_output {
+            // Remove the output before recording anything: a crash in
+            // between leaves no record, so the item is simply redone.
+            self.discard_output(key)?;
+        }
+        let retry_fingerprint = if options.defer {
+            self.spec.retry_fingerprint.clone()
+        } else {
+            None
+        };
+        let record = Record::failed_with(
+            key,
+            Some(version),
+            truncate_error(error),
+            options.defer,
+            retry_fingerprint,
+            options.discard_output,
+        );
+        self.journal.append(std::slice::from_ref(&record))?;
+        self.ledger.apply(record);
+        Ok(())
+    }
+
+    /// Record a deliberate omission of `key`: the item is part of the
+    /// source, but it produces no output and none is expected while its
+    /// source version and this run's fingerprint stay the same.
+    ///
+    /// Any output a previous completion recorded is removed first, so an
+    /// omission never leaves an output behind that nothing points at.
+    pub fn skip(&mut self, key: &str, version: &str, reason: &str) -> Result<()> {
+        self.check_item(key, version, None)?;
+        self.discard_output(key)?;
+        let record = Record::skipped(key, version, &truncate_error(reason));
         self.journal.append(std::slice::from_ref(&record))?;
         self.ledger.apply(record);
         Ok(())
@@ -577,63 +676,53 @@ impl StageRun {
                 format!("item {key:?} is unobservable, so its output is preserved"),
             ));
         }
-        let Some(done) = completion(&self.snapshot, &self.ledger, key) else {
-            return Ok(false); // nothing committed, nothing to remove
-        };
-        let output_path = done.output.map(|output| output.path.clone());
-
-        let mut removed = false;
-        if let Some(path) = &output_path {
-            validate_output_path(path)?;
-            let target = self.output_root.join(path);
-            // A symlinked directory must not let the unlink leave the root.
-            let parent = target.parent().unwrap_or(&self.output_root);
-            match parent.canonicalize() {
-                Ok(parent) if !parent.starts_with(&self.output_root) => {
-                    return Err(MinSyncError::stage(
-                        "invalid_output_path",
-                        format!("output {path:?} resolves outside the output root"),
-                    ));
-                }
-                Ok(_) => match std::fs::remove_file(&target) {
-                    Ok(()) => removed = true,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
+        let removed = self.discard_output(key)?;
         let record = Record::deleted(key);
         self.journal.append(std::slice::from_ref(&record))?;
         self.ledger.apply(record);
-        if let Some(path) = output_path {
-            self.owners.remove(&path);
-        }
-        Ok(removed)
+        Ok(removed.is_some())
+    }
+
+    /// Remove the output `key` is currently recorded as having, if any, and
+    /// stop treating it as that file's owner. The caller appends the record
+    /// that supersedes the completion.
+    fn discard_output(&mut self, key: &str) -> Result<Option<String>> {
+        let Some(path) = completion(&self.snapshot, &self.ledger, key)
+            .and_then(|done| done.output)
+            .map(|output| output.path.clone())
+        else {
+            return Ok(None); // nothing committed, nothing to remove
+        };
+        let removed = unlink_output(&self.output_root, &path)?;
+        self.owners.remove(&path);
+        Ok(removed.then_some(path))
     }
 
     /// Compact the run into the snapshot (one atomic write), drop the
     /// journal and the run marker, and release the lock. Items that were
     /// not committed keep their previous completion and are reported as
-    /// pending; they are simply retried by the next run.
+    /// pending; they are simply retried by the next run. A deferred failure
+    /// is not pending: nothing will retry it until the host changes
+    /// something or asks for a retry.
     pub fn finish(mut self) -> Result<FinishReport> {
         // Every record is already durable and held in `self.ledger`; close
         // the journal handle so removing the file below works on Windows too.
         drop(self.journal);
+        let items: Vec<SourceItem> = self
+            .items
+            .iter()
+            .map(|(key, version)| SourceItem {
+                key: key.clone(),
+                version: version.clone(),
+            })
+            .collect();
         let pending = plan(&PlanInput {
-            items: &self
-                .items
-                .iter()
-                .map(|(key, version)| SourceItem {
-                    key: key.clone(),
-                    version: version.clone(),
-                })
-                .collect::<Vec<_>>(),
+            items: &items,
             unknown: &self.unknown,
             fingerprint: &self.spec.fingerprint,
+            retry_fingerprint: self.spec.retry_fingerprint.as_deref(),
             full: self.spec.full,
+            retry_failed: self.spec.retry_failed,
             snapshot: &self.snapshot,
             ledger: &self.ledger,
             output_ok: &|_| true,
@@ -656,40 +745,18 @@ impl StageRun {
         let fingerprint = self.ledger.header.fingerprint.clone();
         let mut next = std::mem::replace(&mut self.snapshot, Snapshot::new("", ""));
         for record in self.ledger.records() {
-            match record.outcome {
-                Outcome::Committed => {
-                    report.committed += 1;
-                    if let (Some(version), Some(output)) = (&record.version, &record.output) {
-                        next.items.insert(
-                            record.item.clone(),
-                            SnapshotItem {
-                                version: version.clone(),
-                                fingerprint: fingerprint.clone(),
-                                output: output.clone(),
-                            },
-                        );
-                    }
-                    next.failed.remove(&record.item);
-                }
-                Outcome::Deleted => {
-                    report.deleted += 1;
-                    next.items.remove(&record.item);
-                    next.failed.remove(&record.item);
-                }
-                Outcome::Failed => {
-                    report.failed += 1;
-                    next.failed.insert(
-                        record.item.clone(),
-                        FailedItem {
-                            version: record.version.clone(),
-                            error: record.error.clone().unwrap_or_default(),
-                        },
-                    );
-                }
+            match next.apply_record(record, &fingerprint) {
+                Outcome::Committed => report.committed += 1,
+                Outcome::Deleted => report.deleted += 1,
+                Outcome::Failed => report.failed += 1,
+                Outcome::Skipped => {}
             }
         }
-        // A failure only matters while its item is still in the source.
+        // A failure or an omission only matters while its item is still in
+        // the source.
         next.failed
+            .retain(|key, _| self.items.contains_key(key) || self.unknown.contains(key));
+        next.skipped
             .retain(|key, _| self.items.contains_key(key) || self.unknown.contains(key));
         next.updated_at = chrono::Utc::now().to_rfc3339();
 
@@ -734,6 +801,8 @@ mod tests {
             stage: "parse".into(),
             source_id: "corpus".into(),
             fingerprint: fingerprint.into(),
+            retry_fingerprint: None,
+            retry_failed: false,
             output_root: env.out.clone(),
             full: false,
             verify: VerifyMode::Fast,
@@ -783,6 +852,15 @@ mod tests {
             path: path.into(),
             size: None,
             digest: None,
+        }
+    }
+
+    fn output(path: &str) -> OutputRef {
+        OutputRef {
+            path: path.into(),
+            size: 1,
+            digest: "sha256:x".into(),
+            mtime_ns: 1,
         }
     }
 
@@ -993,7 +1071,10 @@ mod tests {
             "fingerprint_mismatch"
         );
         assert_eq!(
-            code(run.fail("a", "v0", None, "boom").unwrap_err()),
+            code(
+                run.fail("a", "v0", None, "boom", FailOptions::default())
+                    .unwrap_err()
+            ),
             "version_mismatch"
         );
         assert_eq!(journal_records(&env), 0);
@@ -1027,7 +1108,8 @@ mod tests {
 
         let (mut run, report) = open(&env, "fp", &[("a", "v2")]);
         assert_eq!(pending(&report), actions(&[("a", Action::Process)]));
-        run.fail("a", "v2", None, "parser crashed").unwrap();
+        run.fail("a", "v2", None, "parser crashed", FailOptions::default())
+            .unwrap();
         let finished = run.finish().unwrap();
         assert_eq!(finished.failed, 1);
         assert_eq!(finished.pending, 1);
@@ -1058,7 +1140,8 @@ mod tests {
     fn a_failure_alone_never_completes_the_item_even_after_a_crash() {
         let env = env();
         let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
-        run.fail("a", "v1", None, "boom").unwrap();
+        run.fail("a", "v1", None, "boom", FailOptions::default())
+            .unwrap();
         drop(run);
 
         let (_run, report) = open(&env, "fp", &[("a", "v1")]);
@@ -1394,7 +1477,8 @@ mod tests {
         let env = env();
         let (mut run, _) = open(&env, "fp", &[("a", "v1"), ("b", "v1"), ("c", "v1")]);
         produce(&env, &mut run, "a", "v1", "alpha");
-        run.fail("b", "v1", None, "boom").unwrap();
+        run.fail("b", "v1", None, "boom", FailOptions::default())
+            .unwrap();
         let finished = run.finish().unwrap();
         assert_eq!(finished.committed, 1);
         assert_eq!(finished.failed, 1);
@@ -1443,5 +1527,349 @@ mod tests {
         );
         run.finish().unwrap();
         assert_ne!(std::fs::read(&snapshot_path).unwrap(), snapshot_before);
+    }
+
+    fn snapshot_of(env: &Env) -> Snapshot {
+        Snapshot::load(&env.state.join(SNAPSHOT_FILE))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn skipping_an_item_removes_any_output_and_the_omission_is_reused() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+        assert!(env.out.join("a.md").exists());
+
+        // v2 is deliberately omitted: the item stays in the source, but it
+        // produces nothing, so the v1 output must not be left behind.
+        let (mut run, report) = open(&env, "fp", &[("a", "v2")]);
+        assert_eq!(pending(&report), actions(&[("a", Action::Process)]));
+        run.skip("a", "v2", "unsupported type").unwrap();
+        let finished = run.finish().unwrap();
+        assert_eq!(finished.committed, 0);
+        assert_eq!(finished.failed, 0);
+        assert_eq!(finished.pending, 0, "an omission is not work");
+        assert!(!env.out.join("a.md").exists(), "the stale output is gone");
+
+        let snapshot = snapshot_of(&env);
+        assert!(!snapshot.items.contains_key("a"));
+        assert_eq!(snapshot.skipped["a"].version, "v2");
+        assert_eq!(snapshot.skipped["a"].fingerprint, "fp");
+        assert_eq!(snapshot.skipped["a"].reason, "unsupported type");
+
+        // The same source version is reusable with no output at all.
+        let (_run, report) = open(&env, "fp", &[("a", "v2")]);
+        assert!(report.decisions.is_empty(), "{:?}", report.decisions);
+        assert_eq!(report.counts.skip, 1);
+        assert_eq!(report.counts.process, 0);
+    }
+
+    #[test]
+    fn a_changed_source_or_fingerprint_reprocesses_an_omitted_item() {
+        let env = env();
+        let all = [("a", "v1")];
+        let (mut run, _) = open(&env, "fp", &all);
+        run.skip("a", "v1", "unsupported type").unwrap();
+        run.finish().unwrap();
+
+        let (run, report) = open(&env, "fp", &[("a", "v2")]);
+        assert_eq!(pending(&report), actions(&[("a", Action::Process)]));
+        drop(run); // the state lock lives as long as the run binding
+
+        let (_run, report) = open(&env, "parser-2", &all);
+        assert_eq!(
+            pending(&report),
+            actions(&[("a", Action::Process)]),
+            "the host bakes its policy into the source version or fingerprint"
+        );
+    }
+
+    #[test]
+    fn an_omission_survives_a_crash_and_never_needs_an_output_to_verify() {
+        let env = env();
+        let all = [("a", "v1")];
+        let (mut run, _) = open(&env, "fp", &all);
+        run.skip("a", "v1", "unsupported type").unwrap();
+        drop(run); // killed before finish
+
+        let (run, report) = open(&env, "fp", &all);
+        assert!(report.resumed);
+        assert!(report.decisions.is_empty(), "{:?}", report.decisions);
+        assert_eq!(report.counts.resumed, 1);
+        run.finish().unwrap();
+        assert_eq!(snapshot_of(&env).skipped["a"].version, "v1");
+    }
+
+    #[test]
+    fn a_deferred_failure_keeps_the_last_good_output_and_holds_the_item() {
+        fn held_spec(
+            env: &Env,
+            retry_fingerprint: Option<&str>,
+            retry_failed: bool,
+            fingerprint: &str,
+        ) -> StageSpec {
+            StageSpec {
+                retry_fingerprint: retry_fingerprint.map(str::to_string),
+                retry_failed,
+                ..spec(env, fingerprint)
+            }
+        }
+
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+
+        let held = held_spec(&env, Some("retry-1"), false, "fp");
+        let (mut run, report) =
+            StageRun::open(&env.state, held, items(&[("a", "v2")]), vec![]).unwrap();
+        assert_eq!(pending(&report), actions(&[("a", Action::Process)]));
+        run.fail(
+            "a",
+            "v2",
+            None,
+            "bad xref",
+            FailOptions {
+                defer: true,
+                discard_output: false,
+            },
+        )
+        .unwrap();
+        let finished = run.finish().unwrap();
+        assert_eq!(finished.failed, 1);
+        assert_eq!(finished.pending, 0, "a held failure is not work");
+        assert!(
+            env.out.join("a.md").exists(),
+            "the last good output is preserved"
+        );
+
+        // Same source version, settings and retry policy: held, reported as
+        // a skip decision with its diagnostic, counted as a skip.
+        let (_run, report) = StageRun::open(
+            &env.state,
+            held_spec(&env, Some("retry-1"), false, "fp"),
+            items(&[("a", "v2")]),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(report.counts.skip, 1);
+        assert_eq!(report.counts.process, 0);
+        assert_eq!(report.counts.retry, 0);
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].action, Action::Skip);
+        assert_eq!(report.decisions[0].version.as_deref(), Some("v2"));
+        assert_eq!(
+            report.decisions[0].deferred_error.as_deref(),
+            Some("bad xref")
+        );
+        let snapshot = snapshot_of(&env);
+        assert!(
+            snapshot.failed["a"].deferred,
+            "the held failure is recorded"
+        );
+        assert_eq!(
+            snapshot.items["a"].version, "v1",
+            "the failure and the v1 completion coexist"
+        );
+        drop(_run); // the state lock lives as long as the run binding
+
+        // A changed retry policy, a changed fingerprint, and an explicit
+        // retry all release it.
+        for released in [
+            held_spec(&env, Some("retry-1"), true, "fp"),
+            held_spec(&env, Some("retry-2"), false, "fp"),
+            held_spec(&env, Some("retry-1"), false, "parser-2"),
+        ] {
+            let (run, report) =
+                StageRun::open(&env.state, released, items(&[("a", "v2")]), vec![]).unwrap();
+            assert!(
+                matches!(report.decisions[0].action, Action::Retry | Action::Process),
+                "{:?}",
+                report.decisions
+            );
+            drop(run);
+        }
+    }
+
+    #[test]
+    fn a_failure_that_discards_the_output_drops_the_completion_and_the_file() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+
+        let (mut run, _) = open(&env, "fp", &[("a", "v2")]);
+        run.fail(
+            "a",
+            "v2",
+            None,
+            "corrupt",
+            FailOptions {
+                defer: false,
+                discard_output: true,
+            },
+        )
+        .unwrap();
+        run.finish().unwrap();
+        assert!(
+            !env.out.join("a.md").exists(),
+            "a failure only erases the last good output when it is asked to"
+        );
+        let snapshot = snapshot_of(&env);
+        assert!(
+            !snapshot.items.contains_key("a"),
+            "no completion survives it"
+        );
+        assert_eq!(snapshot.failed["a"].error, "corrupt");
+
+        // The failure is retried, not held.
+        let (_run, report) = open(&env, "fp", &[("a", "v2")]);
+        assert_eq!(pending(&report), actions(&[("a", Action::Retry)]));
+    }
+
+    #[test]
+    fn a_confirmed_gone_item_is_deleted_whatever_state_it_held() {
+        let env = env();
+        let (mut run, _) = open(
+            &env,
+            "fp",
+            &[("kept", "v1"), ("failed", "v1"), ("skipped", "v1")],
+        );
+        produce(&env, &mut run, "kept", "v1", "alpha");
+        run.fail("failed", "v1", None, "boom", FailOptions::default())
+            .unwrap();
+        run.skip("skipped", "v1", "unsupported type").unwrap();
+        run.finish().unwrap();
+
+        let (mut run, report) = open(&env, "fp", &[("kept", "v1")]);
+        assert_eq!(
+            pending(&report),
+            actions(&[("failed", Action::Delete), ("skipped", Action::Delete)]),
+            "a held failure and an omission must be cleared when the source goes"
+        );
+        assert!(
+            !run.delete("failed").unwrap(),
+            "the failure left no output to remove"
+        );
+        assert!(
+            !run.delete("skipped").unwrap(),
+            "the omission left no output to remove"
+        );
+        run.finish().unwrap();
+
+        let snapshot = snapshot_of(&env);
+        assert!(snapshot.failed.is_empty(), "the failure is cleared");
+        assert!(snapshot.skipped.is_empty(), "the omission is cleared");
+        assert!(snapshot.items.contains_key("kept"));
+
+        // Nothing is left to delete on the next run.
+        let (_run, report) = open(&env, "fp", &[("kept", "v1")]);
+        assert!(report.decisions.is_empty(), "{:?}", report.decisions);
+    }
+
+    #[test]
+    fn deleting_an_item_whose_last_completion_was_discarded_still_clears_the_failure() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+
+        // The item changes, fails badly enough to discard its output, and
+        // then disappears from the source entirely.
+        let (mut run, _) = open(&env, "fp", &[("a", "v2")]);
+        run.fail(
+            "a",
+            "v2",
+            None,
+            "corrupt",
+            FailOptions {
+                defer: false,
+                discard_output: true,
+            },
+        )
+        .unwrap();
+        run.finish().unwrap();
+        assert!(!env.out.join("a.md").exists());
+
+        let (mut run, report) = open(&env, "fp", &[]);
+        assert_eq!(pending(&report), actions(&[("a", Action::Delete)]));
+        assert!(!run.delete("a").unwrap());
+        run.finish().unwrap();
+        let snapshot = snapshot_of(&env);
+        assert!(snapshot.failed.is_empty());
+        assert!(snapshot.items.is_empty());
+    }
+
+    #[test]
+    fn the_running_ledger_and_the_compacted_snapshot_agree_record_for_record() {
+        let committed = Record::committed("a", "v1", Some(output("a.md")));
+        let records = [
+            committed.clone(),
+            Record::skipped("b", "v1", "unsupported type"),
+            Record::failed("c", Some("v1"), "boom"),
+            Record::failed_with("d", Some("v1"), "held", true, Some("retry-1".into()), false),
+            Record::committed("e", "v1", Some(output("e.md"))),
+            Record::failed_with("e", Some("v2"), "corrupt", false, None, true),
+            Record::skipped("f", "v1", "unsupported type"),
+            Record::committed("f", "v2", Some(output("f.md"))),
+            Record::deleted("g"),
+            Record::failed_with("h", Some("v1"), "held", true, None, false),
+            Record::skipped("h", "v2", "unsupported type"),
+            Record::committed("i", "v1", Some(output("i.md"))),
+            Record::failed_with("i", Some("v2"), "later", false, None, false),
+        ];
+        let mut ledger = Ledger::new(RunHeader::new("parse", "corpus", false, "base", "fp"));
+        let mut snapshot = Snapshot::new("parse", "corpus");
+        for record in &records {
+            ledger.apply(record.clone());
+            snapshot.apply_record(record, "fp");
+        }
+
+        for key in ["a", "b", "c", "d", "e", "f", "g", "h", "i"] {
+            let done = ledger.done(key).map(|record| record.outcome);
+            assert_eq!(
+                snapshot.items.contains_key(key),
+                done == Some(Outcome::Committed),
+                "{key}: completions"
+            );
+            assert_eq!(
+                snapshot.skipped.contains_key(key),
+                ledger.skipped(key).is_some(),
+                "{key}: omissions"
+            );
+            assert_eq!(
+                snapshot.failed.contains_key(key),
+                ledger.failed(key).is_some(),
+                "{key}: failures"
+            );
+        }
+        // A completion stands alone.
+        assert!(snapshot.items.contains_key("a"));
+        assert!(!snapshot.failed.contains_key("a"));
+        // A failure keeps the last good completion of the same item...
+        assert!(snapshot.items.contains_key("i"));
+        assert!(snapshot.failed.contains_key("i"));
+        assert_eq!(snapshot.items["i"].version, "v1");
+        assert_eq!(snapshot.failed["i"].version.as_deref(), Some("v2"));
+        // ...unless the failure discarded that output.
+        assert!(!snapshot.items.contains_key("e"));
+        assert!(snapshot.failed.contains_key("e"));
+        // A completion replaces an omission; an omission clears a failure.
+        assert!(snapshot.items.contains_key("f"));
+        assert!(!snapshot.skipped.contains_key("f"));
+        assert!(snapshot.skipped.contains_key("h"));
+        assert!(!snapshot.failed.contains_key("h"));
+        // The fingerprint state travels with the record it belongs to.
+        assert_eq!(snapshot.items["a"].fingerprint, "fp");
+        assert_eq!(snapshot.skipped["b"].fingerprint, "fp");
+        assert!(snapshot.failed["d"].deferred);
+        assert_eq!(snapshot.failed["d"].fingerprint.as_deref(), Some("fp"));
+        assert_eq!(
+            snapshot.failed["d"].retry_fingerprint.as_deref(),
+            Some("retry-1")
+        );
     }
 }

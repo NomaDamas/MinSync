@@ -18,6 +18,13 @@
 //! Logs written before this module existed (`path` / `content_hash` records,
 //! `sync_token` / `manifest_hash_from` / `config_fingerprint` header) are read
 //! through serde aliases, so an upgrade resumes an interrupted run.
+//!
+//! Besides `committed`, `deleted` and `failed`, a record can say `skipped`
+//! (the host deliberately omitted the item: no output, and none is expected
+//! while its source version and the run fingerprint hold) and a failure can be
+//! `deferred` (held until the source, the settings or the retry policy
+//! change, or the host asks for a retry) or `discard_output` (it threw the
+//! item's previous completion and output away).
 
 use super::fsio::atomic_write;
 use crate::error::{MinSyncError, Result};
@@ -30,8 +37,10 @@ use std::path::Path;
 pub const JOURNAL_FILE: &str = "progress.jsonl";
 
 /// Ledger format written by this build. Logs from before the field existed
-/// are format 1; a log from a newer build is not trusted.
-pub const FORMAT_VERSION: u32 = 2;
+/// are format 1; format 2 added the stage header; format 3 added deliberate
+/// omission (`skipped`) records and the deferred/discard failure fields. A
+/// log from a newer build is not trusted.
+pub const FORMAT_VERSION: u32 = 3;
 
 fn legacy_format() -> u32 {
     1
@@ -91,11 +100,18 @@ impl RunHeader {
     /// by `current`. The token, creation time and format say *which* run
     /// wrote it, not *what* it computed, so they are not compared.
     pub fn resumes(&self, current: &RunHeader) -> bool {
-        self.source_id == current.source_id
-            && self.stage == current.stage
+        self.resumes_baseline(&current.source_id, &current.stage, &current.baseline)
             && self.full == current.full
-            && self.baseline == current.baseline
             && self.fingerprint == current.fingerprint
+    }
+
+    /// Whether a ledger belongs to the same stage and corpus and diffed
+    /// against the same committed state as `baseline`. Weaker than
+    /// [`RunHeader::resumes`]: a read-only view of a stage has no
+    /// fingerprint of its own and still wants the running run's durable
+    /// records, but never an unrelated run's.
+    pub fn resumes_baseline(&self, source_id: &str, stage: &str, baseline: &str) -> bool {
+        self.source_id == source_id && self.stage == stage && self.baseline == baseline
     }
 }
 
@@ -110,6 +126,9 @@ pub enum Outcome {
     Committed,
     /// The item's output was removed because its source is confirmed gone.
     Deleted,
+    /// The item was deliberately omitted: no output, and none is expected
+    /// while its source version and the run fingerprint stay the same.
+    Skipped,
     /// Processing failed; nothing was committed. Never counts as done.
     Failed,
 }
@@ -138,9 +157,27 @@ pub struct Record {
     pub outcome: Outcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputRef>,
-    /// Failure diagnostic.
+    /// Failure diagnostic, or the reason of a deliberate omission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Deliberate omission reason (`outcome == Skipped`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The failure is deferred: it is not retried for the same source
+    /// version, run fingerprint and retry fingerprint.
+    #[serde(skip_serializing_if = "is_false")]
+    pub deferred: bool,
+    /// The retry fingerprint in effect when the failure was deferred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_fingerprint: Option<String>,
+    /// The failure throws away the item's previous completion and output,
+    /// instead of leaving the last good output in place.
+    #[serde(skip_serializing_if = "is_false")]
+    pub discard_output: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Record {
@@ -155,6 +192,10 @@ impl Record {
             outcome: Outcome::Committed,
             output,
             error: None,
+            reason: None,
+            deferred: false,
+            retry_fingerprint: None,
+            discard_output: false,
         }
     }
 
@@ -165,6 +206,26 @@ impl Record {
             outcome: Outcome::Deleted,
             output: None,
             error: None,
+            reason: None,
+            deferred: false,
+            retry_fingerprint: None,
+            discard_output: false,
+        }
+    }
+
+    /// A deliberate, successful omission: the item has no output and none is
+    /// expected until its source version or the run fingerprint changes.
+    pub fn skipped(item: impl Into<String>, version: impl Into<String>, reason: &str) -> Self {
+        Self {
+            item: item.into(),
+            version: Some(version.into()),
+            outcome: Outcome::Skipped,
+            output: None,
+            error: None,
+            reason: Some(reason.to_string()),
+            deferred: false,
+            retry_fingerprint: None,
+            discard_output: false,
         }
     }
 
@@ -173,12 +234,28 @@ impl Record {
         version: Option<&str>,
         error: impl Into<String>,
     ) -> Self {
+        Self::failed_with(item, version, error, false, None, false)
+    }
+
+    /// A failure with the defer/discard options of the stage protocol.
+    pub fn failed_with(
+        item: impl Into<String>,
+        version: Option<&str>,
+        error: impl Into<String>,
+        deferred: bool,
+        retry_fingerprint: Option<String>,
+        discard_output: bool,
+    ) -> Self {
         Self {
             item: item.into(),
             version: version.map(str::to_string),
             outcome: Outcome::Failed,
             output: None,
             error: Some(error.into()),
+            reason: None,
+            deferred,
+            retry_fingerprint,
+            discard_output,
         }
     }
 }
@@ -197,6 +274,14 @@ struct RawRecord {
     output: Option<OutputRef>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    deferred: bool,
+    #[serde(default)]
+    retry_fingerprint: Option<String>,
+    #[serde(default)]
+    discard_output: bool,
 }
 
 impl Record {
@@ -207,11 +292,13 @@ impl Record {
         } else {
             Outcome::Deleted
         });
-        if outcome == Outcome::Committed && raw.version.is_none() {
-            return Err(format!(
-                "committed record for {:?} has no version",
-                raw.item
-            ));
+        if raw.version.is_none() && matches!(outcome, Outcome::Committed | Outcome::Skipped) {
+            let kind = if outcome == Outcome::Skipped {
+                "skipped"
+            } else {
+                "committed"
+            };
+            return Err(format!("{kind} record for {:?} has no version", raw.item));
         }
         Ok(Self {
             item: raw.item,
@@ -219,6 +306,10 @@ impl Record {
             outcome,
             output: raw.output,
             error: raw.error,
+            reason: raw.reason,
+            deferred: raw.deferred,
+            retry_fingerprint: raw.retry_fingerprint,
+            discard_output: raw.discard_output,
         })
     }
 }
@@ -234,17 +325,21 @@ pub enum Status {
     Unseen,
 }
 
-/// A parsed ledger: the latest completion and the latest failure per item.
+/// A parsed ledger: the latest completion, deliberate omission and failure
+/// per item.
 ///
-/// Completions and failures are tracked separately so a failure never erases
-/// the record of an earlier commit (that output is still there and still
-/// has to be reconciled), and a later commit clears the failure.
+/// Completions, omissions and failures are tracked separately so a failure
+/// never erases the record of an earlier commit (that output is still there
+/// and still has to be reconciled), a later commit or omission clears the
+/// failure, and a deferred failure is held without forgetting that the item
+/// has a last good output.
 #[derive(Debug, Clone)]
 pub struct Ledger {
     pub header: RunHeader,
     /// The file ended in a record that never got its newline.
     pub torn_tail: bool,
     done: BTreeMap<String, Record>,
+    skipped: BTreeMap<String, Record>,
     failed: BTreeMap<String, Record>,
 }
 
@@ -254,6 +349,7 @@ impl Ledger {
             header,
             torn_tail: false,
             done: BTreeMap::new(),
+            skipped: BTreeMap::new(),
             failed: BTreeMap::new(),
         }
     }
@@ -262,9 +358,21 @@ impl Ledger {
         match record.outcome {
             Outcome::Committed | Outcome::Deleted => {
                 self.failed.remove(&record.item);
+                self.skipped.remove(&record.item);
                 self.done.insert(record.item.clone(), record);
             }
+            Outcome::Skipped => {
+                self.failed.remove(&record.item);
+                self.done.remove(&record.item);
+                self.skipped.insert(record.item.clone(), record);
+            }
             Outcome::Failed => {
+                if record.discard_output {
+                    // The failure threw the previous completion away, so it
+                    // must not survive in the ledger either.
+                    self.done.remove(&record.item);
+                    self.skipped.remove(&record.item);
+                }
                 self.failed.insert(record.item.clone(), record);
             }
         }
@@ -273,6 +381,12 @@ impl Ledger {
     /// Latest committed/deleted record of `item`.
     pub fn done(&self, item: &str) -> Option<&Record> {
         self.done.get(item)
+    }
+
+    /// Latest deliberate omission of `item`, unless a later record replaced
+    /// or discarded it.
+    pub fn skipped(&self, item: &str) -> Option<&Record> {
+        self.skipped.get(item)
     }
 
     /// Latest failure of `item` that no later commit/delete cleared.
@@ -304,11 +418,14 @@ impl Ledger {
 
     /// Every held record, completions first, each group in item order.
     pub fn records(&self) -> impl Iterator<Item = &Record> {
-        self.done.values().chain(self.failed.values())
+        self.done
+            .values()
+            .chain(self.skipped.values())
+            .chain(self.failed.values())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.done.is_empty() && self.failed.is_empty()
+        self.done.is_empty() && self.skipped.is_empty() && self.failed.is_empty()
     }
 }
 
@@ -319,14 +436,14 @@ pub enum Load {
     /// Present but untrustworthy; the reason is for diagnostics. Callers
     /// redo the work.
     Invalid(String),
-    Loaded(Ledger),
+    Loaded(Box<Ledger>),
 }
 
 impl Load {
     /// The ledger, logging why an unusable one is being discarded.
     pub fn into_ledger(self, path: &Path) -> Option<Ledger> {
         match self {
-            Load::Loaded(ledger) => Some(ledger),
+            Load::Loaded(ledger) => Some(*ledger),
             Load::Absent => None,
             Load::Invalid(reason) => {
                 tracing::warn!(
@@ -424,7 +541,7 @@ impl Journal {
                 }
             }
         }
-        Load::Loaded(ledger)
+        Load::Loaded(Box::new(ledger))
     }
 
     pub fn remove(path: &Path) -> Result<()> {
@@ -493,7 +610,7 @@ mod tests {
 
     fn load_ledger(path: &std::path::Path) -> Ledger {
         match Journal::load(path) {
-            Load::Loaded(ledger) => ledger,
+            Load::Loaded(ledger) => *ledger,
             other => panic!("expected a loaded ledger, got {other:?}"),
         }
     }
@@ -847,5 +964,91 @@ mod tests {
         Journal::remove(&path).expect("remove");
         Journal::remove(&path).expect("remove again");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn omissions_and_deferred_failures_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = log_path(&dir);
+        let mut journal = Journal::create(&path, &header(), None).expect("create");
+        journal
+            .append(&[
+                Record::skipped("a.txt", "h1", "unsupported"),
+                Record::failed_with(
+                    "b.txt",
+                    Some("h2"),
+                    "bad xref",
+                    true,
+                    Some("retry-1".into()),
+                    false,
+                ),
+                Record::failed_with("c.txt", Some("h3"), "corrupt", false, None, true),
+                Record::committed("d.txt", "h1", Some(output("out/d.md"))),
+            ])
+            .expect("append");
+
+        let ledger = load_ledger(&path);
+        let omission = ledger.skipped("a.txt").expect("omission");
+        assert_eq!(omission.version.as_deref(), Some("h1"));
+        assert_eq!(omission.reason.as_deref(), Some("unsupported"));
+        assert_eq!(omission.outcome, Outcome::Skipped);
+        assert!(
+            ledger.done("a.txt").is_none(),
+            "an omission is not a completion"
+        );
+        assert!(ledger.failed("a.txt").is_none());
+        let deferred = ledger.failed("b.txt").expect("deferred failure");
+        assert!(deferred.deferred);
+        assert_eq!(deferred.retry_fingerprint.as_deref(), Some("retry-1"));
+        let discarding = ledger.failed("c.txt").expect("discarding failure");
+        assert!(discarding.discard_output, "the flag survives");
+        assert!(!deferred.discard_output, "not an ordinary one");
+        assert!(ledger.done("d.txt").is_some());
+        assert_eq!(ledger.records().count(), 4);
+    }
+
+    #[test]
+    fn an_omission_without_a_version_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = log_path(&dir);
+        let header_line = serde_json::to_string(&header()).expect("header");
+        std::fs::write(
+            &path,
+            format!(
+                "{header_line}\n{{\"item\":\"a.txt\",\"outcome\":\"skipped\",\"reason\":\"x\"}}\n"
+            ),
+        )
+        .expect("write");
+        assert!(matches!(Journal::load(&path), Load::Invalid(_)));
+    }
+
+    #[test]
+    fn a_commit_replaces_an_omission_and_a_discarding_failure_drops_the_completion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = log_path(&dir);
+        let mut journal = Journal::create(&path, &header(), None).expect("create");
+        journal
+            .append(&[
+                Record::skipped("a.txt", "h1", "unsupported"),
+                Record::committed("a.txt", "h1", Some(output("a.md"))),
+                Record::skipped("b.txt", "h1", "unsupported"),
+                Record::failed_with("b.txt", Some("h2"), "corrupt", false, None, true),
+                Record::skipped("c.txt", "h1", "unsupported"),
+                Record::failed("c.txt", Some("h2"), "boom"),
+            ])
+            .expect("append");
+
+        let ledger = load_ledger(&path);
+        assert!(ledger.skipped("a.txt").is_none(), "a commit wins");
+        assert_eq!(ledger.status("a.txt", Some("h1")), Status::Committed);
+        assert!(
+            ledger.skipped("b.txt").is_none(),
+            "a failure that discarded the output clears the omission too"
+        );
+        assert!(ledger.failed("b.txt").is_some());
+        assert!(
+            ledger.skipped("c.txt").is_some(),
+            "an ordinary failure leaves the omission recorded"
+        );
     }
 }
