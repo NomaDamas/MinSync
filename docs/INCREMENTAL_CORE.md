@@ -148,7 +148,10 @@ dropped at `finish` when its item is no longer in the source.
 
 Snapshot format 1 (only completions and failures) still loads. Format 2 adds
 `skipped` and the deferred-failure fields; an older MinSync refuses it with
-`corrupt_state` instead of misreading the stage's durable state.
+`corrupt_state` instead of misreading the stage's durable state. `finish`
+always saves the current format, so a legacy snapshot that picks up an omission
+or a deferred failure is upgraded rather than left under a format that claims
+it cannot hold them.
 
 ### Session protocol
 
@@ -253,9 +256,15 @@ discarded and redone.
                         "mtime_ns":"1761300000000000000"},
               "updated_at":"2026-10-24T09:20:00+00:00"}],
     "failed":[{"key":"c.pdf","version":"sha256:…","error":"parser crashed",
-               "deferred":true}],
+               "deferred":true},
+              {"key":"e.pdf","version":null,"error":"bad xref",
+               "deferred":false}],
     "skipped":[{"key":"d.pdf","version":"sha256:…","reason":"unsupported type",
-                "fingerprint":"parser-1"}]}
+                "fingerprint":"parser-1"}],
+    "known":[{"key":"a.pdf","version":"sha256:…"},
+             {"key":"c.pdf","version":"sha256:…"},
+             {"key":"d.pdf","version":"sha256:…"},
+             {"key":"e.pdf","version":null}]}
 ```
 
 - `plan` takes the `open` field set and returns the same planner's decisions
@@ -276,6 +285,14 @@ discarded and redone.
   string, because a nanosecond timestamp does not survive a JSON number in a
   JavaScript host; on disk it stays a JSON integer. `updated_at` is a stable,
   per-output RFC 3339 timestamp derived from that recorded mtime.
+- `inspect` also returns `known`, always present: the roster of every key the
+  durable snapshot and journal hold — every completion, omission and failure —
+  whether or not its output still verifies and whether or not its failure is
+  deferred. A host uses it to preserve the state of roots it cannot currently
+  read, never as a substitute for a verified output; the `items`, `failed` and
+  `skipped` lists keep their own semantics. A key's `version` comes from its
+  failure if it has one, else its omission, else its completion; `null` marks a
+  failure recorded before versions were kept.
 
 A refused request is answered `{"ok":false,"op":"…","error":{"code":"…","message":"…"}}`
 and the session continues. Codes: `invalid_request`, `invalid_item_key`,

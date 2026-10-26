@@ -63,10 +63,25 @@
 //!                         "mtime_ns":"1761300000000000000"},
 //!               "updated_at":"2026-10-24T09:20:00+00:00"}],
 //!     "failed":[{"key":"c.pdf","version":"sha256:..","error":"parser crashed",
-//!                "deferred":true}],
+//!                "deferred":true},
+//!               {"key":"e.pdf","version":null,"error":"bad xref",
+//!                "deferred":false}],
 //!     "skipped":[{"key":"d.pdf","version":"sha256:..","reason":"unsupported type",
-//!                 "fingerprint":"parser-1"}]}
+//!                 "fingerprint":"parser-1"}],
+//!     "known":[{"key":"a.pdf","version":"sha256:.."},
+//!              {"key":"c.pdf","version":"sha256:.."},
+//!              {"key":"d.pdf","version":"sha256:.."},
+//!              {"key":"e.pdf","version":null}]}
 //! ```
+//!
+//! `known` is the roster of every key the durable snapshot and journal hold —
+//! completions, omissions and failures — whether or not its output still
+//! verifies and whether or not its failure is deferred. A host uses it to
+//! keep the state of roots it cannot currently read, never as a substitute
+//! for a verified output. A `version` of `null` marks a failure recorded
+//! before versions were kept; every other entry carries the source version
+//! the state is at, taken from the failure, then the omission, then the
+//! completion.
 //!
 //! `open` and `plan` return decisions for work to do (`process`, `retry`,
 //! `delete`) and, so the host can tell a held item from an up-to-date one,
@@ -380,12 +395,21 @@ fn inspect_run(state_dir: &Path, request: InspectRequest) -> Result<Value> {
             })
         })
         .collect();
+    // The roster of every key the stage holds, independent of whether its
+    // output verified or its failure is held: a host uses it to keep state it
+    // cannot currently observe, never as a substitute for a verified output.
+    let known: Vec<Value> = inspection
+        .known
+        .iter()
+        .map(|known| json!({"key": known.key, "version": known.version}))
+        .collect();
     Ok(json!({
         "ok": true,
         "op": "inspect",
         "items": items,
         "failed": failed,
         "skipped": skipped,
+        "known": known,
     }))
 }
 
@@ -849,6 +873,11 @@ mod tests {
         assert!(inspect["items"][0]["updated_at"].is_string());
         assert_eq!(inspect["failed"], json!([]));
         assert_eq!(inspect["skipped"], json!([]));
+        assert_eq!(
+            inspect["known"],
+            json!([{"key": "a", "version": "v1"}]),
+            "the roster is always present"
+        );
 
         assert_eq!(responses[1]["op"], "plan");
         assert_eq!(
@@ -926,12 +955,70 @@ mod tests {
         assert_eq!(responses[0]["failed"], json!([]));
         assert_eq!(responses[0]["skipped"], json!([]));
         assert_eq!(
+            responses[0]["known"],
+            json!([]),
+            "the roster is present even when nothing is held"
+        );
+        assert_eq!(
             responses[1]["decisions"],
             json!([{"key": "a", "action": "process", "version": "v1"}])
         );
         assert!(
             !env.state.exists(),
             "a read-only request creates no state directory"
+        );
+    }
+
+    /// `known` is the raw roster of the durable state: a completion whose
+    /// output no longer verifies and a failure recorded before versions were
+    /// kept are both listed, the latter with `null`.
+    #[test]
+    fn inspect_reports_the_known_roster_including_unverified_and_legacy_failures() {
+        let env = env();
+        std::fs::create_dir_all(&env.state).expect("state dir");
+        // A format-1 snapshot, as an older build wrote it: no omissions, a
+        // failure without a version, and a completion whose output is gone.
+        let legacy = json!({
+            "format": 1,
+            "source_id": "corpus",
+            "stage": "parse",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "items": {"a": {
+                "version": "a1",
+                "fingerprint": "parser-1",
+                "output": {"path": "a.md", "size": 5, "digest": "sha256:missing", "mtime_ns": 0},
+            }},
+            "failed": {
+                "c": {"version": "c1", "error": "corrupt"},
+                "e": {"error": "legacy"},
+            },
+        });
+        std::fs::write(env.state.join(SNAPSHOT_FILE), legacy.to_string()).expect("write snapshot");
+
+        let inspect = json!({
+            "op": "inspect",
+            "stage": "parse",
+            "source_id": "corpus",
+            "output_root": env.out,
+        });
+        let (responses, code) = session(&env, &[inspect]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            responses[0]["items"],
+            json!([]),
+            "a.md does not exist, so the completion is not live"
+        );
+        assert_eq!(
+            responses[0]["known"],
+            json!([
+                {"key": "a", "version": "a1"},
+                {"key": "c", "version": "c1"},
+                {"key": "e", "version": null},
+            ])
+        );
+        assert!(
+            !env.state.join("lock").exists(),
+            "listing the roster takes no lock"
         );
     }
 
@@ -1019,6 +1106,14 @@ mod tests {
             responses[0]["skipped"],
             json!([{"key": "a", "version": "v2", "reason": "unsupported type",
                     "fingerprint": "parser-1"}])
+        );
+        assert_eq!(
+            responses[0]["known"],
+            json!([
+                {"key": "a", "version": "v2"},
+                {"key": "b", "version": "v1"},
+            ]),
+            "a held failure and an omission are both identities"
         );
     }
 

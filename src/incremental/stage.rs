@@ -31,7 +31,7 @@ use super::fsio::{open_no_follow, sha256_file, sha256_reader, sync_for_commit};
 use super::item::{validate_item_key, validate_output_path};
 use super::journal::{Journal, Ledger, Outcome, OutputRef, Record, RunHeader, JOURNAL_FILE};
 use super::plan::{completion, plan, Action, Decision, PlanInput, SourceItem};
-use super::snapshot::{Snapshot, SNAPSHOT_FILE};
+use super::snapshot::{Snapshot, SNAPSHOT_FILE, SNAPSHOT_FORMAT};
 use crate::error::{MinSyncError, Result};
 use crate::state::{FileLock, Transaction};
 use serde::{Deserialize, Serialize};
@@ -759,6 +759,11 @@ impl StageRun {
         next.skipped
             .retain(|key, _| self.items.contains_key(key) || self.unknown.contains(key));
         next.updated_at = chrono::Utc::now().to_rfc3339();
+        // A snapshot loaded from an older build keeps its own format, but
+        // this build writes omissions and the deferred-failure fields; the
+        // saved file must be the format that describes them, or the next
+        // reader would trust a format-1 file to have neither.
+        next.format = SNAPSHOT_FORMAT;
 
         next.save(&self.dir.join(SNAPSHOT_FILE))?;
         Journal::remove(&self.dir.join(JOURNAL_FILE))?;
@@ -1565,6 +1570,38 @@ mod tests {
         assert!(report.decisions.is_empty(), "{:?}", report.decisions);
         assert_eq!(report.counts.skip, 1);
         assert_eq!(report.counts.process, 0);
+    }
+
+    /// A snapshot an older build wrote loads at format 1 and stays that way
+    /// while it is merely read, but a `finish` that folds an omission into it
+    /// must save the format that describes the omission. Recording it under a
+    /// format that claims omissions cannot exist would hand the next reader a
+    /// lie about the state it just read.
+    #[test]
+    fn finishing_a_legacy_snapshot_writes_the_current_format() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+
+        // Stand in for what an older build left behind: the same content,
+        // format 1, as if written before omissions existed.
+        let mut legacy = snapshot_of(&env);
+        legacy.format = 1;
+        legacy.save(&env.state.join(SNAPSHOT_FILE)).unwrap();
+
+        let (mut run, report) = open(&env, "fp", &[("a", "v1"), ("b", "v1")]);
+        assert_eq!(pending(&report), actions(&[("b", Action::Process)]));
+        run.skip("a", "v1", "unsupported type").unwrap();
+        run.finish().unwrap();
+
+        let saved = snapshot_of(&env);
+        assert_eq!(
+            saved.format, SNAPSHOT_FORMAT,
+            "the finish records the format its omission needs"
+        );
+        assert!(saved.items.is_empty());
+        assert_eq!(saved.skipped["a"].version, "v1");
     }
 
     #[test]

@@ -24,6 +24,7 @@ use super::stage::{
     mtime_ns, output_matches, tally, validate_items, validate_spec, Counts, StageSpec, VerifyMode,
 };
 use crate::error::{MinSyncError, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// What a run would do, decided but not performed.
@@ -38,6 +39,8 @@ pub struct Inspection {
     pub items: Vec<InspectedItem>,
     pub failed: Vec<InspectedFailure>,
     pub skipped: Vec<InspectedSkip>,
+    /// Every key the durable state holds, whatever happened to its output.
+    pub known: Vec<InspectedKnown>,
 }
 
 /// A committed item whose output is still intact.
@@ -71,6 +74,20 @@ pub struct InspectedSkip {
     pub version: String,
     pub fingerprint: String,
     pub reason: String,
+}
+
+/// A key the durable state holds, and the source version it holds it under.
+///
+/// This is the roster a host needs to tell an item it already knows about
+/// from an item it has never seen, so an unavailable root's state is
+/// preserved rather than rebuilt from an empty baseline. It is the union of
+/// every completion, omission and failure, including a completion whose
+/// output no longer verifies and a failure that is deferred. `version` is
+/// `None` only for a failure recorded before versions were kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedKnown {
+    pub key: String,
+    pub version: Option<String>,
 }
 
 /// Decide what a run of `spec` would do without opening one.
@@ -113,7 +130,9 @@ pub fn preview(
     Ok(Preview { counts, decisions })
 }
 
-/// Reconstruct what the stage durably holds, verifying every output.
+/// Reconstruct what the stage durably holds, verifying every output: the
+/// items whose output still verifies, every failure, every omission, and the
+/// roster of every key the state holds at all (see [`InspectedKnown`]).
 pub fn inspect(
     state_dir: &Path,
     stage: &str,
@@ -163,10 +182,39 @@ pub fn inspect(
             reason: skipped.reason.clone(),
         })
         .collect();
+    // Every key the state holds, whatever happened to its output, so a host
+    // can preserve what it cannot currently observe. A key can be both
+    // completed and failed; the version is the most recent claim about it:
+    // the failure, then the omission, then the completion.
+    let version_of = |key: &String| {
+        durable
+            .failed
+            .get(key)
+            .and_then(|failure| failure.version.clone())
+            .or_else(|| {
+                durable
+                    .skipped
+                    .get(key)
+                    .map(|skipped| skipped.version.clone())
+            })
+            .or_else(|| durable.items.get(key).map(|item| item.version.clone()))
+    };
+    let mut durable_keys: BTreeSet<&String> = BTreeSet::new();
+    durable_keys.extend(durable.items.keys());
+    durable_keys.extend(durable.skipped.keys());
+    durable_keys.extend(durable.failed.keys());
+    let known = durable_keys
+        .into_iter()
+        .map(|key| InspectedKnown {
+            key: key.clone(),
+            version: version_of(key),
+        })
+        .collect();
     Ok(Inspection {
         items,
         failed,
         skipped,
+        known,
     })
 }
 
@@ -448,5 +496,145 @@ mod tests {
         );
         assert_eq!(planned.counts.skip, 2);
         assert_eq!(planned.decisions.len(), 2);
+    }
+
+    /// The roster of held keys is every identity the durable state carries,
+    /// even when nothing about its output can be trusted: a completion whose
+    /// output is gone, a released failure, a held failure and a legacy
+    /// failure without a version. Reading it must take no lock and write
+    /// nothing.
+    #[test]
+    fn inspect_known_lists_every_held_key_without_another_claim_or_a_write() {
+        use crate::incremental::snapshot::{FailedItem, SkippedItem, SnapshotItem};
+
+        let env = env();
+        std::fs::create_dir_all(&env.state).expect("state dir");
+        let snapshot_path = env.state.join(SNAPSHOT_FILE);
+
+        let gone = |path: &str| OutputRef {
+            path: path.into(),
+            size: 5,
+            digest: "sha256:missing".into(),
+            mtime_ns: 0,
+        };
+        let failure = |version: Option<&str>, deferred: bool| FailedItem {
+            version: version.map(str::to_string),
+            error: "boom".into(),
+            fingerprint: Some("parser-1".into()),
+            deferred,
+            retry_fingerprint: None,
+        };
+        let mut snapshot = Snapshot::new("parse", "corpus");
+        // A completion whose output is gone: it is not in `items`, but the
+        // key is still held.
+        snapshot.items.insert(
+            "a".into(),
+            SnapshotItem {
+                version: "a1".into(),
+                fingerprint: "parser-1".into(),
+                output: gone("a.md"),
+            },
+        );
+        // An ordinary, released failure.
+        snapshot
+            .failed
+            .insert("c".into(), failure(Some("c1"), false));
+        // A deliberate omission.
+        snapshot.skipped.insert(
+            "d".into(),
+            SkippedItem {
+                version: "d1".into(),
+                fingerprint: "parser-1".into(),
+                reason: "unsupported type".into(),
+            },
+        );
+        // A failure recorded before versions were kept: the only null version.
+        snapshot.failed.insert(
+            "e".into(),
+            FailedItem {
+                version: None,
+                error: "legacy".into(),
+                fingerprint: None,
+                deferred: false,
+                retry_fingerprint: None,
+            },
+        );
+        // A held failure keeps its key visible too.
+        snapshot
+            .failed
+            .insert("f".into(), failure(Some("f1"), true));
+        // Completed and then failed: the failure's version wins.
+        snapshot.items.insert(
+            "g".into(),
+            SnapshotItem {
+                version: "g1".into(),
+                fingerprint: "parser-1".into(),
+                output: gone("g.md"),
+            },
+        );
+        snapshot
+            .failed
+            .insert("g".into(), failure(Some("g2"), false));
+        snapshot.save(&snapshot_path).expect("save");
+        let before = std::fs::read(&snapshot_path).expect("snapshot");
+
+        let state =
+            inspect(&env.state, "parse", "corpus", &env.out, VerifyMode::Fast).expect("inspect");
+
+        // No output verifies, so nothing is a live item...
+        assert!(state.items.is_empty(), "{:?}", state.items);
+        assert_eq!(state.skipped.len(), 1);
+        assert_eq!(
+            state
+                .failed
+                .iter()
+                .map(|failure| failure.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "e", "f", "g"]
+        );
+        // ...but every identity is still visible, versions taken from the
+        // failure, then the omission, then the completion.
+        assert_eq!(
+            state.known,
+            vec![
+                InspectedKnown {
+                    key: "a".into(),
+                    version: Some("a1".into()),
+                },
+                InspectedKnown {
+                    key: "c".into(),
+                    version: Some("c1".into()),
+                },
+                InspectedKnown {
+                    key: "d".into(),
+                    version: Some("d1".into()),
+                },
+                InspectedKnown {
+                    key: "e".into(),
+                    version: None,
+                },
+                InspectedKnown {
+                    key: "f".into(),
+                    version: Some("f1".into()),
+                },
+                InspectedKnown {
+                    key: "g".into(),
+                    version: Some("g2".into()),
+                },
+            ]
+        );
+
+        // A read-only view takes no lock and writes nothing.
+        assert!(!env.state.join("lock").exists(), "no lock is taken");
+        assert!(
+            !env.state.join(JOURNAL_FILE).exists(),
+            "no journal is written"
+        );
+        assert!(!env.state.join("txn.json").exists(), "no marker is written");
+        assert_eq!(
+            std::fs::read(&snapshot_path).expect("snapshot"),
+            before,
+            "the snapshot is left byte for byte"
+        );
     }
 }
