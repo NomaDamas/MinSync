@@ -30,7 +30,7 @@
 use super::fsio::{open_no_follow, sha256_file, sha256_reader, sync_for_commit};
 use super::item::{validate_item_key, validate_output_path};
 use super::journal::{Journal, Ledger, Outcome, OutputRef, Record, RunHeader, JOURNAL_FILE};
-use super::plan::{completion, plan, Action, Decision, PlanInput, SourceItem};
+use super::plan::{completion, holds_state, plan, Action, Decision, PlanInput, SourceItem};
 use super::snapshot::{Snapshot, SNAPSHOT_FILE, SNAPSHOT_FORMAT};
 use crate::error::{MinSyncError, Result};
 use crate::state::{FileLock, Transaction};
@@ -661,7 +661,9 @@ impl StageRun {
     }
 
     /// Remove the output of an item whose source is confirmed gone, then
-    /// record the deletion. Idempotent: returns whether a file was removed.
+    /// record the deletion, which also clears any omission or failure the
+    /// item held. Idempotent: an item that holds nothing records nothing.
+    /// Returns whether a file was removed.
     pub fn delete(&mut self, key: &str) -> Result<bool> {
         validate_item_key(key)?;
         if self.items.contains_key(key) {
@@ -675,6 +677,9 @@ impl StageRun {
                 "preserved_item",
                 format!("item {key:?} is unobservable, so its output is preserved"),
             ));
+        }
+        if !holds_state(&self.snapshot, &self.ledger, key) {
+            return Ok(false);
         }
         let removed = self.discard_output(key)?;
         let record = Record::deleted(key);
@@ -1907,6 +1912,72 @@ mod tests {
         assert_eq!(
             snapshot.failed["d"].retry_fingerprint.as_deref(),
             Some("retry-1")
+        );
+    }
+
+    #[test]
+    fn deleting_a_key_that_holds_nothing_records_nothing() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        assert!(!run.delete("never-seen").unwrap());
+        assert!(!run.delete("never-seen").unwrap());
+        assert_eq!(
+            journal_records(&env),
+            0,
+            "nothing to clear, nothing recorded"
+        );
+        let finished = run.finish().unwrap();
+        assert_eq!(finished.deleted, 0);
+        assert_eq!(finished.pending, 0);
+    }
+
+    #[test]
+    fn deleting_a_failure_or_an_omission_leaves_nothing_pending() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1"), ("f", "v1"), ("s", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.fail("f", "v1", None, "boom", FailOptions::default())
+            .unwrap();
+        run.skip("s", "v1", "unsupported type").unwrap();
+        run.finish().unwrap();
+
+        let (mut run, report) = open(&env, "fp", &[("a", "v1")]);
+        assert_eq!(
+            pending(&report),
+            actions(&[("f", Action::Delete), ("s", Action::Delete)])
+        );
+        run.delete("f").unwrap();
+        run.delete("s").unwrap();
+        let finished = run.finish().unwrap();
+        assert_eq!(finished.deleted, 2);
+        assert_eq!(finished.pending, 0, "the deletions resolved both items");
+    }
+
+    #[test]
+    fn a_discarding_failure_of_a_still_current_version_stays_pending() {
+        let env = env();
+        let (mut run, _) = open(&env, "fp", &[("a", "v1")]);
+        produce(&env, &mut run, "a", "v1", "alpha");
+        run.finish().unwrap();
+        // The output was damaged, so the same version is processed again and
+        // the parser fails badly enough to discard what is left of it.
+        std::fs::write(env.out.join("a.md"), "damaged output").unwrap();
+
+        let (mut run, report) = open(&env, "fp", &[("a", "v1")]);
+        assert_eq!(pending(&report), actions(&[("a", Action::Process)]));
+        let discard = FailOptions {
+            defer: false,
+            discard_output: true,
+        };
+        run.fail("a", "v1", None, "corrupt", discard).unwrap();
+        let finished = run.finish().unwrap();
+        assert_eq!(
+            finished.pending, 1,
+            "the discarded snapshot completion must not count as reusable"
         );
     }
 }

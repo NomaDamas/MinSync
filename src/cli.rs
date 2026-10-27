@@ -157,6 +157,11 @@ pub enum Commands {
     /// responses on stdout. Tracks which source items an external host
     /// (a parser) has already turned into output files, so a killed or
     /// failed run resumes with only the pending items.
+    ///
+    /// Ops: open, commit, fail (defer / discard_output), skip, delete,
+    /// finish; read-only and lock-free: capabilities, plan, inspect.
+    /// Send `capabilities` before relying on any newer op or field.
+    /// Protocol: docs/INCREMENTAL_CORE.md.
     Stage {
         /// Directory for the stage's lock, run marker, journal and snapshot.
         /// One stage and one corpus per directory; keep it outside the

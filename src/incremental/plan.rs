@@ -14,7 +14,7 @@
 //! host asking for a retry.
 
 use super::journal::{Ledger, Outcome, OutputRef};
-use super::snapshot::Snapshot;
+use super::snapshot::{FailedItem, Snapshot};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,7 +96,8 @@ pub(super) struct Completion<'a> {
     pub from_ledger: bool,
 }
 
-/// `None` = no output exists for `key` (never committed, or deleted).
+/// `None` = no output exists for `key` (never committed, deleted, or thrown
+/// away by a `discard_output` failure of this run).
 pub(super) fn completion<'a>(
     snapshot: &'a Snapshot,
     ledger: &'a Ledger,
@@ -110,6 +111,15 @@ pub(super) fn completion<'a>(
             from_ledger: true,
         }),
         Some(_) => None,
+        // This run discarded the committed output, or replaced it with an
+        // omission; the snapshot's completion no longer describes a file.
+        None if ledger.skipped(key).is_some()
+            || ledger
+                .failed(key)
+                .is_some_and(|record| record.discard_output) =>
+        {
+            None
+        }
         None => snapshot.items.get(key).map(|item| Completion {
             version: &item.version,
             fingerprint: &item.fingerprint,
@@ -117,6 +127,19 @@ pub(super) fn completion<'a>(
             from_ledger: false,
         }),
     }
+}
+
+/// The committed snapshot's failure of `key`, unless this run's ledger has
+/// already resolved the item (a completion, a deletion or an omission).
+fn snapshot_failure<'a>(
+    snapshot: &'a Snapshot,
+    ledger: &Ledger,
+    key: &str,
+) -> Option<&'a FailedItem> {
+    if ledger.done(key).is_some() || ledger.skipped(key).is_some() {
+        return None;
+    }
+    snapshot.failed.get(key)
 }
 
 /// A deliberate omission of `key`: no output is expected for it.
@@ -134,12 +157,19 @@ fn omission<'a>(snapshot: &'a Snapshot, ledger: &'a Ledger, key: &str) -> Option
             fingerprint: &ledger.header.fingerprint,
             from_ledger: true,
         }),
-        // A completion or deletion of this run supersedes an older omission.
-        None if ledger.done(key).is_none() => snapshot.skipped.get(key).map(|skipped| Omission {
-            version: &skipped.version,
-            fingerprint: &skipped.fingerprint,
-            from_ledger: false,
-        }),
+        // A completion, deletion or discarding failure of this run
+        // supersedes an older omission.
+        None if ledger.done(key).is_none()
+            && !ledger
+                .failed(key)
+                .is_some_and(|record| record.discard_output) =>
+        {
+            snapshot.skipped.get(key).map(|skipped| Omission {
+                version: &skipped.version,
+                fingerprint: &skipped.fingerprint,
+                from_ledger: false,
+            })
+        }
         None => None,
     }
 }
@@ -162,9 +192,7 @@ fn deferral<'a>(snapshot: &'a Snapshot, ledger: &'a Ledger, key: &str) -> Option
             error: record.error.as_deref().unwrap_or_default(),
         });
     }
-    snapshot
-        .failed
-        .get(key)
+    snapshot_failure(snapshot, ledger, key)
         .filter(|failure| failure.deferred)
         .map(|failure| Deferral {
             version: failure.version.as_deref(),
@@ -174,9 +202,13 @@ fn deferral<'a>(snapshot: &'a Snapshot, ledger: &'a Ledger, key: &str) -> Option
         })
 }
 
-/// Whether `key` holds any failure, deferred or not.
-fn failed_somewhere(snapshot: &Snapshot, ledger: &Ledger, key: &str) -> bool {
-    ledger.failed(key).is_some() || snapshot.failed.contains_key(key)
+/// Whether `key` still holds durable state a deletion has to clear: an
+/// output, an omission or a failure that this run has not resolved yet.
+pub(super) fn holds_state(snapshot: &Snapshot, ledger: &Ledger, key: &str) -> bool {
+    completion(snapshot, ledger, key).is_some()
+        || omission(snapshot, ledger, key).is_some()
+        || ledger.failed(key).is_some()
+        || snapshot_failure(snapshot, ledger, key).is_some()
 }
 
 /// Whether `key` already failed for exactly `version`.
@@ -185,9 +217,7 @@ fn failed_before(snapshot: &Snapshot, ledger: &Ledger, key: &str, version: &str)
         .failed(key)
         .is_some_and(|record| record.version.as_deref() == Some(version));
     in_ledger
-        || snapshot
-            .failed
-            .get(key)
+        || snapshot_failure(snapshot, ledger, key)
             .is_some_and(|failure| failure.version.as_deref() == Some(version))
 }
 
@@ -287,10 +317,7 @@ pub fn plan(input: &PlanInput<'_>) -> Vec<Decision> {
         if present.contains(key) || input.unknown.contains(key) {
             continue;
         }
-        let holds_state = completion(input.snapshot, input.ledger, key).is_some()
-            || omission(input.snapshot, input.ledger, key).is_some()
-            || failed_somewhere(input.snapshot, input.ledger, key);
-        if !holds_state {
+        if !holds_state(input.snapshot, input.ledger, key) {
             continue;
         }
         decisions.entry(key).or_insert_with(|| Decision {

@@ -277,7 +277,24 @@ MinSync는 UTF-8 텍스트를 읽을 뿐 내용을 추출하지 않습니다. PD
 minsync stage --state-dir ./.parse-state     # stdin으로 JSON 요청, stdout으로 JSON 응답
 ```
 
-host는 출력을 최종 경로 옆에 쓴 뒤 rename하고 `commit`을 보냅니다. 검증을 통과한 commit(`output_root` 안의 일반 파일, 경로 이탈·symlink 탈출 없음, size/digest 일치, 올바른 원본 버전과 fingerprint)만 기록됩니다. host나 `minsync stage`가 강제 종료되면 journal이 남고, 다음 `open`은 `resumed: true`와 함께 남은 항목만 돌려줍니다. 실패한 항목은 이전 출력을 유지한 채 재시도되고, `unknown`으로 알린 항목(읽을 수 없는 원본)은 삭제되지 않으며, `items`에서 빠진 항목의 출력은 `delete`로 제거됩니다. `fingerprint`(parser 이름/버전, 출력 형식)를 바꾸면 이 단계만 다시 처리됩니다. 결과 색인은 `output_root`를 일반 `minsync` workspace로 지정해 별도 단계로 수행하며, 그 resume log는 독립적입니다. protocol 명세, 파일 형식, 장애 처리: [docs/INCREMENTAL_CORE.md](docs/INCREMENTAL_CORE.md).
+host는 출력을 최종 경로 옆에 쓴 뒤 rename하고 `commit`을 보냅니다. 검증을 통과한 commit(`output_root` 안의 일반 파일, 경로 이탈·symlink 탈출 없음, size/digest 일치, 올바른 원본 버전과 fingerprint)만 기록됩니다. host나 `minsync stage`가 강제 종료되면 journal이 남고, 다음 `open`은 `resumed: true`와 함께 남은 항목만 돌려줍니다. 실패한 항목은 이전 출력을 유지한 채 재시도되고, `unknown`으로 알린 항목(읽을 수 없는 원본)은 삭제되지 않으며, `items`에서 빠진 항목의 출력은 `delete`로 제거됩니다. `fingerprint`(parser 이름/버전, 출력 형식)를 바꾸면 이 단계만 다시 처리됩니다. 결과 색인은 `output_root`를 일반 `minsync` workspace로 지정해 별도 단계로 수행하며, 그 resume log는 독립적입니다.
+
+항목별 결과도 MinSync가 소유하므로 host는 checkpoint나 재시도 장부를 따로 둘 필요가 없습니다.
+
+```text
+-> {"op":"capabilities"}                       # 먼저 확인; 구버전 minsync는 invalid_request로 답함
+<- {"ok":true,"op":"capabilities","protocol":2,"features":["retry_fingerprint","retry_failed","deferred_failure",
+    "discard_output","deliberate_skip","plan","inspect"],"journal_format":3,"snapshot_format":2}
+-> {"op":"fail","key":"b.pdf","version":"sha256:…","error":"bad xref","defer":true}
+-> {"op":"skip","key":"c.pdf","version":"sha256:…","reason":"unsupported type"}
+-> {"op":"inspect","stage":"parse","source_id":"corpus","output_root":"./mirror"}
+```
+
+- `fail`에 `"defer": true`를 주면 실패를 보류합니다. 원본 버전, `fingerprint`, `open`의 `retry_fingerprint`가 그대로인 동안 재시도하지 않고 마지막 정상 출력도 유지합니다. `open`에 `"retry_failed": true` 또는 `"full": true`를 주면 보류된 실패를 모두 풉니다. `"discard_output": true`는 실패와 함께 이전 출력을 지웁니다.
+- `skip`은 의도적 누락을 기록합니다. 이전 출력은 지워지고, 버전이나 `fingerprint`가 바뀔 때까지 다시 작업 대상이 되지 않습니다.
+- `plan`(`open`과 같은 필드)과 `inspect`는 읽기 전용입니다. lock도, run도, 쓰기도 없으므로 다른 프로세스가 실행 중일 때도 쓸 수 있습니다. `inspect`는 출력이 검증되는 commit 항목, 실패, 누락, 그리고 stage가 가진 모든 키(`known`)를 돌려줍니다.
+
+이 필드들을 쓰기 전에는 항상 `capabilities`를 보내세요. 구버전 `minsync`는 모르는 `open`/`fail` 필드를 무시하므로 아무것도 보류하지 않습니다. 0.5.1 이상이 `finish`한 stage 디렉터리는 snapshot format 2이며 0.5.0은 이를 거부합니다(`corrupt_state`). protocol 명세, 파일 형식, 장애 처리: [docs/INCREMENTAL_CORE.md](docs/INCREMENTAL_CORE.md).
 
 ## Embedding 안정성
 

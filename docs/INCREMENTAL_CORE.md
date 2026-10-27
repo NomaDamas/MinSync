@@ -211,7 +211,9 @@ writes one JSON response per line on stdout. One session is one run.
 - `delete` removes the recorded output (idempotent) and records the deletion.
   It refuses an item that is still in `items` (`still_present`) or listed in
   `unknown` (`preserved_item`); an item that only holds a failure or an
-  omission is deleted to clear it.
+  omission is deleted to clear it. An item that holds nothing is answered
+  `output_removed: false` and records nothing, so it is not counted in
+  `finish`'s `deleted`.
 - `finish` leaves failed and untouched items with their previous completion;
   `pending` counts what the next run will still do, so a held failure is not
   pending.

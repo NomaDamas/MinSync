@@ -348,7 +348,24 @@ minsync stage --state-dir ./.parse-state     # JSON requests on stdin, JSON resp
 -> {"op":"finish"}
 ```
 
-The host writes each output beside its final path and renames it into place, then sends `commit`; only a validated commit (regular file inside `output_root`, no traversal or symlink escape, matching size/digest, right source version and fingerprint) is recorded. A killed host or a killed `minsync stage` leaves a journal: the next `open` reports `resumed: true` and returns only the pending items. A failed item keeps its previous output and is retried; an item listed in `unknown` (unreadable source) is never deleted; an item missing from `items` has its output removed through `delete`. Changing `fingerprint` (parser name/version, output format) reprocesses this stage only. Point a normal `minsync` workspace at `output_root` to index the result as a separate stage; its own resume log is independent. Protocol reference, file formats and failure semantics: [docs/INCREMENTAL_CORE.md](docs/INCREMENTAL_CORE.md).
+The host writes each output beside its final path and renames it into place, then sends `commit`; only a validated commit (regular file inside `output_root`, no traversal or symlink escape, matching size/digest, right source version and fingerprint) is recorded. A killed host or a killed `minsync stage` leaves a journal: the next `open` reports `resumed: true` and returns only the pending items. A failed item keeps its previous output and is retried; an item listed in `unknown` (unreadable source) is never deleted; an item missing from `items` has its output removed through `delete`. Changing `fingerprint` (parser name/version, output format) reprocesses this stage only. Point a normal `minsync` workspace at `output_root` to index the result as a separate stage; its own resume log is independent.
+
+MinSync also owns each item's outcome, so the host does not need a second checkpoint or retry ledger:
+
+```text
+-> {"op":"capabilities"}                       # probe first; an older minsync answers invalid_request
+<- {"ok":true,"op":"capabilities","protocol":2,"features":["retry_fingerprint","retry_failed","deferred_failure",
+    "discard_output","deliberate_skip","plan","inspect"],"journal_format":3,"snapshot_format":2}
+-> {"op":"fail","key":"b.pdf","version":"sha256:…","error":"bad xref","defer":true}
+-> {"op":"skip","key":"c.pdf","version":"sha256:…","reason":"unsupported type"}
+-> {"op":"inspect","stage":"parse","source_id":"corpus","output_root":"./mirror"}
+```
+
+- `fail` with `"defer": true` holds the failure: it is not retried, and the last good output stays, while the source version, `fingerprint` and the `open`'s `retry_fingerprint` stay the same. `"retry_failed": true` or `"full": true` on `open` releases every held failure. `"discard_output": true` removes the previous output with the failure.
+- `skip` records a deliberate omission: the previous output is removed and the item is not work again until its version or `fingerprint` changes.
+- `plan` (same fields as `open`) and `inspect` are read-only: no lock, no run, nothing written, so they work from another process while a run is in progress. `inspect` returns the committed items whose output still verifies, the failures, the omissions and `known`, every key the stage holds.
+
+Always send `capabilities` before using these fields: an older `minsync` ignores unknown `open`/`fail` fields and would silently hold nothing. A stage directory finished by 0.5.1 or later uses snapshot format 2, which 0.5.0 refuses (`corrupt_state`). Protocol reference, file formats and failure semantics: [docs/INCREMENTAL_CORE.md](docs/INCREMENTAL_CORE.md).
 
 ## Embedding Reliability
 

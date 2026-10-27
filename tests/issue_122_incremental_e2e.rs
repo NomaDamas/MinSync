@@ -577,3 +577,178 @@ async fn each_stage_is_invalidated_only_by_its_own_configuration() {
     assert!(ok, "{result}");
     assert_eq!(result["already_up_to_date"], true, "{result}");
 }
+
+fn inspect_request(corpus: &Corpus) -> Value {
+    json!({
+        "op": "inspect",
+        "stage": "parse",
+        "source_id": "corpus-122",
+        "output_root": corpus.out,
+    })
+}
+
+fn sorted_keys(list: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = list
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|entry| entry["key"].as_str().expect("key").to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A host probes the binary and reads the durable state from a second
+/// process while a writer holds the stage lock, without opening a run.
+#[tokio::test]
+async fn capabilities_plan_and_inspect_read_beside_a_running_writer() {
+    let root = tempfile::tempdir().expect("root");
+    let corpus = Corpus::new(root.path());
+    corpus.write("a.txt", "alpha");
+    corpus.write("b.txt", "beta");
+
+    // Probing a fresh stage creates nothing.
+    let mut probe = Stage::spawn(&state_dir(root.path()));
+    let caps = probe.call(json!({"op": "capabilities"}));
+    assert_eq!(caps["ok"], true, "{caps}");
+    assert_eq!(caps["protocol"], 2, "{caps}");
+    for feature in ["deferred_failure", "deliberate_skip", "plan", "inspect"] {
+        assert!(
+            caps["features"]
+                .as_array()
+                .expect("features")
+                .contains(&json!(feature)),
+            "{caps}"
+        );
+    }
+    assert_eq!(probe.hang_up(), 0, "a read-only session exits cleanly");
+    assert!(!state_dir(root.path()).exists(), "probing creates no state");
+
+    // A writer commits `a.txt` and is still running, lock held.
+    let mut writer = Stage::spawn(&state_dir(root.path()));
+    let opened = writer.call(corpus.open_request("parser-1"));
+    assert_eq!(keys(&opened), ["a.txt", "b.txt"]);
+    let decision = opened["decisions"][0].clone();
+    assert_eq!(corpus.materialize(&mut writer, &decision)["ok"], true);
+
+    let mut reader = Stage::spawn(&state_dir(root.path()));
+    let inspected = reader.call(inspect_request(&corpus));
+    assert_eq!(inspected["ok"], true, "{inspected}");
+    assert_eq!(sorted_keys(&inspected["items"]), ["a.txt"], "{inspected}");
+    let mut plan = corpus.open_request("parser-1");
+    plan["op"] = json!("plan");
+    let planned = reader.call(plan);
+    assert_eq!(planned["ok"], true, "{planned}");
+    assert_eq!(planned["counts"]["skip"], 1, "{planned}");
+    assert_eq!(planned["counts"]["process"], 1, "{planned}");
+    assert_eq!(reader.hang_up(), 0, "reading never needed the lock");
+
+    let decision = opened["decisions"][1].clone();
+    assert_eq!(corpus.materialize(&mut writer, &decision)["ok"], true);
+    let finished = writer.call(json!({"op": "finish"}));
+    assert_eq!(finished["committed"], 2, "{finished}");
+    assert_eq!(writer.hang_up(), 0);
+}
+
+/// A held failure, a deliberate omission and a discarding failure are all
+/// durable across SIGKILL, and `inspect` reports them after the resumed run.
+#[tokio::test]
+async fn held_failures_omissions_and_discards_survive_a_kill() {
+    let root = tempfile::tempdir().expect("root");
+    let corpus = Corpus::new(root.path());
+    for key in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        corpus.write(key, &format!("{key} v1"));
+    }
+    let mut stage = Stage::spawn(&state_dir(root.path()));
+    corpus.run(&mut stage, "parser-1", usize::MAX);
+    assert_eq!(stage.call(json!({"op": "finish"}))["committed"], 4);
+    assert_eq!(stage.hang_up(), 0);
+
+    for key in ["b.txt", "c.txt", "d.txt"] {
+        corpus.write(key, &format!("{key} v2"));
+    }
+    let open = |retry_failed: bool| {
+        let mut open = corpus.open_request("parser-1");
+        open["retry_fingerprint"] = json!("retry-1");
+        open["retry_failed"] = json!(retry_failed);
+        open
+    };
+    let version = |opened: &Value, key: &str| {
+        opened["decisions"]
+            .as_array()
+            .expect("decisions")
+            .iter()
+            .find(|decision| decision["key"] == key)
+            .unwrap_or_else(|| panic!("{key} in {opened}"))["version"]
+            .clone()
+    };
+
+    let mut stage = Stage::spawn(&state_dir(root.path()));
+    let opened = stage.call(open(false));
+    assert_eq!(keys(&opened), ["b.txt", "c.txt", "d.txt"], "{opened}");
+    let held = stage.call(json!({"op": "fail", "key": "b.txt",
+        "version": version(&opened, "b.txt"), "error": "bad xref", "defer": true}));
+    assert_eq!(held["ok"], true, "{held}");
+    let omitted = stage.call(json!({"op": "skip", "key": "c.txt",
+        "version": version(&opened, "c.txt"), "reason": "unsupported type"}));
+    assert_eq!(omitted["ok"], true, "{omitted}");
+    let discarded = stage.call(json!({"op": "fail", "key": "d.txt",
+        "version": version(&opened, "d.txt"), "error": "corrupt", "discard_output": true}));
+    assert_eq!(discarded["ok"], true, "{discarded}");
+    stage.kill(); // SIGKILL before finish
+
+    assert!(
+        corpus.out.join("b.txt.md").exists(),
+        "last good output kept"
+    );
+    assert!(!corpus.out.join("c.txt.md").exists(), "omission removed it");
+    assert!(!corpus.out.join("d.txt.md").exists(), "discard removed it");
+
+    let mut stage = Stage::spawn(&state_dir(root.path()));
+    let opened = stage.call(open(false));
+    assert_eq!(opened["resumed"], true, "{opened}");
+    assert_eq!(opened["counts"]["resumed"], 1, "the omission: {opened}");
+    assert_eq!(
+        opened["counts"]["skip"], 3,
+        "a, held b, omitted c: {opened}"
+    );
+    let decisions = opened["decisions"].as_array().expect("decisions");
+    assert_eq!(decisions.len(), 2, "{opened}");
+    assert_eq!(decisions[0]["key"], "b.txt");
+    assert_eq!(decisions[0]["action"], "skip");
+    assert_eq!(decisions[0]["deferred"], true);
+    assert_eq!(decisions[0]["error"], "bad xref");
+    assert_eq!(decisions[1]["key"], "d.txt");
+    assert_eq!(decisions[1]["action"], "retry");
+    assert_eq!(corpus.materialize(&mut stage, &decisions[1])["ok"], true);
+    let finished = stage.call(json!({"op": "finish"}));
+    assert_eq!(
+        finished["pending"], 0,
+        "a held failure is not work: {finished}"
+    );
+    assert_eq!(stage.hang_up(), 0);
+
+    let mut reader = Stage::spawn(&state_dir(root.path()));
+    let inspected = reader.call(inspect_request(&corpus));
+    assert_eq!(
+        sorted_keys(&inspected["items"]),
+        ["a.txt", "b.txt", "d.txt"],
+        "{inspected}"
+    );
+    assert_eq!(
+        inspected["failed"],
+        json!([{"key": "b.txt", "version": version(&opened, "b.txt"),
+                "error": "bad xref", "deferred": true}])
+    );
+    assert_eq!(sorted_keys(&inspected["skipped"]), ["c.txt"]);
+    assert_eq!(reader.hang_up(), 0);
+
+    // An explicit retry releases the held failure.
+    let mut stage = Stage::spawn(&state_dir(root.path()));
+    let opened = stage.call(open(true));
+    assert_eq!(
+        opened["decisions"],
+        json!([{"key": "b.txt", "action": "retry", "version": version(&opened, "b.txt")}])
+    );
+    stage.kill();
+}
