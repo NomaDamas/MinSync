@@ -1394,7 +1394,10 @@ mod tests {
         let error = StageRun::open(&env.state, spec(&env, "fp"), items(&[("a", "v1")]), vec![])
             .err()
             .expect("locked");
-        assert!(matches!(error, MinSyncError::LockFailed), "{error:?}");
+        assert!(
+            matches!(error, MinSyncError::LockFailed { .. }),
+            "{error:?}"
+        );
         drop(run);
         open(&env, "fp", &[("a", "v1")]);
     }

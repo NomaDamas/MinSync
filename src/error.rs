@@ -1,4 +1,42 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Who holds the workspace lock, as recorded in `.minsync/lock`.
+///
+/// Every field is optional: a lock file written by an older MinSync holds
+/// only a bare pid, and a file that is empty or unreadable yields nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockHolder {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl LockHolder {
+    fn is_empty(&self) -> bool {
+        self.pid.is_none() && self.started_at.is_none() && self.command.is_none()
+    }
+}
+
+fn lock_holder_suffix(holder: &Option<LockHolder>) -> String {
+    let Some(holder) = holder.as_ref().filter(|holder| !holder.is_empty()) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(pid) = holder.pid {
+        parts.push(format!("pid {pid}"));
+    }
+    if let Some(started_at) = &holder.started_at {
+        parts.push(format!("started {started_at}"));
+    }
+    if let Some(command) = &holder.command {
+        parts.push(format!("`{command}`"));
+    }
+    format!(" ({})", parts.join(", "))
+}
 
 #[derive(Debug, Error)]
 pub enum MinSyncError {
@@ -8,8 +46,10 @@ pub enum MinSyncError {
     #[error("already initialized — use --force to reinitialize")]
     AlreadyInitialized,
 
-    #[error("another sync is in progress")]
-    LockFailed,
+    /// The workspace lock is held by another process. `holder` is what that
+    /// process recorded in the lock file, when it could be read.
+    #[error("another sync is in progress{}", lock_holder_suffix(.holder))]
+    LockFailed { holder: Option<LockHolder> },
 
     #[error("schema/embedder mismatch — run sync with --full")]
     SchemaMismatch,
@@ -66,7 +106,7 @@ impl MinSyncError {
 
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::LockFailed => 3,
+            Self::LockFailed { .. } => 3,
             Self::VectorStore(_) => 4,
             Self::Embedding(_) => 5,
             Self::Timeout(_) => 7,
@@ -87,7 +127,7 @@ mod tests {
         assert_eq!(error.exit_code(), 7);
         assert!(error.to_string().contains("native batch stuck"));
         for other in [
-            MinSyncError::LockFailed.exit_code(),
+            MinSyncError::LockFailed { holder: None }.exit_code(),
             MinSyncError::VectorStore(String::new()).exit_code(),
             MinSyncError::Embedding(String::new()).exit_code(),
         ] {

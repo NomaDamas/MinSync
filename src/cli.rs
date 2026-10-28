@@ -67,8 +67,14 @@ pub enum Commands {
         full: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Wait for another sync holding the workspace lock to finish
+        /// instead of failing at once.
         #[arg(long)]
         wait: bool,
+        /// Wait at most this many seconds for the workspace lock, then fail
+        /// as if it were held (exit code 3). Implies `--wait`.
+        #[arg(long, value_name = "SECS")]
+        wait_timeout: Option<u64>,
         #[arg(long)]
         batch_size: Option<usize>,
         /// Stream progress events to stdout while syncing (human logs stay

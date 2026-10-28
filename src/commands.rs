@@ -19,6 +19,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         full,
         dry_run,
         wait,
+        wait_timeout,
         batch_size,
         progress,
         progress_file,
@@ -36,7 +37,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
             &minsync_dir,
             full,
             dry_run,
-            wait,
+            LockWait::from_flags(wait, wait_timeout),
             batch_size,
             progress,
         )
@@ -208,6 +209,38 @@ fn check_progress_file_location(root: &std::path::Path, path: &std::path::Path) 
     Ok(())
 }
 
+/// How `sync` waits for the workspace lock (`--wait` / `--wait-timeout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockWait {
+    wait: bool,
+    timeout: Option<std::time::Duration>,
+}
+
+impl LockWait {
+    /// `--wait-timeout` implies `--wait`; `--wait` alone waits forever.
+    fn from_flags(wait: bool, wait_timeout: Option<u64>) -> Self {
+        Self {
+            wait: wait || wait_timeout.is_some(),
+            timeout: wait_timeout.map(std::time::Duration::from_secs),
+        }
+    }
+}
+
+/// The `--format json` error object for errors with machine-readable
+/// details, or `None` to keep the plain stderr message only.
+pub fn json_error(error: &MinSyncError) -> Option<serde_json::Value> {
+    match error {
+        MinSyncError::LockFailed { holder } => Some(serde_json::json!({
+            "error": {
+                "code": "lock_failed",
+                "message": error.to_string(),
+                "holder": holder,
+            }
+        })),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sync(
     format: &OutputFormat,
@@ -215,7 +248,7 @@ async fn sync(
     minsync_dir: &std::path::Path,
     full: bool,
     dry_run: bool,
-    wait: bool,
+    lock_wait: LockWait,
     batch_size: Option<usize>,
     progress: ProgressOptions,
 ) -> Result<i32> {
@@ -226,7 +259,11 @@ async fn sync(
     if let Some(reporter) = &reporter {
         ms = ms.with_progress(reporter.clone());
     }
-    let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), wait)?;
+    let _lock = crate::state::FileLock::acquire_with_timeout(
+        &minsync_dir.join("lock"),
+        lock_wait.wait,
+        lock_wait.timeout,
+    )?;
     let mut config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     if let Some(bs) = batch_size {
         config.embedder.batch_size = bs;

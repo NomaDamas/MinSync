@@ -203,6 +203,18 @@ later scan can read the path again (or confirms it is gone). If the root
 directory itself is unreadable the sync still fails, since nothing can be said
 about any file.
 
+### Concurrent syncs
+
+`minsync sync` holds `.minsync/lock` while it runs. A second `sync` fails at once with exit code `3` and names the holder:
+
+```text
+Error: another sync is in progress (pid 12345, started 2026-10-15T10:00:00Z, `minsync sync --full`)
+```
+
+With `--format json`, the same details are also printed to stdout as `{"error": {"code": "lock_failed", "message": "...", "holder": {"pid": 12345, "started_at": "...", "command": "minsync sync --full"}}}`. `--wait` waits for the lock instead; `--wait-timeout <SECS>` (which implies `--wait`) gives up after that many seconds with the same error. The lock is released when its holder exits, even if it is killed, so a holder that no longer runs never blocks the next `sync`.
+
+The lock file holds that JSON object. Lock files written by older versions hold a bare pid, which is still reported.
+
 ## Chunkers
 
 | id | Strategy | Boundary stability under edits |

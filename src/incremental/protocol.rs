@@ -226,7 +226,7 @@ pub const FEATURES: [&str; 7] = [
 fn error_code(error: &MinSyncError) -> &'static str {
     match error {
         MinSyncError::Stage { code, .. } => code,
-        MinSyncError::LockFailed => "lock_failed",
+        MinSyncError::LockFailed { .. } => "lock_failed",
         MinSyncError::Io(_) => "io_error",
         _ => "internal",
     }
@@ -239,11 +239,18 @@ fn respond(output: &mut impl Write, value: &Value) -> Result<()> {
 }
 
 fn refusal(op: &str, error: &MinSyncError) -> Value {
-    json!({
+    let mut value = json!({
         "ok": false,
         "op": op,
         "error": {"code": error_code(error), "message": error.to_string()},
-    })
+    });
+    if let MinSyncError::LockFailed {
+        holder: Some(holder),
+    } = error
+    {
+        value["error"]["holder"] = json!(holder);
+    }
+    value
 }
 
 fn decision_json(decision: &super::plan::Decision) -> Value {
@@ -520,7 +527,7 @@ pub fn serve(state_dir: &Path, input: impl BufRead, output: &mut impl Write) -> 
                 }
                 Err(error) => {
                     respond(output, &refusal("open", &error))?;
-                    if matches!(error, MinSyncError::LockFailed) {
+                    if matches!(error, MinSyncError::LockFailed { .. }) {
                         return Ok(error.exit_code());
                     }
                 }

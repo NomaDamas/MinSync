@@ -1013,7 +1013,7 @@ mod tests {
             .init(true, "openai:text-embedding-3-small", "recursive")
             .expect_err("force init must reject a locked workspace");
 
-        assert!(matches!(error, MinSyncError::LockFailed));
+        assert!(matches!(error, MinSyncError::LockFailed { .. }));
     }
 
     #[test]
