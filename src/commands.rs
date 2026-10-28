@@ -450,7 +450,14 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
-    let result = crate::verify::check(minsync_dir, embedder.as_ref(), store.as_ref()).await?;
+    let result = crate::verify::check(
+        minsync_dir,
+        &store_path,
+        &config.check,
+        embedder.as_ref(),
+        store.as_ref(),
+    )
+    .await?;
     match format {
         OutputFormat::Text => {
             println!("MinSync Health Check");
@@ -462,6 +469,22 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
                 "  VectorStore: {}",
                 if result.vectorstore_ok { "OK" } else { "FAIL" }
             );
+            if let Some(free) = result.free_bytes {
+                println!("  Free space:  {free} bytes");
+            }
+            if result.interrupted {
+                println!(
+                    "  Last sync:   interrupted ({})",
+                    if result.resumable {
+                        "resumable"
+                    } else {
+                        "will be redone"
+                    }
+                );
+            }
+            for warning in &result.warnings {
+                println!("  Warning: {warning}");
+            }
             if result.all_passed {
                 println!("\nAll checks passed.");
             } else {

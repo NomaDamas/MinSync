@@ -203,6 +203,20 @@ later scan can read the path again (or confirms it is gone). If the root
 directory itself is unreadable the sync still fails, since nothing can be said
 about any file.
 
+### Health check
+
+`minsync check` probes each piece a sync needs and exits non-zero when one is unhealthy: `5` for the embedder, `4` for the vector store (the report is still printed).
+
+- **Embedder**: embeds one short string, bounded by `[check] timeout_seconds` (default 10; `0` waits indefinitely), so a hung embedder fails the check instead of hanging it.
+- **Vector store**: reads the store's index state and surfaces any error. It also writes a temporary file in the store directory and removes it again, and it checks that the store's volume has at least `[check] min_free_bytes` free (default 256 MiB; `0` turns the limit off). A read-only, corrupt or nearly full store fails here, and the actual free space is reported as `free_bytes`.
+- **Interrupted run**: `interrupted` is `true` while `.minsync/txn.json` exists. `resumable` says whether its `progress.jsonl` lets the next `sync` skip files it already committed. This is a warning and does not fail the check, because the next `sync` picks the run up.
+
+```toml
+[check]
+min_free_bytes = 268435456   # 256 MiB; 0 disables
+timeout_seconds = 10         # embedder probe; 0 disables
+```
+
 ## Chunkers
 
 | id | Strategy | Boundary stability under edits |

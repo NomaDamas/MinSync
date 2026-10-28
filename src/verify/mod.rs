@@ -386,14 +386,60 @@ mod tests {
         sync.init(false, "openai:text-embedding-3-small", "recursive")
             .expect("init succeeds");
 
-        let result = check(&dir.path().join(".minsync"), &embedder, &store)
-            .await
-            .expect("check succeeds");
+        let minsync_dir = dir.path().join(".minsync");
+        let result = check(
+            &minsync_dir,
+            &minsync_dir.join("store"),
+            &no_disk_limit(),
+            &embedder,
+            &store,
+        )
+        .await
+        .expect("check succeeds");
 
         assert!(result.embedder_ok);
         assert!(result.vectorstore_ok);
         assert!(result.all_passed);
         assert!(result.errors.is_empty());
+    }
+
+    /// The disk-space probe depends on the machine running the tests.
+    fn no_disk_limit() -> crate::config::CheckConfig {
+        crate::config::CheckConfig {
+            min_free_bytes: 0,
+            ..crate::config::CheckConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_reports_an_interrupted_sync() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").unwrap();
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+        let minsync_dir = dir.path().join(".minsync");
+        Transaction::new("source", "token", None, "sha256:next")
+            .save(&minsync_dir.join("txn.json"))
+            .expect("save transaction");
+
+        let result = check(
+            &minsync_dir,
+            &minsync_dir.join("store"),
+            &no_disk_limit(),
+            &embedder,
+            &store,
+        )
+        .await
+        .expect("check succeeds");
+
+        assert!(result.interrupted);
+        assert!(!result.resumable, "a finished sync leaves no progress log");
+        assert_eq!(result.warnings.len(), 1);
+        // The next sync picks the run up, so the workspace is still usable.
+        assert!(result.all_passed);
     }
 
     struct LexicalOnly;
@@ -419,9 +465,16 @@ mod tests {
         sync.init(false, "none", "recursive")
             .expect("init succeeds");
 
-        let result = check(&dir.path().join(".minsync"), &LexicalOnly, &store)
-            .await
-            .expect("check succeeds");
+        let minsync_dir = dir.path().join(".minsync");
+        let result = check(
+            &minsync_dir,
+            &minsync_dir.join("store"),
+            &no_disk_limit(),
+            &LexicalOnly,
+            &store,
+        )
+        .await
+        .expect("check succeeds");
 
         assert!(result.embedder_ok);
         assert!(result.all_passed);

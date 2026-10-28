@@ -16,6 +16,8 @@ pub struct Config {
     pub normalize: NormalizeConfig,
     #[serde(default)]
     pub sync: SyncConfig,
+    #[serde(default)]
+    pub check: CheckConfig,
 }
 
 /// Default for [`SyncConfig::checkpoint_every_files`].
@@ -81,6 +83,43 @@ impl Default for SyncConfig {
             batch_files: DEFAULT_BATCH_FILES,
             on_file_error: OnFileError::default(),
             max_file_bytes: default_max_file_bytes(),
+        }
+    }
+}
+
+/// Default for [`CheckConfig::min_free_bytes`] (256 MiB).
+pub const DEFAULT_CHECK_MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default for [`CheckConfig::timeout_seconds`].
+pub const DEFAULT_CHECK_TIMEOUT_SECONDS: u64 = 10;
+
+/// Knobs for `minsync check`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckConfig {
+    /// Free bytes the vector store's volume needs for the store check to
+    /// pass. Zero disables the disk-space check (free space is still
+    /// reported when it can be read).
+    #[serde(default = "default_check_min_free_bytes")]
+    pub min_free_bytes: u64,
+    /// Seconds the embedder probe may take before the check fails it.
+    /// Zero disables the deadline.
+    #[serde(default = "default_check_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_check_min_free_bytes() -> u64 {
+    DEFAULT_CHECK_MIN_FREE_BYTES
+}
+
+fn default_check_timeout_seconds() -> u64 {
+    DEFAULT_CHECK_TIMEOUT_SECONDS
+}
+
+impl Default for CheckConfig {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: DEFAULT_CHECK_MIN_FREE_BYTES,
+            timeout_seconds: DEFAULT_CHECK_TIMEOUT_SECONDS,
         }
     }
 }
@@ -348,6 +387,7 @@ impl Config {
             lexical: LexicalConfig::default(),
             normalize: NormalizeConfig::default(),
             sync: SyncConfig::default(),
+            check: CheckConfig::default(),
         }
     }
 }

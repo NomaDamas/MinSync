@@ -137,10 +137,26 @@ pub enum SyncState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckResult {
     pub embedder_ok: bool,
+    /// The store answered, its directory is writable and its volume has at
+    /// least `[check] min_free_bytes` free.
     pub vectorstore_ok: bool,
     pub all_passed: bool,
     pub errors: Vec<String>,
     pub index_state: Option<IndexState>,
+    /// An earlier `sync` did not finish (`.minsync/txn.json` is present).
+    /// The next `sync` picks it up; this does not fail the check.
+    #[serde(default)]
+    pub interrupted: bool,
+    /// The interrupted run left a usable progress log, so the next `sync`
+    /// skips the files it already committed instead of redoing them.
+    #[serde(default)]
+    pub resumable: bool,
+    /// Free bytes on the vector store's volume, when they can be read.
+    #[serde(default)]
+    pub free_bytes: Option<u64>,
+    /// Findings that do not fail the check (e.g. an interrupted run).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
