@@ -1,19 +1,44 @@
 //! Arrow schema definition and conversions between [`Document`]/[`QueryHit`]
 //! values and Arrow record batches.
 
-use super::{to_store_error, DISTANCE_COLUMN, VECTOR_COLUMN};
+use super::{
+    to_store_error, DISTANCE_COLUMN, SPARSE_INDICES_COLUMN, SPARSE_MODEL_COLUMN,
+    SPARSE_VALUES_COLUMN, VECTOR_COLUMN,
+};
 use crate::error::{MinSyncError, Result};
+use crate::sparse::SparseVector;
 use crate::vectorstore::{Document, DocumentUpdate, QueryHit};
+use arrow_array::builder::{Float32Builder, ListBuilder, StringBuilder, UInt32Builder};
 use arrow_array::cast::AsArray;
-use arrow_array::types::Float32Type;
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, StringArray};
+use arrow_array::types::{Float32Type, UInt32Type};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn indices_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::UInt32, true)))
+}
+
+fn values_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
+}
+
+/// The three nullable columns that hold a row's sparse vector and the model
+/// that produced it. All null means "not encoded yet".
+pub(super) fn sparse_fields() -> Vec<Field> {
+    vec![
+        Field::new(SPARSE_MODEL_COLUMN, DataType::Utf8, true),
+        Field::new(SPARSE_INDICES_COLUMN, indices_type(), true),
+        Field::new(SPARSE_VALUES_COLUMN, values_type(), true),
+    ]
+}
+
 pub(super) fn schema(dim: usize) -> Result<SchemaRef> {
     validate_dimension(dim)?;
-    Ok(Arc::new(Schema::new(vec![
+    let mut fields = vec![
         Field::new("id", DataType::Utf8, false),
         Field::new(
             VECTOR_COLUMN,
@@ -24,7 +49,6 @@ pub(super) fn schema(dim: usize) -> Result<SchemaRef> {
             false,
         ),
         Field::new("text", DataType::Utf8, false),
-        Field::new("lexical_text", DataType::Utf8, false),
         Field::new("source_id", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("chunk_schema_id", DataType::Utf8, false),
@@ -32,18 +56,24 @@ pub(super) fn schema(dim: usize) -> Result<SchemaRef> {
         Field::new("heading_path", DataType::Utf8, false),
         Field::new("content_hash", DataType::Utf8, false),
         Field::new("seen_token", DataType::Utf8, false),
-    ])))
+    ];
+    fields.extend(sparse_fields());
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 pub(super) fn validate_schema(schema: &SchemaRef, dim: usize) -> Result<()> {
     validate_dimension(dim)?;
-    let lexical_text = schema
-        .field_with_name("lexical_text")
-        .map_err(to_store_error)?;
-    if lexical_text.data_type() != &DataType::Utf8 {
-        return Err(MinSyncError::VectorStore(
-            "LanceDB column lexical_text must be Utf8".into(),
-        ));
+    for expected in sparse_fields() {
+        let actual = schema
+            .field_with_name(expected.name())
+            .map_err(to_store_error)?;
+        if actual.data_type() != expected.data_type() {
+            return Err(MinSyncError::VectorStore(format!(
+                "LanceDB column {} must be {}",
+                expected.name(),
+                expected.data_type()
+            )));
+        }
     }
     for field_name in super::filters::FILTERABLE_FIELDS {
         let field = schema.field_with_name(field_name).map_err(to_store_error)?;
@@ -74,7 +104,7 @@ pub(super) fn validate_schema(schema: &SchemaRef, dim: usize) -> Result<()> {
     }
 }
 
-pub(super) fn docs_to_batch(docs: &[Document], dim: usize, language: &str) -> Result<RecordBatch> {
+pub(super) fn docs_to_batch(docs: &[Document], dim: usize) -> Result<RecordBatch> {
     for doc in docs {
         validate_vector(
             &doc.embedding,
@@ -88,46 +118,157 @@ pub(super) fn docs_to_batch(docs: &[Document], dim: usize, language: &str) -> Re
             .map(|doc| Some(doc.embedding.iter().copied().map(Some).collect::<Vec<_>>())),
         dim as i32,
     );
+    let strings = |column: fn(&Document) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from_iter_values(docs.iter().map(column)))
+    };
 
+    let mut columns: Vec<ArrayRef> = vec![
+        strings(|doc| doc.id.as_str()),
+        Arc::new(vectors),
+        strings(|doc| doc.text.as_str()),
+        strings(|doc| doc.source_id.as_str()),
+        strings(|doc| doc.path.as_str()),
+        strings(|doc| doc.chunk_schema_id.as_str()),
+        strings(|doc| doc.chunk_type.as_str()),
+        strings(|doc| doc.heading_path.as_str()),
+        strings(|doc| doc.content_hash.as_str()),
+        strings(|doc| doc.seen_token.as_str()),
+    ];
+    // A written row carries no sparse vector: when it replaces an old row,
+    // the old vector described old text. Sync encodes it afterwards.
+    columns.extend(
+        sparse_fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), docs.len())),
+    );
+    RecordBatch::try_new(schema(dim)?, columns).map_err(to_store_error)
+}
+
+/// `id` plus the three sparse columns, for a `merge_insert` that fills the
+/// sparse vectors of rows that already exist (every other column untouched).
+pub(super) fn sparse_rows_to_batch(
+    model: &str,
+    rows: &[&(String, SparseVector)],
+) -> Result<RecordBatch> {
+    let mut models = StringBuilder::new();
+    let mut indices = ListBuilder::new(UInt32Builder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::UInt32,
+        true,
+    )));
+    let mut values = ListBuilder::new(Float32Builder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::Float32,
+        true,
+    )));
+    for (_, vector) in rows {
+        models.append_value(model);
+        indices.values().append_slice(vector.indices());
+        indices.append(true);
+        values.values().append_slice(vector.values());
+        values.append(true);
+    }
+    let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+    fields.extend(sparse_fields());
     RecordBatch::try_new(
-        schema(dim)?,
+        Arc::new(Schema::new(fields)),
         vec![
             Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.id.as_str()),
+                rows.iter().map(|(id, _)| id.as_str()),
             )),
-            Arc::new(vectors),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.text.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter()
-                    .map(|doc| crate::tokenizer::tokenize(&doc.text, language))
-                    .collect::<Result<Vec<_>>>()?,
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.source_id.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.path.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.chunk_schema_id.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.chunk_type.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.heading_path.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.content_hash.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                docs.iter().map(|doc| doc.seen_token.as_str()),
-            )),
+            Arc::new(models.finish()),
+            Arc::new(indices.finish()),
+            Arc::new(values.finish()),
         ],
     )
     .map_err(to_store_error)
+}
+
+/// The vector held by one row of the two sparse list columns; `None` when
+/// either is null (the row is not encoded).
+fn sparse_at(indices: &ListArray, values: &ListArray, row: usize) -> Result<Option<SparseVector>> {
+    if indices.is_null(row) || values.is_null(row) {
+        return Ok(None);
+    }
+    let row_indices = indices.value(row);
+    let row_values = values.value(row);
+    SparseVector::new(
+        row_indices.as_primitive::<UInt32Type>().values().to_vec(),
+        row_values.as_primitive::<Float32Type>().values().to_vec(),
+    )
+    .map(Some)
+    .map_err(|error| {
+        MinSyncError::VectorStore(format!("stored sparse vector is malformed: {error}"))
+    })
+}
+
+fn list_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ListArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| missing_column(name))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| MinSyncError::VectorStore(format!("column {name} has unexpected type")))
+}
+
+/// `(content_hash, vector)` for every row of `batch` holding a sparse vector.
+pub(super) fn batch_to_hash_sparse(batch: &RecordBatch) -> Result<Vec<(String, SparseVector)>> {
+    let hashes = string_col(batch, "content_hash")?;
+    let indices = list_col(batch, SPARSE_INDICES_COLUMN)?;
+    let values = list_col(batch, SPARSE_VALUES_COLUMN)?;
+    let mut found = Vec::new();
+    for row in 0..batch.num_rows() {
+        if let Some(vector) = sparse_at(indices, values, row)? {
+            found.push((hashes.value(row).to_string(), vector));
+        }
+    }
+    Ok(found)
+}
+
+/// Score every row of `batch` that holds a sparse vector against `query`,
+/// straight from the column buffers (no per-row allocation), and offer it to
+/// `top`. Rows without a vector are skipped.
+pub(super) fn score_sparse_batch(
+    batch: &RecordBatch,
+    query: &SparseVector,
+    top: &mut crate::sparse::TopK,
+) -> Result<()> {
+    let ids = string_col(batch, "id")?;
+    let indices = list_col(batch, SPARSE_INDICES_COLUMN)?;
+    let values = list_col(batch, SPARSE_VALUES_COLUMN)?;
+    for row in 0..batch.num_rows() {
+        if indices.is_null(row) || values.is_null(row) {
+            continue;
+        }
+        let row_indices = indices.value(row);
+        let row_values = values.value(row);
+        let score = crate::sparse::dot_terms(
+            query.indices(),
+            query.values(),
+            row_indices.as_primitive::<UInt32Type>().values(),
+            row_values.as_primitive::<Float32Type>().values(),
+        );
+        top.offer(score, ids.value(row));
+    }
+    Ok(())
+}
+
+/// Rows that still need encoding: `(id, path, content_hash, text)`.
+pub(super) fn batch_to_sparse_targets(
+    batch: &RecordBatch,
+) -> Result<Vec<crate::vectorstore::SparseTarget>> {
+    let ids = string_col(batch, "id")?;
+    let paths = string_col(batch, "path")?;
+    let hashes = string_col(batch, "content_hash")?;
+    let texts = string_col(batch, "text")?;
+    Ok((0..batch.num_rows())
+        .map(|row| crate::vectorstore::SparseTarget {
+            id: ids.value(row).to_string(),
+            path: paths.value(row).to_string(),
+            content_hash: hashes.value(row).to_string(),
+            text: texts.value(row).to_string(),
+        })
+        .collect())
 }
 
 /// Batch holding only `id` plus the three metadata columns an update
@@ -251,26 +392,30 @@ pub(super) fn batch_to_query_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> 
     Ok(hits)
 }
 
-pub(super) fn batch_to_fts_hits(batch: &RecordBatch) -> Result<Vec<QueryHit>> {
+/// Hits for the chosen ids, in the order of `scored`: each hit takes its
+/// score from `scored` and its metadata from `batch`.
+pub(super) fn batch_to_scored_hits(
+    batch: &RecordBatch,
+    scored: &HashMap<String, f32>,
+) -> Result<Vec<QueryHit>> {
     let ids = string_col(batch, "id")?;
     let paths = string_col(batch, "path")?;
     let headings = string_col(batch, "heading_path")?;
     let chunk_types = string_col(batch, "chunk_type")?;
     let texts = string_col(batch, "text")?;
     let hashes = string_col(batch, "content_hash")?;
-    let scores = batch
-        .column_by_name("_score")
-        .ok_or_else(|| missing_column("_score"))?
-        .as_primitive::<Float32Type>();
     Ok((0..batch.num_rows())
-        .map(|row| QueryHit {
-            doc_id: ids.value(row).to_string(),
-            path: paths.value(row).to_string(),
-            heading_path: headings.value(row).to_string(),
-            chunk_type: chunk_types.value(row).to_string(),
-            text: texts.value(row).to_string(),
-            score: scores.value(row),
-            content_hash: hashes.value(row).to_string(),
+        .filter_map(|row| {
+            let score = *scored.get(ids.value(row))?;
+            Some(QueryHit {
+                doc_id: ids.value(row).to_string(),
+                path: paths.value(row).to_string(),
+                heading_path: headings.value(row).to_string(),
+                chunk_type: chunk_types.value(row).to_string(),
+                text: texts.value(row).to_string(),
+                score,
+                content_hash: hashes.value(row).to_string(),
+            })
         })
         .collect())
 }
@@ -346,7 +491,7 @@ mod tests {
     fn test_docs_to_batch_roundtrip() {
         let docs = vec![doc("a", vec![1.0, 0.0]), doc("b", vec![0.5, 0.5])];
 
-        let batch = docs_to_batch(&docs, 2, "simple").expect("convert to batch");
+        let batch = docs_to_batch(&docs, 2).expect("convert to batch");
         let roundtripped = batch_to_documents(&batch).expect("convert back");
 
         assert_eq!(roundtripped.len(), docs.len());
@@ -368,7 +513,7 @@ mod tests {
     fn test_docs_to_batch_rejects_wrong_dimension() {
         let docs = vec![doc("a", vec![1.0, 0.0, 0.0])];
 
-        assert!(docs_to_batch(&docs, 2, "simple").is_err());
+        assert!(docs_to_batch(&docs, 2).is_err());
     }
 
     #[test]

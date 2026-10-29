@@ -9,6 +9,8 @@ use std::path::Path;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 const DIMENSION: usize = 4;
 const CEILING: usize = 4;
 
@@ -52,6 +54,7 @@ fn setup(root: &Path, base_url: &str) {
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(DIMENSION as i64));
     config.vectorstore.options = toml::Value::Table(options);
+    common::use_tiny_sparse(&mut config);
     config.save(&config_path).expect("save config");
 }
 

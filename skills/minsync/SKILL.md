@@ -105,6 +105,24 @@ passage_prefix = "passage: "
 dimension = 384
 ```
 
+## Sparse Retrieval
+
+MinSync also supports learned-sparse (SPLADE) retrieval, independent of the dense embedder, configured under `[sparse]` in `.minsync/config.toml` (default model `native:nlpai-lab/KURE-Sparse-nano`, Apache-2.0). Providers:
+
+- `native:` runs the ModernBERT + SPLADE model in-process on candle (no Python, no ONNX runtime); the weights download from Hugging Face on first use (~100 MB).
+- `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse` at `base_url`.
+- A running `minsync serve --sparse` is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
+
+Select the mode per query:
+
+```bash
+minsync query "question" --mode vector   # dense ranking (default)
+minsync query "question" --mode sparse   # sparse ranking
+minsync query "question" --mode hybrid   # RRF fusion of both (k=60)
+```
+
+There is no `--language` flag on `minsync init` and no `[lexical]` config table. `minsync init --embedder none` builds a sparse-only workspace where `query` defaults to `--mode sparse`. Run `minsync sync` once after upgrading from a BM25-era index to drop the old FTS index and `lexical_text` column and encode sparse vectors for existing chunks; no `--full` is needed and dense vectors are not recomputed.
+
 ## Extending Vector Stores
 
 Use this checklist when adding a vector database backend:
@@ -160,7 +178,7 @@ Run `minsync sync` after edits. It re-embeds only changed chunks and sweeps stal
 ## Troubleshooting
 
 - `not initialized`: run `minsync init`.
-- No model/API key available: `minsync init --embedder none` indexes and searches with BM25 only (`query` defaults to `--mode bm25`).
+- No dense model/API key available: `minsync init --embedder none` builds a sparse-only workspace, where `query` defaults to `--mode sparse`.
 - Embedding request fails: make sure the local TEI server is running for the default embedder, or export `OPENAI_API_KEY` when using an `openai:` embedder.
 - Vector dimension mismatch: set `[vectorstore.options].dimension` to the embedder dimension and run `minsync sync --full`.
 - Binary files appear empty: this is expected; MinSync only reads UTF-8 text.

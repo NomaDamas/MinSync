@@ -80,20 +80,143 @@ impl SparseVector {
 
     /// Inner product: the SPLADE relevance score.
     pub fn dot(&self, other: &Self) -> f32 {
-        let (mut left, mut right) = (0, 0);
-        let mut sum = 0.0;
-        while left < self.indices.len() && right < other.indices.len() {
-            match self.indices[left].cmp(&other.indices[right]) {
-                std::cmp::Ordering::Less => left += 1,
-                std::cmp::Ordering::Greater => right += 1,
-                std::cmp::Ordering::Equal => {
-                    sum += self.values[left] * other.values[right];
-                    left += 1;
-                    right += 1;
-                }
+        dot_terms(&self.indices, &self.values, &other.indices, &other.values)
+    }
+}
+
+/// Inner product of two term lists, each strictly ascending by index. This is
+/// the one scoring loop: [`SparseVector::dot`] and the stores that score rows
+/// straight from their column buffers both run it.
+pub fn dot_terms(
+    left_indices: &[u32],
+    left_values: &[f32],
+    right_indices: &[u32],
+    right_values: &[f32],
+) -> f32 {
+    let (mut left, mut right) = (0, 0);
+    let mut sum = 0.0;
+    while left < left_indices.len() && right < right_indices.len() {
+        match left_indices[left].cmp(&right_indices[right]) {
+            std::cmp::Ordering::Less => left += 1,
+            std::cmp::Ordering::Greater => right += 1,
+            std::cmp::Ordering::Equal => {
+                sum += left_values[left] * right_values[right];
+                left += 1;
+                right += 1;
             }
         }
-        sum
+    }
+    sum
+}
+
+/// The `k` best `(score, id)` pairs of a stream: highest score first, equal
+/// scores toward the smaller id. A score that is not finite and positive never
+/// qualifies, so a row that shares no term with the query is not a hit.
+///
+/// Memory is `O(k)` however many rows are offered, which is what lets a store
+/// score a table batch by batch instead of materializing it.
+pub struct TopK {
+    k: usize,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<Ranked>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct Ranked {
+    score: OrderedScore,
+    id: String,
+}
+
+/// `f32` ordered by [`f32::total_cmp`] (scores here are finite, so it is the
+/// usual order).
+#[derive(PartialEq, Eq)]
+struct OrderedScore(u32);
+
+impl OrderedScore {
+    fn new(score: f32) -> Self {
+        // Monotonic map from the IEEE bit pattern to an unsigned order.
+        let bits = score.to_bits();
+        Self(if bits >> 31 == 1 {
+            !bits
+        } else {
+            bits | (1 << 31)
+        })
+    }
+}
+
+impl Ord for OrderedScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for OrderedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    /// Greater is better: a higher score, then the smaller id.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl TopK {
+    pub fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// Offer one scored row. Allocates only when the row is kept.
+    pub fn offer(&mut self, score: f32, id: &str) {
+        if self.k == 0 || !score.is_finite() || score <= 0.0 {
+            return;
+        }
+        let candidate = OrderedScore::new(score);
+        if self.heap.len() == self.k {
+            let worst = &self.heap.peek().expect("heap holds k entries").0;
+            let better = match candidate.cmp(&worst.score) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => id < worst.id.as_str(),
+                std::cmp::Ordering::Less => false,
+            };
+            if !better {
+                return;
+            }
+            self.heap.pop();
+        }
+        self.heap.push(std::cmp::Reverse(Ranked {
+            score: candidate,
+            id: id.to_string(),
+        }));
+    }
+
+    /// The kept rows, best first, with their scores.
+    pub fn into_sorted(self) -> Vec<(f32, String)> {
+        let mut kept: Vec<Ranked> = self.heap.into_iter().map(|entry| entry.0).collect();
+        kept.sort_by(|a, b| b.cmp(a));
+        kept.into_iter()
+            .map(|ranked| {
+                let bits = ranked.score.0;
+                let bits = if bits >> 31 == 1 {
+                    bits & !(1 << 31)
+                } else {
+                    !bits
+                };
+                (f32::from_bits(bits), ranked.id)
+            })
+            .collect()
     }
 }
 
@@ -203,5 +326,78 @@ mod tests {
                 .is_err(),
             "a descending index list must not deserialize"
         );
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+
+    #[test]
+    fn dot_terms_is_the_sum_over_shared_terms() {
+        assert_eq!(
+            dot_terms(&[1, 3, 5], &[2.0, 1.0, 4.0], &[3, 4, 5], &[10.0, 7.0, 0.5]),
+            12.0
+        );
+        assert_eq!(dot_terms(&[], &[], &[1], &[1.0]), 0.0);
+        assert_eq!(dot_terms(&[1], &[1.0], &[2], &[1.0]), 0.0);
+    }
+
+    #[test]
+    fn top_k_returns_the_best_first_and_breaks_ties_toward_the_smaller_id() {
+        let mut top = TopK::new(3);
+        for (score, id) in [(1.0, "d"), (3.0, "b"), (3.0, "a"), (2.0, "c"), (0.5, "e")] {
+            top.offer(score, id);
+        }
+        assert_eq!(
+            top.into_sorted(),
+            vec![
+                (3.0, "a".to_string()),
+                (3.0, "b".to_string()),
+                (2.0, "c".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn top_k_never_keeps_a_row_that_scores_zero_or_is_not_finite() {
+        let mut top = TopK::new(5);
+        for score in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            top.offer(score, "x");
+        }
+        top.offer(0.25, "y");
+        assert_eq!(top.into_sorted(), vec![(0.25, "y".to_string())]);
+        assert!(TopK::new(0).into_sorted().is_empty());
+    }
+
+    #[test]
+    fn top_k_equals_sorting_everything_for_many_random_streams() {
+        // Deterministic LCG: no dev-dependency on rand for one property.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for round in 0..200 {
+            let rows: Vec<(f32, String)> = (0..(round % 40 + 1))
+                .map(|i| {
+                    // Few distinct scores so ties are common.
+                    let score = (next() % 6) as f32 * 0.5;
+                    (score, format!("id{:03}", (i * 7 + next() as usize) % 90))
+                })
+                .collect();
+            let k = (next() % 8) as usize;
+            let mut top = TopK::new(k);
+            for (score, id) in &rows {
+                top.offer(*score, id);
+            }
+            let mut expected: Vec<(f32, String)> =
+                rows.into_iter().filter(|(score, _)| *score > 0.0).collect();
+            expected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            expected.truncate(k);
+            assert_eq!(top.into_sorted(), expected, "round {round}, k {k}");
+        }
     }
 }

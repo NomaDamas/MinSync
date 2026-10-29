@@ -22,6 +22,7 @@ MinSync is a manifest-based incremental vector database indexing CLI for text fi
 - [How it works](#how-it-works)
 - [Chunkers](#chunkers)
 - [Vector store](#vector-store)
+- [Sparse retrieval (SPLADE)](#sparse-retrieval-splade)
 - [Embedding network reliability](#embedding-network-reliability)
 - [Local embeddings](#local-embeddings)
 - [.minsyncignore](#minsyncignore)
@@ -53,15 +54,15 @@ cargo build --release
 
 MinSync embeds in-process with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) by default. No API key, TEI server, or Hugging Face gate is required. The first `minsync sync` downloads the model into the local cache.
 
-No model at all? Use the BM25-only mode, which needs no embedder, API key, model download or network:
+No dense model at all? Build a sparse-only workspace, which needs no dense embedder, API key or embedding server (the sparse encoder still has its own small model, see [Sparse retrieval (SPLADE)](#sparse-retrieval-splade)):
 
 ```bash
 minsync init --embedder none
-minsync sync                          # chunks + full-text index only; nothing is embedded
-minsync query "exact terms"           # --mode defaults to bm25 in this workspace
+minsync sync                          # chunks + sparse vectors only; no dense vectors are computed
+minsync query "exact terms"           # --mode defaults to sparse in this workspace
 ```
 
-`--embedder none` stores a 1-float placeholder vector per chunk (the LanceDB schema requires the column) and never builds an ANN index. `--mode vector` and `--mode hybrid` fail with a pointer to `--mode bm25`; `minsync check` skips the embedder probe. To add vector search later, run `minsync init --force --embedder <id>` and re-sync.
+`--embedder none` stores a 1-float placeholder dense vector per chunk (the LanceDB schema requires the column) and never builds an ANN index, so the dense `--mode vector` and `--mode hybrid` modes are unavailable; `minsync check` skips the dense embedder probe but still probes the sparse encoder. To add dense vector search later, run `minsync init --force --embedder <id>` and re-sync.
 
 For OpenAI embeddings instead:
 
@@ -77,7 +78,7 @@ minsync init                          # initialize .minsync/
 minsync sync                          # index changed files incrementally
 minsync sync --full                   # rebuild from scratch
 minsync query "search text" --mode vector --k 5
-minsync query "exact terms" --mode bm25 --k 5
+minsync query "exact terms" --mode sparse --k 5
 minsync query "search text" --mode hybrid --k 5
 minsync watch                         # initial sync, then re-index on file changes
 minsync watch --watch-on-sync-error   # stay alive and retry after initial sync errors
@@ -86,18 +87,6 @@ minsync check                         # health check; exit 5 if the embedder fai
 minsync verify --fix                  # consistency check + repair
 minsync optimize                      # compact + re-index + prune the store
 ```
-
-Select the BM25 tokenizer preset during initialization:
-
-```bash
-minsync init --language ko
-```
-
-Supported values are `simple`, `ko`, `ja`, `zh`, `ar`, and `multilingual`.
-Korean uses Kiwi through the `kiwi-rs` Rust binding, Japanese uses an embedded
-Lindera dictionary, Chinese uses `jieba-rs`, and Arabic uses an in-process light
-stemmer based on Discrawl PR #180.
-Changing `[lexical].language` triggers a full rebuild on the next sync.
 
 `minsync watch` performs an initial sync before waiting for filesystem events.
 By default, an initial embedding or vector-store error stops the command,
@@ -128,36 +117,30 @@ cargo test --test issue_41_benchmark -- --nocapture
 ```
 
 It generates the same local corpus at 1x, 2x, 4x, and 8x, reports full,
-unchanged, and changed-file sync milliseconds, and reports p50/p95 for BM25,
+unchanged, and changed-file sync milliseconds, and reports p50/p95 for sparse,
 vector, and hybrid retrieval. The benchmark intentionally uses the in-memory
 store, so its query timings measure retrieval scaling separately from LanceDB
-index maintenance; the LanceDB ANN/FTS threshold and unindexed-delta behavior
+index maintenance; the LanceDB ANN threshold and unindexed-delta behavior
 are covered by the live index tests. Timing values are observations, not a
 machine-specific latency SLO.
 
-Korean tokenization requires the official Kiwi native library and base model.
-Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted
-`models/cong/base` directory. `kiwi-rs` (LGPL-2.1-or-later) is statically linked;
-see `THIRD_PARTY_NOTICES.md` for its notice and how to relink against a modified copy.
-On macOS/Linux, `bash scripts/install-kiwi.sh` downloads the matching official
-assets and prints the required environment variables.
-On Windows, run `powershell -ExecutionPolicy Bypass -File
-scripts/install-kiwi.ps1` and set the printed paths in the environment.
-The Windows CI uses the official Kiwi 0.22.2 assets until the remaining
-`kiwi_config_t` ABI differences in the Rust binding are resolved upstream.
+Sparse encoding is configured under `[sparse]` in `.minsync/config.toml`; see
+[Sparse retrieval (SPLADE)](#sparse-retrieval-splade) for the providers, config
+keys, and the upgrade path from a BM25-era index.
 
 ## How It Works
 
-MinSync scans your directory, compares each text file to the manifest, chunks changed content once, and stores the same stable chunk IDs for vector and BM25 retrieval in LanceDB. Stale rows are removed by mark-and-sweep. Vector mode embeds the query, BM25 mode uses LanceDB full-text search without an embedding request, and hybrid mode combines both rankings with deterministic reciprocal rank fusion (RRF, `k=60`).
+MinSync scans your directory, compares each text file to the manifest, chunks changed content once, and stores the same stable chunk IDs for dense and sparse retrieval in LanceDB. Stale rows are removed by mark-and-sweep. Vector mode embeds the query densely, sparse mode encodes the query with the sparse encoder and ranks chunks by the inner product over their sparse term weights, and hybrid mode fuses both rankings with deterministic reciprocal rank fusion (RRF, `k=60`).
 
-The selected analyzer converts documents and queries into the shared
-`lexical_text` column before LanceDB BM25 indexing.
+Sparse term weights live in the same LanceDB table as nullable list columns
+(`sparse_indices`, `sparse_values`) plus a `sparse_model` tag column; sparse
+search is an exact top-k inner-product scan over those columns.
 
 State lives in `.minsync/`:
 
 | File | Purpose |
 |---|---|
-| `config.toml` | collection, chunker, embedder, vector store, normalization |
+| `config.toml` | collection, chunker, embedder, sparse encoder, vector store, normalization |
 | `manifest.json` | last known file metadata and content hashes |
 | `cursor.json` | last completed processing point |
 | `txn.json` | in-progress transaction marker |
@@ -311,6 +294,79 @@ minsync sync --progress jsonl --progress-heartbeat-seconds 2
 - With `--progress jsonl`, the text summary moves to stderr and `--format json` prints the final result as one compact last line on stdout. Without the flags, output is unchanged.
 - A sink that closes mid-run (host exited, disk full) is dropped with a warning and never fails the sync. An unopenable `--progress-file` fails before any work. A `--progress-file` inside `.minsync/` (it would overwrite state such as the resume log) or inside the indexed workspace without a matching `.minsyncignore` entry (it would be indexed as a source file) is rejected before the file is touched.
 
+## Sparse retrieval (SPLADE)
+
+MinSync supports learned-sparse retrieval with
+[KURE-Sparse-nano](https://huggingface.co/nlpai-lab/KURE-Sparse-nano)
+(Apache-2.0, 0.1B parameters). This is a real encoder, not a term-frequency
+index: documents and queries run through the model to produce weighted term
+vectors, and chunks are ranked by the inner product of those vectors.
+
+Select the mode with `--mode`:
+
+| Mode | Behavior |
+|---|---|
+| `vector` (default) | dense query embedding, ANN/HNSW search |
+| `sparse` | sparse query encoding, exact top-k inner-product scan |
+| `hybrid` | reciprocal-rank fusion of the dense and sparse rankings (`k=60`) |
+
+The JSON result field for the sparse ranking is `sparse_rank`.
+
+Sparse encoding is configured under `[sparse]` in `.minsync/config.toml`.
+Defaults:
+
+```toml
+[sparse]
+id = "native:nlpai-lab/KURE-Sparse-nano"
+batch_size = 64
+max_retries = 3
+timeout_seconds = 60
+query_prefix = "[Q] "
+passage_prefix = "[D] "
+device = "auto"                      # auto | cpu | metal | cuda (native only)
+dtype = "auto"                       # resolves to f32 on every device (native only)
+max_length = 2048
+
+# Optional, unset by default:
+# per_batch_timeout_seconds = 120      # native only; defaults to timeout_seconds (at least 900 on CPU)
+# max_batch_tokens = 8192             # native only
+# model_cache_dir = "~/.cache/minsync/models"
+# base_url = "http://localhost:8081"  # tei: only
+```
+
+Providers:
+
+- `native:` runs the model in-process on [candle](https://github.com/huggingface/candle) (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (about 100 MB).
+- `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
+- `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
+
+Query-time encoding runs the same model on the query with the `query_prefix`;
+there is no inference-free query mode. There is no `--language` flag on
+`minsync init` and no `[lexical]` config table: an old `config.toml` that still
+has `[lexical]` is silently ignored.
+
+`minsync sync` encodes sparse vectors in a catch-up phase at the end of the run.
+It is resumable and deduplicated by content hash, and independent of the dense
+phase. The model id is recorded in `.minsync/cursor.json` as `sparse_id` only
+when every stored chunk holds a vector from that model. A sparse or hybrid
+query against an index whose last sync left `sparse_id` unset or set to another
+model (a changed `[sparse].id`, a sparse failure that left chunks unencoded, a
+sync that ran without an encoder and added chunks) fails with a message to run
+`minsync sync`; vector queries are unaffected. A file whose chunk the encoder
+rejects is reported with stage `sparse` and retried by the next sync.
+
+`minsync check` also probes the sparse encoder and reports `sparse_ok`. The
+library exposes `MinSync::with_sparse_encoder(Arc<dyn SparseEncoder>)`; without
+it a sync is dense-only and runs no sparse phase.
+
+### Upgrading from a BM25-era index
+
+The first `minsync sync` after upgrading automatically drops the old full-text
+(FTS) index and the `lexical_text` column, adds the sparse columns, and encodes
+sparse vectors for every existing chunk. Dense vectors are untouched and not
+recomputed, and no `--full` is needed. A read-only `minsync query` on an
+un-migrated index fails with a message to run `minsync sync` once to migrate.
+
 ## Skipped files
 
 By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. A skipped file is never recorded as done: a new file stays out of the saved manifest and a previously indexed file keeps its previous manifest entry, so the next `minsync sync` retries it automatically. Its old chunks (if it was indexed before) stay searchable until it succeeds, including across full syncs.
@@ -324,7 +380,7 @@ Files larger than `[sync] max_file_bytes` (default 64 MiB) are skipped before ha
 "partial": true
 ```
 
-`stage` is one of `size_guard`, `read`, `chunk`, `truncate`, `embed`, `store`. When `partial` is true the CLI exits with code **6** (completed, files skipped) and text output lists each skipped path on stderr. Hard failures keep their codes (1, 3, 4, 5). An embed/store failure that hits the first few files of a run with nothing indexed yet (for example the embedder being down) is treated as an outage, not as bad files: the sync aborts with that error (exit 5/4) and the file path in the message.
+`stage` is one of `size_guard`, `read`, `chunk`, `truncate`, `embed`, `store`, `sparse` (the sparse encoder rejected one of the file's chunks; its dense rows stay indexed). When `partial` is true the CLI exits with code **6** (completed, files skipped) and text output lists each skipped path on stderr. Hard failures keep their codes (1, 3, 4, 5). An embed/store failure that hits the first few files of a run with nothing indexed yet (for example the embedder being down) is treated as an outage, not as bad files: the sync aborts with that error (exit 5/4) and the file path in the message.
 
 ```toml
 [sync]
@@ -369,7 +425,7 @@ Always send `capabilities` before using these fields: an older `minsync` ignores
 
 ## Embedding Reliability
 
-Embedding requests use per-request timeouts and retry transient failures: network errors, HTTP 429, and HTTP 5xx. When a `tei:` / `openai:` request with several inputs is answered with HTTP 413, 408 or 504, or hits the request timeout, the server found the batch too big or too slow: MinSync does not resend it, but halves the batch and lowers the effective `batch_size` for the rest of the run (a single input is retried per `max_retries`; a single-input 413 fails immediately). Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or lexical language changed in between.
+Embedding requests use per-request timeouts and retry transient failures: network errors, HTTP 429, and HTTP 5xx. When a `tei:` / `openai:` request with several inputs is answered with HTTP 413, 408 or 504, or hits the request timeout, the server found the batch too big or too slow: MinSync does not resend it, but halves the batch and lowers the effective `batch_size` for the rest of the run (a single input is retried per `max_retries`; a single-input 413 fails immediately). Permanent failures such as invalid auth, malformed responses, or validation errors fail immediately. A failed or killed sync never advances the cursor or manifest, but it keeps a resume log (`progress.jsonl`): the next `minsync sync` skips every file the interrupted run already committed and continues from there. The log is discarded if the files, chunker, normalizer, embedder, or sparse model changed in between.
 
 ```toml
 [embedder]

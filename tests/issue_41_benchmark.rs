@@ -4,9 +4,11 @@ use minsync::cli::QueryMode;
 use minsync::embedder::Embedder;
 use minsync::error::Result;
 use minsync::query::query;
+use minsync::sparse::{SparseEncoder, SparseVector};
 use minsync::sync::MinSync;
 use minsync::vectorstore::memory::InMemoryStore;
 use minsync::vectorstore::{Document, VectorStore};
+use std::sync::Arc;
 use std::time::Instant;
 
 struct LocalEmbedder;
@@ -23,6 +25,27 @@ impl Embedder for LocalEmbedder {
 
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         Ok(vector_for(text))
+    }
+}
+
+/// Stand-in for the learned-sparse encoder: one fixed term, no model load.
+struct LocalSparse;
+
+#[async_trait]
+impl SparseEncoder for LocalSparse {
+    fn id(&self) -> &str {
+        "local:issue-41-sparse"
+    }
+
+    async fn encode(&self, texts: &[String]) -> Result<Vec<SparseVector>> {
+        Ok(texts
+            .iter()
+            .map(|_| SparseVector::from_pairs([(1, 1.0)]))
+            .collect())
+    }
+
+    async fn encode_query(&self, _text: &str) -> Result<SparseVector> {
+        Ok(SparseVector::from_pairs([(1, 1.0)]))
     }
 }
 
@@ -78,6 +101,7 @@ fn seed_documents(store: &mut InMemoryStore, scale: usize, source_id: &str) {
 async fn issue_41_local_benchmark_reports_sync_and_query_scaling() {
     let embedder = LocalEmbedder;
     let chunker = ChonkieChunker::new(128, "\n ");
+    let sparse: Arc<dyn SparseEncoder> = Arc::new(LocalSparse);
     let mut rows = Vec::new();
 
     for scale in [1_usize, 2, 4, 8] {
@@ -89,7 +113,7 @@ async fn issue_41_local_benchmark_reports_sync_and_query_scaling() {
             )
             .expect("write benchmark document");
         }
-        let sync = MinSync::new(root.path().to_path_buf());
+        let sync = MinSync::new(root.path().to_path_buf()).with_sparse_encoder(Arc::clone(&sparse));
         sync.init(false, "local:issue-41", "chonkie")
             .expect("initialize benchmark workspace");
         let mut store = InMemoryStore::new();
@@ -115,12 +139,13 @@ async fn issue_41_local_benchmark_reports_sync_and_query_scaling() {
                 "selective",
                 5,
                 &embedder,
+                Some(sparse.as_ref()),
                 &store,
                 None,
-                QueryMode::Bm25,
+                QueryMode::Sparse,
             )
             .await
-            .expect("BM25 benchmark query succeeds");
+            .expect("sparse benchmark query succeeds");
             query_samples[0].push(started.elapsed().as_secs_f64() * 1_000.0);
 
             let started = Instant::now();
@@ -129,6 +154,7 @@ async fn issue_41_local_benchmark_reports_sync_and_query_scaling() {
                 "selective",
                 5,
                 &embedder,
+                Some(sparse.as_ref()),
                 &store,
                 None,
                 QueryMode::Vector,
@@ -143,6 +169,7 @@ async fn issue_41_local_benchmark_reports_sync_and_query_scaling() {
                 "selective",
                 5,
                 &embedder,
+                Some(sparse.as_ref()),
                 &store,
                 None,
                 QueryMode::Hybrid,
@@ -161,12 +188,12 @@ async fn issue_41_local_benchmark_reports_sync_and_query_scaling() {
                 "changed_file": changed_ms
             },
             "query_ms_p50": {
-                "bm25": percentile(&mut query_samples[0], 0.50),
+                "sparse": percentile(&mut query_samples[0], 0.50),
                 "vector": percentile(&mut query_samples[1], 0.50),
                 "hybrid": percentile(&mut query_samples[2], 0.50)
             },
             "query_ms_p95": {
-                "bm25": percentile(&mut query_samples[0], 0.95),
+                "sparse": percentile(&mut query_samples[0], 0.95),
                 "vector": percentile(&mut query_samples[1], 0.95),
                 "hybrid": percentile(&mut query_samples[2], 0.95)
             },

@@ -1,34 +1,39 @@
 //! Async LanceDB operations executed on the worker thread.
 
-use super::filters::{column_in_filter, filter_to_sql, id_in_filter};
+use super::filters::{
+    column_in_filter, filter_to_sql, has_sparse_filter, id_in_filter, missing_sparse_filter,
+};
 use super::index::{compact_if_fragmented, maintain_index, maintain_scalar_indexes};
 use super::schema::{
-    batch_to_documents, batch_to_fts_hits, batch_to_hash_embeddings, batch_to_query_hits,
-    dedupe_documents, docs_to_batch, schema, string_col, updates_to_batch, validate_schema,
-    validate_vector,
+    batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse, batch_to_query_hits,
+    batch_to_scored_hits, batch_to_sparse_targets, dedupe_documents, docs_to_batch, schema,
+    score_sparse_batch, sparse_fields, sparse_rows_to_batch, string_col, updates_to_batch,
+    validate_schema, validate_vector,
 };
 use super::{
-    to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
+    to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, SPARSE_INDICES_COLUMN,
+    SPARSE_VALUES_COLUMN, TABLE_NAME, VECTOR_COLUMN,
 };
 use crate::error::{MinSyncError, Result};
+use crate::sparse::{SparseVector, TopK};
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
+use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget};
 use arrow_array::{RecordBatch, RecordBatchIterator};
+use arrow_schema::Schema;
 use futures::TryStreamExt;
-use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::NewColumnTransform;
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, Table};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub(super) struct LanceDbInner {
     conn: Connection,
     table: Table,
     dim: usize,
     indexing: IndexingConfig,
-    language: String,
 }
 
 impl LanceDbInner {
@@ -37,14 +42,13 @@ impl LanceDbInner {
     /// alongside a running sync.
     ///
     /// Read-only mode never writes: a missing table is [`MinSyncError::NeverSynced`]
-    /// instead of `create_empty_table`, and a pre-`lexical_text` table is an
-    /// error instead of an in-place `add_columns` migration. Both cases are
+    /// instead of `create_empty_table`, and a table from before sparse
+    /// retrieval is an error instead of an in-place migration. Both cases are
     /// resolved by running a sync, which holds the writer lock.
     pub(super) async fn open(
         uri: &str,
         dim: usize,
         indexing: IndexingConfig,
-        language: String,
         read_only: bool,
     ) -> Result<Self> {
         let conn = lancedb::connect(uri)
@@ -58,28 +62,14 @@ impl LanceDbInner {
                 .execute()
                 .await
                 .map_err(to_store_error)?;
-            if table
-                .schema()
-                .await
-                .map_err(to_store_error)?
-                .field_with_name("lexical_text")
-                .is_err()
-            {
+            if Self::needs_migration(&table).await? {
                 if read_only {
                     return Err(MinSyncError::VectorStore(
-                        "index predates lexical search — run `minsync sync` once to migrate".into(),
+                        "index predates sparse retrieval — run `minsync sync` once to migrate"
+                            .into(),
                     ));
                 }
-                table
-                    .add_columns(
-                        NewColumnTransform::SqlExpressions(vec![(
-                            "lexical_text".to_string(),
-                            "text".to_string(),
-                        )]),
-                        None,
-                    )
-                    .await
-                    .map_err(to_store_error)?;
+                Self::migrate(&table).await?;
             }
             validate_schema(&table.schema().await.map_err(to_store_error)?, dim)?;
             table
@@ -97,8 +87,56 @@ impl LanceDbInner {
             table,
             dim,
             indexing,
-            language,
         })
+    }
+
+    /// A table written by the BM25 era (it has `lexical_text`) or any table
+    /// without the sparse columns.
+    async fn needs_migration(table: &Table) -> Result<bool> {
+        let schema = table.schema().await.map_err(to_store_error)?;
+        Ok(schema.field_with_name("lexical_text").is_ok()
+            || sparse_fields()
+                .iter()
+                .any(|field| schema.field_with_name(field.name()).is_err()))
+    }
+
+    /// Turn a BM25-era table into a sparse-ready one in place: drop the FTS
+    /// index, add the sparse columns (all null, so every row reads as "not
+    /// encoded yet" and the next sync encodes them), then drop `lexical_text`.
+    /// Every step looks at the current state, so a run that was killed half
+    /// way picks up where it stopped. Dense vectors are never touched.
+    async fn migrate(table: &Table) -> Result<()> {
+        let indices = table.list_indices().await.map_err(to_store_error)?;
+        for index in indices
+            .iter()
+            .filter(|index| index.columns.iter().any(|column| column == "lexical_text"))
+        {
+            table
+                .drop_index(&index.name)
+                .await
+                .map_err(to_store_error)?;
+        }
+        let schema = table.schema().await.map_err(to_store_error)?;
+        let missing: Vec<_> = sparse_fields()
+            .into_iter()
+            .filter(|field| schema.field_with_name(field.name()).is_err())
+            .collect();
+        if !missing.is_empty() {
+            table
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
+                    None,
+                )
+                .await
+                .map_err(to_store_error)?;
+        }
+        if schema.field_with_name("lexical_text").is_ok() {
+            table
+                .drop_columns(&["lexical_text"])
+                .await
+                .map_err(to_store_error)?;
+        }
+        Ok(())
     }
 
     /// Replace-or-insert `docs` by `id` in ONE commit. (Was `delete` + `add`:
@@ -108,7 +146,7 @@ impl LanceDbInner {
             return Ok(());
         }
         let docs = dedupe_documents(docs);
-        let batch = docs_to_batch(&docs, self.dim, &self.language)?;
+        let batch = docs_to_batch(&docs, self.dim)?;
         self.merge_by_id(batch, true).await
     }
 
@@ -119,7 +157,7 @@ impl LanceDbInner {
             return Ok(());
         }
         let docs = dedupe_documents(docs);
-        let batch = docs_to_batch(&docs, self.dim, &self.language)?;
+        let batch = docs_to_batch(&docs, self.dim)?;
         self.table
             .add(batch)
             .execute()
@@ -323,26 +361,146 @@ impl LanceDbInner {
         Ok(hits)
     }
 
-    pub(super) async fn query_text(
+    /// Rows that hold no sparse vector from `model`, at most `limit`.
+    pub(super) async fn rows_missing_sparse(
         &self,
-        text: String,
+        model: String,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(missing_sparse_filter(&model))
+            .select(Select::columns(&["id", "path", "content_hash", "text"]))
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut targets = Vec::new();
+        for batch in &batches {
+            targets.extend(batch_to_sparse_targets(batch)?);
+        }
+        targets.truncate(limit);
+        Ok(targets)
+    }
+
+    pub(super) async fn count_missing_sparse(&self, model: String) -> Result<usize> {
+        self.table
+            .count_rows(Some(missing_sparse_filter(&model)))
+            .await
+            .map_err(to_store_error)
+    }
+
+    /// Fill the sparse columns of existing rows in ONE commit. Ids that are
+    /// not in the table are ignored, never inserted.
+    pub(super) async fn set_sparse(
+        &self,
+        model: String,
+        rows: Vec<(String, SparseVector)>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // merge_insert rejects several source rows for one target row.
+        let mut last: HashMap<&str, &(String, SparseVector)> = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            last.insert(row.0.as_str(), row);
+        }
+        let mut ordered: Vec<&(String, SparseVector)> = last.into_values().collect();
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
+        let batch = sparse_rows_to_batch(&model, &ordered)?;
+        self.merge_by_id(batch, false).await
+    }
+
+    /// Reads only `content_hash` and the sparse columns: no chunk text.
+    pub(super) async fn fetch_sparse_by_content_hash(
+        &self,
+        model: String,
+        hashes: Vec<String>,
+    ) -> Result<HashMap<String, SparseVector>> {
+        let mut found = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(found);
+        }
+        let predicate = format!(
+            "{} AND {}",
+            column_in_filter("content_hash", hashes.iter().map(String::as_str)),
+            has_sparse_filter(&model)
+        );
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(predicate)
+            .select(Select::columns(&[
+                "content_hash",
+                SPARSE_INDICES_COLUMN,
+                SPARSE_VALUES_COLUMN,
+            ]))
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        for batch in &batches {
+            for (hash, vector) in batch_to_hash_sparse(batch)? {
+                found.entry(hash).or_insert(vector);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Exact top-`topk` by inner product. The two sparse columns of every
+    /// matching row are streamed batch by batch into a bounded heap, so the
+    /// table is never materialized; only the winners' metadata is read after.
+    pub(super) async fn query_sparse(
+        &self,
+        model: String,
+        vector: SparseVector,
         filter: Option<Filter>,
         topk: usize,
     ) -> Result<Vec<QueryHit>> {
-        if topk == 0 {
+        if topk == 0 || vector.is_empty() {
             return Ok(Vec::new());
         }
-        let sql_filter = filter.as_ref().map(filter_to_sql).transpose()?;
-        let tokenized_text = crate::tokenizer::tokenize(&text, &self.language)?;
-        let mut query = self
+        let mut predicate = has_sparse_filter(&model);
+        if let Some(filter) = &filter {
+            predicate = format!("({}) AND {predicate}", filter_to_sql(filter)?);
+        }
+        let mut stream = self
             .table
             .query()
-            .full_text_search(
-                FullTextSearchQuery::new(tokenized_text)
-                    .with_column("lexical_text".to_string())
-                    .map_err(to_store_error)?,
-            )
-            .limit(topk)
+            .only_if(predicate)
+            .select(Select::columns(&[
+                "id",
+                SPARSE_INDICES_COLUMN,
+                SPARSE_VALUES_COLUMN,
+            ]))
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        let mut top = TopK::new(topk);
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            score_sparse_batch(&batch, &vector, &mut top)?;
+        }
+        let ranked = top.into_sorted();
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scored: HashMap<String, f32> = ranked
+            .iter()
+            .map(|(score, id)| (id.clone(), *score))
+            .collect();
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(id_in_filter(ranked.iter().map(|(_, id)| id.as_str())))
             .select(Select::columns(&[
                 "id",
                 "path",
@@ -350,31 +508,24 @@ impl LanceDbInner {
                 "chunk_type",
                 "text",
                 "content_hash",
-                "_score",
-            ]));
-        if let Some(sql) = sql_filter {
-            query = query.only_if(sql);
-        }
-        let batches: Vec<RecordBatch> = query
+            ]))
             .execute()
             .await
             .map_err(to_store_error)?
             .try_collect()
             .await
             .map_err(to_store_error)?;
-        let mut hits = Vec::new();
-        for batch in batches {
-            hits.extend(batch_to_fts_hits(&batch)?);
+        let mut by_id: HashMap<String, QueryHit> = HashMap::new();
+        for batch in &batches {
+            for hit in batch_to_scored_hits(batch, &scored)? {
+                by_id.insert(hit.doc_id.clone(), hit);
+            }
         }
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.doc_id.cmp(&right.doc_id))
-        });
-        hits.truncate(topk);
-        Ok(hits)
+        // A row replaced between the scan and this read simply drops out.
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(_, id)| by_id.remove(&id))
+            .collect())
     }
 
     pub(super) async fn flush(&self) -> Result<()> {
@@ -431,9 +582,6 @@ impl LanceDbInner {
 
     pub(super) async fn index_state(&self) -> Result<IndexState> {
         let indices = self.table.list_indices().await.map_err(to_store_error)?;
-        let fts_indexed = indices
-            .iter()
-            .any(|index| index.columns.iter().any(|column| column == "lexical_text"));
         let ann = indices
             .iter()
             .find(|index| index.columns.iter().any(|column| column == VECTOR_COLUMN));
@@ -447,7 +595,6 @@ impl LanceDbInner {
             None => None,
         };
         Ok(IndexState {
-            fts_indexed,
             ann_indexed: ann.is_some(),
             unindexed_rows,
         })

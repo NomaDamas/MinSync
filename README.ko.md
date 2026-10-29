@@ -41,15 +41,15 @@ cargo build --release
 
 MinSync는 기본적으로 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)를 프로세스 안에서 embedding합니다. API key, TEI 서버, Hugging Face 게이트가 필요 없습니다. 첫 `minsync sync`에서 모델을 로컬 캐시로 받습니다.
 
-모델 없이 BM25만 쓰려면 embedder, API 키, 모델 다운로드, 네트워크가 모두 필요 없는 `none` 모드를 사용하세요.
+dense 모델 없이 쓰려면 embedder, API 키, embedding 서버가 모두 필요 없는 sparse-only workspace를 만드세요(sparse encoder는 자체적으로 작은 모델을 씁니다. [Sparse 검색(SPLADE)](#sparse-검색splade) 참고).
 
 ```bash
 minsync init --embedder none
-minsync sync                          # chunk와 full-text 인덱스만 생성하며 임베딩은 하지 않음
-minsync query "정확한 단어"           # 이 workspace에서는 --mode 기본값이 bm25
+minsync sync                          # chunk와 sparse 벡터만 생성하며 dense 벡터는 계산하지 않음
+minsync query "정확한 단어"           # 이 workspace에서는 --mode 기본값이 sparse
 ```
 
-`--embedder none`은 chunk마다 1차원 placeholder 벡터를 저장하고(LanceDB 스키마에 벡터 컬럼이 필요) ANN 인덱스는 만들지 않습니다. `--mode vector`와 `--mode hybrid`는 `--mode bm25`를 안내하며 실패합니다. 나중에 벡터 검색을 추가하려면 `minsync init --force --embedder <id>` 후 다시 sync하세요.
+`--embedder none`은 chunk마다 1차원 placeholder dense 벡터를 저장하고(LanceDB 스키마에 벡터 컬럼이 필요) ANN 인덱스는 만들지 않으므로 dense `--mode vector`와 `--mode hybrid`는 사용할 수 없습니다. `minsync check`는 dense embedder probe는 건너뛰지만 sparse encoder는 계속 확인합니다. 나중에 dense 벡터 검색을 추가하려면 `minsync init --force --embedder <id>` 후 다시 sync하세요.
 
 OpenAI embedding을 사용할 경우:
 
@@ -65,7 +65,7 @@ minsync init                          # .minsync/ 초기화
 minsync sync                          # 변경된 파일을 증분 index
 minsync sync --full                   # 처음부터 다시 빌드
 minsync query "검색어" --mode vector --k 5
-minsync query "정확한 단어" --mode bm25 --k 5
+minsync query "정확한 단어" --mode sparse --k 5
 minsync query "검색어" --mode hybrid --k 5
 minsync watch                         # 초기 sync 후 파일 변경 감시 및 re-index
 minsync watch --watch-on-sync-error   # 초기 sync 오류 후에도 유지하며 재시도
@@ -74,18 +74,6 @@ minsync check                         # health check
 minsync verify --fix                  # consistency check 및 repair
 minsync optimize                      # store compact + re-index + prune
 ```
-
-초기화할 때 BM25 tokenizer preset을 선택할 수 있습니다.
-
-```bash
-minsync init --language ko
-```
-
-지원 값은 `simple`, `ko`, `ja`, `zh`, `ar`, `multilingual`입니다.
-한국어는 `kiwi-rs` Rust binding을 통한 Kiwi, 일본어는 사전이 내장된
-Lindera, 중국어는 `jieba-rs`, 아랍어는 Discrawl PR #180을 따른
-in-process light stemmer를 사용합니다.
-`[lexical].language`를 바꾸면 다음 sync에서 full rebuild가 수행됩니다.
 
 `minsync watch`는 filesystem event를 기다리기 전에 초기 sync를 수행합니다.
 기본값에서는 초기 embedding 또는 vector store 오류가 `minsync sync`와 같이
@@ -116,35 +104,29 @@ cargo test --test issue_41_benchmark -- --nocapture
 ```
 
 이 benchmark는 동일한 local corpus를 1x, 2x, 4x, 8x로 생성하고 full,
-변경 없음, 파일 변경 sync의 millisecond와 BM25, vector, hybrid 검색의
+변경 없음, 파일 변경 sync의 millisecond와 sparse, vector, hybrid 검색의
 p50/p95를 출력합니다. Query scaling과 LanceDB index maintenance를
 분리하기 위해 query 측정은 의도적으로 in-memory store를 사용하며, LanceDB의
-ANN/FTS threshold와 unindexed delta 동작은 live index test가 검증합니다.
+ANN threshold와 unindexed delta 동작은 live index test가 검증합니다.
 측정값은 관찰 결과이며 machine-specific latency SLO가 아닙니다.
 
-한국어 tokenizer에는 공식 Kiwi native library와 base model이 필요합니다.
-`KIWI_LIBRARY_PATH`는 `libkiwi`, `KIWI_MODEL_PATH`는 압축 해제한
-`models/cong/base`를 가리켜야 합니다. `kiwi-rs`(LGPL-2.1-or-later)는 정적으로
-링크되며, 고지와 수정본으로 다시 링크하는 방법은 `THIRD_PARTY_NOTICES.md`를 참고하세요.
-macOS/Linux에서는 `bash scripts/install-kiwi.sh`가 공식 자산을 내려받고
-필요한 환경변수를 출력합니다.
-Windows에서는 `powershell -ExecutionPolicy Bypass -File
-scripts/install-kiwi.ps1`를 실행한 뒤 출력된 경로를 환경변수로 설정합니다.
-Rust binding의 남은 `kiwi_config_t` ABI 차이가 upstream에서 해결될 때까지
-Windows CI는 공식 Kiwi 0.22.2 자산을 사용합니다.
+Sparse encoding은 `.minsync/config.toml`의 `[sparse]`에서 설정합니다. provider,
+config key, BM25 시절 index에서의 업그레이드 경로는
+[Sparse 검색(SPLADE)](#sparse-검색splade)를 참고하세요.
 
 ## 동작 방식
 
-MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일의 변경 여부를 판단합니다. 변경된 파일은 한 번만 chunk로 나누며, 같은 stable chunk ID를 LanceDB의 vector 검색과 BM25 검색이 공유합니다. stale row는 mark-and-sweep으로 제거됩니다. vector 모드는 query를 embedding하고, BM25 모드는 embedding 요청 없이 LanceDB full-text search를 사용하며, hybrid 모드는 두 순위를 결정적인 RRF(`k=60`)로 결합합니다.
+MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일의 변경 여부를 판단합니다. 변경된 파일은 한 번만 chunk로 나누며, 같은 stable chunk ID를 LanceDB의 dense 검색과 sparse 검색이 공유합니다. stale row는 mark-and-sweep으로 제거됩니다. vector 모드는 query를 dense embedding하고, sparse 모드는 sparse encoder로 query를 인코딩해 chunk의 sparse term weight와의 inner product로 순위를 매기며, hybrid 모드는 두 순위를 결정적인 RRF(`k=60`)로 결합합니다.
 
-선택한 analyzer가 문서와 query를 같은 방식으로 `lexical_text`로 변환한
-뒤 LanceDB BM25 index에서 검색합니다.
+sparse term weight는 같은 LanceDB table에 nullable list column(`sparse_indices`,
+`sparse_values`)과 `sparse_model` tag column으로 저장되며, sparse 검색은 이
+column들을 훑는 exact top-k inner-product scan입니다.
 
 상태는 `.minsync/`에 저장됩니다.
 
 | 파일 | 목적 |
 |---|---|
-| `config.toml` | collection, chunker, embedder, vector store, normalization 설정 |
+| `config.toml` | collection, chunker, embedder, sparse encoder, vector store, normalization 설정 |
 | `manifest.json` | 마지막으로 확인한 파일 metadata와 content hash |
 | `cursor.json` | 마지막으로 완료된 processing point |
 | `txn.json` | 진행 중 transaction marker |
@@ -251,6 +233,78 @@ compact_fragment_threshold = 64
 
 `minsync optimize`는 compact + re-index + prune만 수행합니다(embedding, 파일 읽기 없음). 중단된 sync 때문에 조각난 store를 복구할 때 사용하세요.
 
+## Sparse 검색(SPLADE)
+
+MinSync는 [KURE-Sparse-nano](https://huggingface.co/nlpai-lab/KURE-Sparse-nano)
+(Apache-2.0, 0.1B 파라미터)로 learned-sparse 검색을 지원합니다. term-frequency
+index가 아니라 실제 encoder입니다. 문서와 query를 모델에 통과시켜 weighted term
+vector를 만들고, chunk의 sparse term weight와의 inner product로 순위를 매깁니다.
+
+`--mode`로 선택합니다.
+
+| 모드 | 동작 |
+|---|---|
+| `vector` (기본값) | dense query embedding, ANN/HNSW 검색 |
+| `sparse` | sparse query encoding, exact top-k inner-product scan |
+| `hybrid` | dense와 sparse 순위를 결정적 RRF(`k=60`)로 융합 |
+
+JSON 결과에서 sparse 순위를 나타내는 필드는 `sparse_rank`입니다.
+
+Sparse encoding은 `.minsync/config.toml`의 `[sparse]`에서 설정합니다. 기본값:
+
+```toml
+[sparse]
+id = "native:nlpai-lab/KURE-Sparse-nano"
+batch_size = 64
+max_retries = 3
+timeout_seconds = 60
+query_prefix = "[Q] "
+passage_prefix = "[D] "
+device = "auto"                      # auto | cpu | metal | cuda (native 전용)
+dtype = "auto"                       # 모든 장치에서 f32로 결정됨 (native 전용)
+max_length = 2048
+
+# 선택 사항이며 기본값은 설정되지 않음:
+# per_batch_timeout_seconds = 120      # native 전용; 기본은 timeout_seconds(CPU에서는 최소 900)
+# max_batch_tokens = 8192             # native 전용
+# model_cache_dir = "~/.cache/minsync/models"
+# base_url = "http://localhost:8081"  # tei: 전용
+```
+
+Provider:
+
+- `native:`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(약 100 MB)를 model cache로 받습니다.
+- `tei:`는 Text Embeddings Inference 서버의 `POST /embed_sparse`를 호출하며 `base_url`이 그 서버를 가리킵니다.
+- `native:`는 실행 중인 `minsync serve --sparse`를 자동으로 채택합니다(discovery 규칙은 dense embedder와 같으며 `MINSYNC_SERVER=off`로 끕니다). `minsync serve --sparse`는 TEI 호환 `POST /embed_sparse`와 `GET /health`(kind `sparse`)를 제공합니다.
+
+Query-time encoding은 같은 모델을 query에 `query_prefix`와 함께 실행합니다.
+inference-free query 모드는 없습니다. `minsync init`에는 `--language` flag가
+없고 `[lexical]` config table도 없습니다. `[lexical]`이 남아 있는 예전
+`config.toml`은 조용히 무시됩니다.
+
+`minsync sync`는 실행 끝의 catch-up 단계에서 sparse 벡터를 인코딩합니다. content
+hash로 중복을 제거하며 재개할 수 있고 dense 단계와 독립적입니다. 모델 id는
+`.minsync/cursor.json`에 `sparse_id`로 기록되며, 저장된 모든 chunk가 그 모델의
+벡터를 가진 경우에만 기록됩니다. 마지막 sync가 `sparse_id`를 비워 두었거나 다른
+모델로 남겼다면(`[sparse].id` 변경, 일부 chunk가 인코딩되지 않은 sparse 실패,
+encoder 없이 실행되어 chunk를 추가한 sync) sparse 또는 hybrid query는
+`minsync sync`를 실행하라는 메시지와 함께 실패합니다. vector query는 영향을
+받지 않습니다. encoder가 chunk를 거부한 파일은 stage `sparse`로 보고되고 다음
+sync에서 재시도됩니다.
+
+`minsync check`는 sparse encoder도 probe해 `sparse_ok`를 보고합니다. library는
+`MinSync::with_sparse_encoder(Arc<dyn SparseEncoder>)`를 제공하며, 이것이 없으면
+sync는 dense-only로 sparse 단계를 수행하지 않습니다.
+
+### BM25 시절 index에서 업그레이드
+
+업그레이드 후 첫 `minsync sync`가 이전 full-text(FTS) index와 `lexical_text`
+column을 자동으로 제거하고 sparse column을 추가하며, 기존 모든 chunk의 sparse
+벡터를 인코딩합니다. dense 벡터는 건드리지 않고 다시 계산하지 않으며 `--full`도
+필요 없습니다. 마이그레이션되지 않은 index에서 read-only `minsync query`를
+실행하면 `minsync sync`를 한 번 실행해 마이그레이션하라는 메시지와 함께
+실패합니다.
+
 ## 건너뛴 파일
 
 기본 설정에서는 파일 하나가 실패해도 sync 전체가 중단되지 않습니다. read, chunk, token 수 계산, embed 단계에서 실패한 파일(EACCES, EBUSY, EIO, parser 오류, embedder의 입력 거부 등)은 건너뛰고 기록합니다. batch commit이 실패하면 그 batch를 파일 단위로 다시 시도해 원인 파일만 건너뜁니다. 건너뛴 파일은 완료로 기록되지 않습니다. 새 파일은 저장되는 manifest에서 빠지고, 이전에 색인된 파일은 이전 manifest 항목을 유지하므로 다음 `minsync sync`가 자동으로 다시 시도하며, 성공할 때까지 기존 chunk가 (full sync 중에도) 검색됩니다.
@@ -262,7 +316,7 @@ compact_fragment_threshold = 64
 "partial": true
 ```
 
-`stage`는 `read`, `chunk`, `truncate`, `embed`, `store` 중 하나입니다. `partial`이 true이면 CLI는 종료 코드 **6**(완료, 일부 파일 건너뜀)으로 끝나고, text 출력은 건너뛴 경로를 stderr에 나열합니다. 하드 실패의 종료 코드(1, 3, 4, 5)는 그대로입니다. 아직 아무것도 색인하지 못한 실행에서 처음 몇 개 파일이 embed/store 단계에서 연속 실패하면(예: embedder 중단) 파일 문제가 아니라 장애로 보고, 파일 경로가 포함된 오류(종료 코드 5/4)로 sync를 중단합니다.
+`stage`는 `read`, `chunk`, `truncate`, `embed`, `store`, `sparse`(sparse encoder가 파일의 chunk를 거부함; dense row는 그대로 색인됨) 중 하나입니다. `partial`이 true이면 CLI는 종료 코드 **6**(완료, 일부 파일 건너뜀)으로 끝나고, text 출력은 건너뛴 경로를 stderr에 나열합니다. 하드 실패의 종료 코드(1, 3, 4, 5)는 그대로입니다. 아직 아무것도 색인하지 못한 실행에서 처음 몇 개 파일이 embed/store 단계에서 연속 실패하면(예: embedder 중단) 파일 문제가 아니라 장애로 보고, 파일 경로가 포함된 오류(종료 코드 5/4)로 sync를 중단합니다.
 
 ```toml
 [sync]
@@ -298,7 +352,7 @@ host는 출력을 최종 경로 옆에 쓴 뒤 rename하고 `commit`을 보냅�
 
 ## Embedding 안정성
 
-Embedding request는 per-request timeout과 transient failure retry를 사용합니다. Retry 대상은 network error, timeout, HTTP 429, HTTP 5xx입니다. Invalid auth, malformed response, validation error 같은 permanent failure는 즉시 실패합니다. 실패하거나 강제 종료된 sync는 cursor나 manifest를 전진시키지 않지만 resume log(`progress.jsonl`)를 남깁니다. 다음 `minsync sync`는 중단된 실행이 이미 commit한 파일을 건너뛰고 이어서 처리합니다. 그 사이 파일, chunker, normalizer, embedder, lexical language가 바뀌면 log는 폐기됩니다.
+Embedding request는 per-request timeout과 transient failure retry를 사용합니다. Retry 대상은 network error, timeout, HTTP 429, HTTP 5xx입니다. Invalid auth, malformed response, validation error 같은 permanent failure는 즉시 실패합니다. 실패하거나 강제 종료된 sync는 cursor나 manifest를 전진시키지 않지만 resume log(`progress.jsonl`)를 남깁니다. 다음 `minsync sync`는 중단된 실행이 이미 commit한 파일을 건너뛰고 이어서 처리합니다. 그 사이 파일, chunker, normalizer, embedder, sparse model이 바뀌면 log는 폐기됩니다.
 
 ```toml
 [embedder]

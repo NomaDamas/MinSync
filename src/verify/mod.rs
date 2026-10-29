@@ -239,13 +239,42 @@ mod tests {
             self.inner.query(vector, filter, topk)
         }
 
-        fn query_text(
+        fn rows_missing_sparse(
             &self,
-            text: &str,
+            model: &str,
+            limit: usize,
+        ) -> Result<Vec<crate::vectorstore::SparseTarget>> {
+            self.inner.rows_missing_sparse(model, limit)
+        }
+
+        fn count_missing_sparse(&self, model: &str) -> Result<usize> {
+            self.inner.count_missing_sparse(model)
+        }
+
+        fn set_sparse(
+            &mut self,
+            model: &str,
+            rows: &[(String, crate::sparse::SparseVector)],
+        ) -> Result<()> {
+            self.inner.set_sparse(model, rows)
+        }
+
+        fn fetch_sparse_by_content_hash(
+            &self,
+            model: &str,
+            hashes: &[String],
+        ) -> Result<HashMap<String, crate::sparse::SparseVector>> {
+            self.inner.fetch_sparse_by_content_hash(model, hashes)
+        }
+
+        fn query_sparse(
+            &self,
+            model: &str,
+            vector: &crate::sparse::SparseVector,
             filter: Option<&Filter>,
             topk: usize,
         ) -> Result<Vec<QueryHit>> {
-            self.inner.query_text(text, filter, topk)
+            self.inner.query_sparse(model, vector, filter, topk)
         }
 
         fn flush(&mut self) -> Result<()> {
@@ -386,7 +415,7 @@ mod tests {
         sync.init(false, "openai:text-embedding-3-small", "recursive")
             .expect("init succeeds");
 
-        let result = check(&dir.path().join(".minsync"), &embedder, &store)
+        let result = check(&dir.path().join(".minsync"), &embedder, None, &store)
             .await
             .expect("check succeeds");
 
@@ -396,30 +425,77 @@ mod tests {
         assert!(result.errors.is_empty());
     }
 
-    struct LexicalOnly;
+    struct ProbeSparse(Result<()>);
 
     #[async_trait::async_trait]
-    impl Embedder for LexicalOnly {
+    impl crate::sparse::SparseEncoder for ProbeSparse {
         fn id(&self) -> &str {
-            "none"
+            "probe/sparse"
         }
-
-        fn is_lexical_only(&self) -> bool {
-            true
+        async fn encode(&self, texts: &[String]) -> Result<Vec<crate::sparse::SparseVector>> {
+            Ok(texts.iter().map(|_| Default::default()).collect())
         }
-
-        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            panic!("check must not probe a lexical-only embedder");
+        async fn encode_query(&self, _text: &str) -> Result<crate::sparse::SparseVector> {
+            match &self.0 {
+                Ok(()) => Ok(Default::default()),
+                Err(error) => Err(MinSyncError::Embedding(error.to_string())),
+            }
         }
     }
 
     #[tokio::test]
-    async fn test_check_lexical_only_skips_embedder_probe() {
+    async fn test_check_probes_the_sparse_encoder() {
+        let (dir, sync, _chunker, embedder, store) = fixture();
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+        let minsync_dir = dir.path().join(".minsync");
+
+        let healthy = ProbeSparse(Ok(()));
+        let ok = check(&minsync_dir, &embedder, Some(&healthy), &store)
+            .await
+            .expect("check succeeds");
+        assert!(ok.sparse_ok && ok.all_passed, "{:?}", ok.errors);
+
+        let broken = ProbeSparse(Err(MinSyncError::Embedding("model gone".into())));
+        let bad = check(&minsync_dir, &embedder, Some(&broken), &store)
+            .await
+            .expect("check reports instead of failing");
+        assert!(!bad.sparse_ok);
+        assert!(bad.embedder_ok, "the dense probe is independent");
+        assert!(!bad.all_passed);
+        assert!(
+            bad.errors
+                .iter()
+                .any(|e| e.contains("sparse encoder") && e.contains("model gone")),
+            "{:?}",
+            bad.errors
+        );
+    }
+
+    struct SparseOnly;
+
+    #[async_trait::async_trait]
+    impl Embedder for SparseOnly {
+        fn id(&self) -> &str {
+            "none"
+        }
+
+        fn is_sparse_only(&self) -> bool {
+            true
+        }
+
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("check must not probe a sparse-only embedder");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_sparse_only_skips_embedder_probe() {
         let (dir, sync, _chunker, _embedder, store) = fixture();
         sync.init(false, "none", "recursive")
             .expect("init succeeds");
 
-        let result = check(&dir.path().join(".minsync"), &LexicalOnly, &store)
+        let result = check(&dir.path().join(".minsync"), &SparseOnly, None, &store)
             .await
             .expect("check succeeds");
 
@@ -428,7 +504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_lexical_only_placeholder_vectors_are_not_flagged() {
+    async fn test_verify_sparse_only_placeholder_vectors_are_not_flagged() {
         let (dir, sync, chunker, _embedder, mut store) = fixture();
         std::fs::write(
             dir.path().join("a.txt"),
@@ -442,7 +518,7 @@ mod tests {
         .expect("write b");
         sync.init(false, "none", "recursive")
             .expect("init succeeds");
-        sync.sync(&chunker, &LexicalOnly, &mut store, true, false, false)
+        sync.sync(&chunker, &SparseOnly, &mut store, true, false, false)
             .await
             .expect("sync succeeds");
 
@@ -553,12 +629,10 @@ mod tests {
             .expect("upsert stale doc");
 
         let before_repair = crate::types::IndexState {
-            fts_indexed: true,
             ann_indexed: true,
             unindexed_rows: Some(1),
         };
         let after_repair = crate::types::IndexState {
-            fts_indexed: true,
             ann_indexed: true,
             unindexed_rows: Some(0),
         };

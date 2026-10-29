@@ -3,7 +3,6 @@
 use super::{to_store_error, DISTANCE_TYPE, VECTOR_COLUMN};
 use crate::error::{MinSyncError, Result};
 use lancedb::index::scalar::BTreeIndexBuilder;
-use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::vector::IvfHnswSqIndexBuilder;
 use lancedb::index::Index;
 use lancedb::table::{CompactionOptions, OptimizeAction, OptimizeOptions};
@@ -45,7 +44,7 @@ pub struct IndexingConfig {
     /// sync (and so how slow a killed-and-restarted sync is to reopen).
     pub compact_fragment_threshold: usize,
     /// Build and maintain the ANN index over the vector column. Off for
-    /// BM25-only stores, whose vectors are placeholders: an HNSW build over
+    /// sparse-only stores, whose vectors are placeholders: an HNSW build over
     /// identical zero vectors is meaningless and can fail.
     pub build_ann_index: bool,
 }
@@ -176,24 +175,6 @@ pub(super) async fn compact_if_fragmented(table: &Table, threshold: usize) -> Re
 /// (no k-means retrain) once the delta grows large enough to hurt latency.
 pub(super) async fn maintain_index(table: &Table, indexing: &IndexingConfig) -> Result<()> {
     let indices = table.list_indices().await.map_err(to_store_error)?;
-    if !indices
-        .iter()
-        .any(|index| index.columns.iter().any(|column| column == "lexical_text"))
-    {
-        table
-            .create_index(
-                &["lexical_text"],
-                Index::FTS(
-                    FtsIndexBuilder::default()
-                        .stem(false)
-                        .remove_stop_words(false)
-                        .ascii_folding(false),
-                ),
-            )
-            .execute()
-            .await
-            .map_err(to_store_error)?;
-    }
 
     if !indexing.build_ann_index {
         return Ok(());

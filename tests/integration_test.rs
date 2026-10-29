@@ -19,7 +19,7 @@ use minsync::watch::{
     run_with_shutdown, should_index, WatchControl, WatchStartup, WatchStartupStatus,
 };
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use tempfile::TempDir;
@@ -111,6 +111,7 @@ async fn test_watch_real_filesystem_add_modify_delete() {
             &mut store,
             Some(25),
             WatchControl {
+                sparse: None,
                 startup: WatchStartup::FailFast,
                 progress: Some(progress_tx),
                 startup_status: None,
@@ -169,6 +170,7 @@ async fn test_watch_resilient_startup_reports_failure_and_retries() {
             &mut store,
             Some(25),
             WatchControl {
+                sparse: None,
                 startup: WatchStartup::ContinueOnSyncError,
                 progress: Some(progress_tx),
                 startup_status: Some(status_tx),
@@ -237,6 +239,7 @@ async fn test_full_workflow() {
         "alpha beta",
         5,
         &embedder,
+        None,
         &store,
         None,
         QueryMode::Vector,
@@ -607,6 +610,7 @@ async fn test_init_then_plain_sync_is_queryable() {
         "alpha beta",
         3,
         &embedder,
+        None,
         &store,
         None,
         QueryMode::Vector,
@@ -861,6 +865,7 @@ async fn test_recursive_chunker_end_to_end() {
         "apples",
         5,
         &embedder,
+        None,
         &store,
         None,
         QueryMode::Vector,
@@ -899,19 +904,12 @@ async fn test_lancedb_backend_end_to_end() {
     assert!(result.chunks_added > 0);
     assert!(store.doc_count() > 0);
 
-    let bm25_hits = store
-        .query_text("apples", None, 5)
-        .expect("lancedb BM25 query succeeds");
-    assert!(
-        bm25_hits.iter().any(|hit| hit.text.contains("apples")),
-        "BM25 must retrieve the shared normalized chunk text"
-    );
-
     let query_results = query(
         &dir.path().join(".minsync"),
         "apples",
         5,
         &embedder,
+        None,
         &store,
         None,
         QueryMode::Vector,
@@ -937,11 +935,51 @@ async fn test_lancedb_backend_end_to_end() {
     assert!(store.doc_count() > 0);
 }
 
+/// Encodes a chunk as the set of its words, each word being one term:
+/// enough structure to check ranking, incremental updates and deletion
+/// against the real LanceDB store without loading a model.
+struct WordSparse;
+
+fn word_term(word: &str) -> u32 {
+    word.chars()
+        .fold(7u32, |acc, c| acc.wrapping_mul(31).wrapping_add(c as u32))
+        % 1_000_003
+        + 1
+}
+
+fn word_vector(text: &str) -> minsync::sparse::SparseVector {
+    minsync::sparse::SparseVector::from_pairs(
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| (word_term(w), 1.0)),
+    )
+}
+
+#[async_trait::async_trait]
+impl minsync::sparse::SparseEncoder for WordSparse {
+    fn id(&self) -> &str {
+        "test/word-sparse"
+    }
+    async fn encode(
+        &self,
+        texts: &[String],
+    ) -> minsync::error::Result<Vec<minsync::sparse::SparseVector>> {
+        Ok(texts.iter().map(|t| word_vector(t)).collect())
+    }
+    async fn encode_query(
+        &self,
+        text: &str,
+    ) -> minsync::error::Result<minsync::sparse::SparseVector> {
+        Ok(word_vector(text))
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lancedb_bm25_incremental_delete_and_korean_e2e() {
+async fn test_lancedb_sparse_incremental_delete_and_korean_e2e() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let store_dir = tempfile::tempdir().expect("create store tempdir");
-    let sync = MinSync::new(dir.path().to_path_buf());
+    let encoder = Arc::new(WordSparse);
+    let sync = MinSync::new(dir.path().to_path_buf()).with_sparse_encoder(encoder.clone());
     let chunker = RecursiveChunker::new(128);
     let embedder = MockEmbedder;
     let mut store =
@@ -955,14 +993,25 @@ async fn test_lancedb_bm25_incremental_delete_and_korean_e2e() {
     write_file(&dir, "other.md", "unrelated lexical content");
     sync.init(false, "openai:text-embedding-3-small", "recursive")
         .expect("init succeeds");
-    sync.sync(&chunker, &embedder, &mut store, true, false, false)
+    let first_sync = sync
+        .sync(&chunker, &embedder, &mut store, true, false, false)
         .await
         .expect("initial live sync succeeds");
+    assert!(first_sync.sparse_encoded > 0);
 
-    let first = store
-        .query_text("환불 정책", None, 5)
-        .expect("Korean BM25 query succeeds");
+    let search = |text: &str| {
+        store
+            .query_sparse(
+                minsync::sparse::SparseEncoder::id(&*encoder),
+                &word_vector(text),
+                None,
+                5,
+            )
+            .expect("sparse query succeeds")
+    };
+    let first = search("환불 정책");
     assert_eq!(first.len(), 1);
+    assert_eq!(first[0].path, "korean.md");
     let stable_id = first[0].doc_id.clone();
 
     write_file(
@@ -974,11 +1023,11 @@ async fn test_lancedb_bm25_incremental_delete_and_korean_e2e() {
         .await
         .expect("incremental live sync succeeds");
     let modified = store
-        .query_text("교환 조건", None, 5)
-        .expect("updated BM25 query succeeds");
+        .query_sparse("test/word-sparse", &word_vector("교환 조건"), None, 5)
+        .expect("updated sparse query succeeds");
     assert!(
         modified.iter().any(|hit| hit.text.contains("교환 조건")),
-        "modified shared chunk must be searchable"
+        "a modified chunk must be searchable by its new words"
     );
 
     std::fs::remove_file(dir.path().join("korean.md")).expect("delete source");
@@ -986,51 +1035,12 @@ async fn test_lancedb_bm25_incremental_delete_and_korean_e2e() {
         .await
         .expect("delete live sync succeeds");
     let deleted = store
-        .query_text("환불 정책", None, 5)
-        .expect("post-delete BM25 query succeeds");
+        .query_sparse("test/word-sparse", &word_vector("환불 정책"), None, 5)
+        .expect("post-delete sparse query succeeds");
     assert!(
         deleted.iter().all(|hit| hit.doc_id != stable_id),
-        "stale deleted chunk must leave lexical results"
+        "a deleted chunk must leave sparse results"
     );
-}
-
-#[test]
-fn test_lancedb_language_specific_tokenizers_live_e2e() {
-    let cases = [
-        ("ko", "오늘저녁먹음", "저녁"),
-        ("ja", "関西国際空港限定トートバッグ", "空港"),
-        ("zh", "我们中出了一个叛徒", "叛徒"),
-        ("ar", "والكتاب في المدرسة", "كتاب"),
-    ];
-    for (language, content, query_text) in cases {
-        let store_dir = tempfile::tempdir().expect("create store tempdir");
-        let mut store =
-            LanceDbStore::open_with_language(store_dir.path(), 8, Default::default(), language)
-                .expect("create language-aware LanceDB store");
-        store
-            .upsert(&[minsync::vectorstore::Document {
-                id: format!("{language}-doc"),
-                embedding: vec![1.0; 8],
-                text: content.to_string(),
-                source_id: "source".to_string(),
-                path: format!("{language}.txt"),
-                chunk_schema_id: "schema".to_string(),
-                chunk_type: "text".to_string(),
-                heading_path: String::new(),
-                content_hash: "hash".to_string(),
-                seen_token: "token".to_string(),
-            }])
-            .expect("upsert multilingual document");
-        store.flush().expect("build language-aware BM25 index");
-        let hits = store
-            .query_text(query_text, None, 3)
-            .expect("query language-aware BM25 index");
-        assert_eq!(
-            hits.first().map(|hit| hit.doc_id.as_str()),
-            Some(format!("{language}-doc").as_str()),
-            "{language} query did not match: {hits:?}"
-        );
-    }
 }
 
 #[test]
@@ -1255,85 +1265,87 @@ async fn test_sync_embedding_failure_keeps_cursor_and_manifest_unchanged() {
 }
 
 #[tokio::test]
-async fn test_lexical_rebuild_retries_files_that_fail_indexing() {
-    struct SelectiveEmbedder {
-        fail_retry_target: Arc<AtomicBool>,
+async fn test_a_sparse_failure_keeps_the_dense_index_and_is_retried() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FlakySparse {
+        reject: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
-    impl Embedder for SelectiveEmbedder {
+    impl minsync::sparse::SparseEncoder for FlakySparse {
         fn id(&self) -> &str {
-            "selective-mock"
+            "test/flaky-sparse"
         }
-
-        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            if self.fail_retry_target.load(Ordering::SeqCst)
-                && texts.iter().any(|text| text.contains("retrytarget"))
+        async fn encode(
+            &self,
+            texts: &[String],
+        ) -> minsync::error::Result<Vec<minsync::sparse::SparseVector>> {
+            if self.reject.load(Ordering::SeqCst) && texts.iter().any(|t| t.contains("retrytarget"))
             {
                 return Err(MinSyncError::Embedding(
-                    "selected file temporarily unavailable".to_string(),
+                    "selected file temporarily unavailable".into(),
                 ));
             }
-            Ok(texts.iter().map(|_| vec![0.0; 8]).collect())
+            Ok(texts.iter().map(|t| word_vector(t)).collect())
+        }
+        async fn encode_query(
+            &self,
+            text: &str,
+        ) -> minsync::error::Result<minsync::sparse::SparseVector> {
+            Ok(word_vector(text))
         }
     }
 
     let dir = tempfile::tempdir().expect("create tempdir");
-    let sync = MinSync::new(dir.path().to_path_buf());
+    let reject = Arc::new(AtomicBool::new(true));
+    let sync = MinSync::new(dir.path().to_path_buf()).with_sparse_encoder(Arc::new(FlakySparse {
+        reject: reject.clone(),
+    }));
     let chunker = RecursiveChunker::new(256);
-    let fail_retry_target = Arc::new(AtomicBool::new(false));
-    let embedder = SelectiveEmbedder {
-        fail_retry_target: fail_retry_target.clone(),
-    };
     let mut store = InMemoryStore::new();
 
     write_file(&dir, "a-good.md", "good document content");
     write_file(&dir, "z-retry.md", "retrytarget document content");
     sync.init(false, "tei:test-model", "recursive")
         .expect("init succeeds");
-    sync.sync(&chunker, &embedder, &mut store, true, false, false)
+
+    let failed = sync
+        .sync(&chunker, &MockEmbedder, &mut store, true, false, false)
         .await
-        .expect("initial sync succeeds");
-    assert_eq!(store.doc_count(), 2);
+        .expect("a sparse failure is a partial sync, not an error");
 
-    let config_path = dir.path().join(".minsync/config.toml");
-    let mut config = Config::load(&config_path).expect("load config");
-    assert_eq!(config.lexical.language, "simple");
-    config.lexical.language = "ko".to_string();
-    config.save(&config_path).expect("save changed language");
-
-    fail_retry_target.store(true, Ordering::SeqCst);
-    let failed_rebuild = sync
-        .sync(&chunker, &embedder, &mut store, false, false, false)
-        .await
-        .expect("file-level failure is recorded as a partial sync");
-
-    assert!(failed_rebuild.partial);
+    assert!(failed.partial);
     assert_eq!(
-        failed_rebuild
+        failed
             .files_failed
             .iter()
-            .map(|failure| failure.path.as_str())
+            .map(|f| f.path.as_str())
             .collect::<Vec<_>>(),
         vec!["z-retry.md"]
     );
-    assert_eq!(store.doc_count(), 1, "failed file was removed by the sweep");
+    assert_eq!(store.doc_count(), 2, "dense rows of the failed file stay");
     let cursor = minsync::state::Cursor::load(&dir.path().join(".minsync/cursor.json"))
-        .expect("load cursor after partial rebuild");
+        .expect("load cursor after partial sync");
     assert_eq!(
-        cursor.lexical_language, "simple",
-        "failed indexing must keep the old lexical cursor so the rebuild retries"
+        cursor.sparse_id, None,
+        "sparse search stays refused until healed"
     );
 
-    fail_retry_target.store(false, Ordering::SeqCst);
-    sync.sync(&chunker, &embedder, &mut store, false, false, false)
+    reject.store(false, Ordering::SeqCst);
+    let healed = sync
+        .sync(&chunker, &MockEmbedder, &mut store, false, false, false)
         .await
-        .expect("healed lexical rebuild succeeds");
+        .expect("healed sync succeeds");
 
-    assert_eq!(store.doc_count(), 2, "healed retry restores both files");
+    assert!(!healed.partial, "{:?}", healed.files_failed);
+    assert_eq!(
+        healed.sparse_encoded, 1,
+        "only the leftover chunk is encoded"
+    );
     let cursor = minsync::state::Cursor::load(&dir.path().join(".minsync/cursor.json"))
-        .expect("load cursor after healed rebuild");
-    assert_eq!(cursor.lexical_language, "ko");
+        .expect("load cursor after healed sync");
+    assert_eq!(cursor.sparse_id.as_deref(), Some("test/flaky-sparse"));
 }
 
 #[tokio::test]
@@ -1387,6 +1399,7 @@ async fn test_tei_full_sync_and_query_pipeline() {
         "hello",
         1,
         &embedder,
+        None,
         &store,
         None,
         QueryMode::Vector,

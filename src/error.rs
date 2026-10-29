@@ -17,6 +17,11 @@ pub enum MinSyncError {
     #[error("never synced — run `minsync sync --full` first")]
     NeverSynced,
 
+    /// A sparse or hybrid query against an index whose rows were not all
+    /// encoded by the configured sparse model.
+    #[error("sparse index is not ready: {0} — run `minsync sync`")]
+    SparseNotReady(String),
+
     #[error("query text is required")]
     EmptyQuery,
 

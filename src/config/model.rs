@@ -11,8 +11,6 @@ pub struct Config {
     pub embedder: EmbedderConfig,
     pub vectorstore: VectorStoreConfig,
     #[serde(default)]
-    pub lexical: LexicalConfig,
-    #[serde(default)]
     pub sparse: SparseConfig,
     #[serde(default)]
     pub normalize: NormalizeConfig,
@@ -83,24 +81,6 @@ impl Default for SyncConfig {
             batch_files: DEFAULT_BATCH_FILES,
             on_file_error: OnFileError::default(),
             max_file_bytes: default_max_file_bytes(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LexicalConfig {
-    #[serde(default = "default_lexical_language")]
-    pub language: String,
-}
-
-fn default_lexical_language() -> String {
-    "simple".to_string()
-}
-
-impl Default for LexicalConfig {
-    fn default() -> Self {
-        Self {
-            language: default_lexical_language(),
         }
     }
 }
@@ -309,15 +289,16 @@ fn default_timeout_seconds() -> u64 {
 /// works with no API key, TEI server, or Hugging Face gate.
 pub const DEFAULT_EMBEDDER_ID: &str = "native:Qwen/Qwen3-Embedding-0.6B";
 
-/// Reserved embedder id for BM25-only workspaces: no model, no API key, no
-/// ANN index. `sync` writes chunks with a placeholder vector and queries
-/// default to `--mode bm25`; `vector` and `hybrid` queries are rejected.
+/// Reserved embedder id for sparse-only workspaces: no dense model, no API
+/// key, no ANN index. `sync` writes chunks with a placeholder vector and
+/// queries default to `--mode sparse`; `vector` and `hybrid` queries are
+/// rejected.
 pub const NONE_EMBEDDER_ID: &str = "none";
 
 /// Width of the placeholder vector stored for each chunk when the embedder
 /// is [`NONE_EMBEDDER_ID`]. The LanceDB schema requires a vector column; a
 /// single float is the smallest valid one.
-pub const LEXICAL_ONLY_DIMENSION: usize = 1;
+pub const SPARSE_ONLY_DIMENSION: usize = 1;
 
 /// Local TEI EmbeddingGemma id. `minsync init --embedder` of this value
 /// still writes the Gemma retrieval prefixes and dimension 768.
@@ -334,7 +315,7 @@ pub const EMBEDDINGGEMMA_PASSAGE_PREFIX: &str = "title: none | text: ";
 /// manually for those.
 pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
     match embedder_id {
-        NONE_EMBEDDER_ID => Some(LEXICAL_ONLY_DIMENSION),
+        NONE_EMBEDDER_ID => Some(SPARSE_ONLY_DIMENSION),
         "native:Qwen/Qwen3-Embedding-0.6B" => Some(1024),
         "tei:google/embeddinggemma-300m" => Some(768),
         "openai:text-embedding-3-small" | "openai:text-embedding-ada-002" => Some(1536),
@@ -392,9 +373,9 @@ impl Default for NormalizeConfig {
 }
 
 impl Config {
-    /// True when this workspace indexes and searches with BM25 only
-    /// (`embedder.id = "none"`).
-    pub fn is_lexical_only(&self) -> bool {
+    /// True when this workspace has no dense embedder (`embedder.id =
+    /// "none"`): it indexes and searches with the sparse encoder only.
+    pub fn is_sparse_only(&self) -> bool {
         self.embedder.id == NONE_EMBEDDER_ID
     }
 
@@ -434,7 +415,6 @@ impl Config {
                 id: "lancedb".to_string(),
                 options: default_lancedb_options(),
             },
-            lexical: LexicalConfig::default(),
             sparse: SparseConfig::default(),
             normalize: NormalizeConfig::default(),
             sync: SyncConfig::default(),

@@ -10,9 +10,7 @@ use std::path::Path;
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content).map_err(MinSyncError::TomlParse)?;
-        crate::tokenizer::validate_language(&config.lexical.language)?;
-        Ok(config)
+        toml::from_str(&content).map_err(MinSyncError::TomlParse)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -65,7 +63,6 @@ mod tests {
         assert_eq!(config.embedder.max_batch_tokens, None);
         assert_eq!(config.embedder.model_cache_dir, None);
         assert_eq!(config.vectorstore.id, "lancedb");
-        assert_eq!(config.lexical.language, "simple");
         assert_eq!(config.sync.max_file_bytes, DEFAULT_MAX_FILE_BYTES);
         assert_eq!(
             config.vectorstore.options["dimension"].as_integer(),
@@ -104,7 +101,7 @@ mod tests {
         assert_eq!(known_embedding_dimension("tei:custom/model"), None);
         assert_eq!(
             known_embedding_dimension(NONE_EMBEDDER_ID),
-            Some(LEXICAL_ONLY_DIMENSION)
+            Some(SPARSE_ONLY_DIMENSION)
         );
     }
 
@@ -140,13 +137,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_lexical_only_only_for_none_embedder() {
+    fn test_is_sparse_only_only_for_none_embedder() {
         let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-        assert!(!config.is_lexical_only());
+        assert!(!config.is_sparse_only());
         config.embedder.id = "none".to_string();
-        assert!(config.is_lexical_only());
+        assert!(config.is_sparse_only());
         config.embedder.id = "none:foo".to_string();
-        assert!(!config.is_lexical_only());
+        assert!(!config.is_sparse_only());
     }
 
     #[test]
@@ -162,16 +159,28 @@ mod tests {
     }
 
     #[test]
-    fn test_config_load_rejects_unknown_lexical_language() {
+    fn test_config_from_the_bm25_era_still_loads_and_drops_its_lexical_table() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("config.toml");
-        let mut config = Config::default_for("abcdef12-1234-4234-9234-123456789abc");
-        config.lexical.language = "klingon".to_string();
-        config.save(&path).expect("save invalid config fixture");
+        let config = Config::default_for("abcdef12-1234-4234-9234-123456789abc");
+        config.save(&path).expect("save config");
+        // What `minsync init --language ko` wrote before BM25 was replaced.
+        let legacy = format!(
+            "{}\n[lexical]\nlanguage = \"ko\"\n",
+            std::fs::read_to_string(&path).expect("read config")
+        );
+        std::fs::write(&path, legacy).expect("write legacy config");
 
-        let error = Config::load(&path).expect_err("unknown language must fail");
+        let loaded = Config::load(&path).expect("a legacy [lexical] table must not break load");
 
-        assert!(error.to_string().contains("unsupported BM25 language"));
+        assert_eq!(loaded, config);
+        loaded.save(&path).expect("save again");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read config")
+                .contains("lexical"),
+            "saving writes the current shape only"
+        );
     }
 
     #[test]
