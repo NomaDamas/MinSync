@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod normalize;
 pub mod query;
 pub mod serve;
+pub mod sparse;
 pub mod state;
 pub mod sync;
 pub mod tokenizer;

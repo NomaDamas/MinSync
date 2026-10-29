@@ -104,15 +104,15 @@ impl RetryPolicy {
 /// re-cut and sent as smaller requests, without the retry/backoff of
 /// [`RetryPolicy::run`]. Single inputs go through the normal retry policy.
 /// Results keep input order.
-pub async fn embed_adaptive<F, Fut>(
+pub async fn embed_adaptive<T, F, Fut>(
     policy: &RetryPolicy,
     limit: &AtomicUsize,
     inputs: Vec<String>,
     send: F,
-) -> Result<Vec<Vec<f32>>>
+) -> Result<Vec<T>>
 where
     F: Fn(Vec<String>) -> Fut,
-    Fut: Future<Output = std::result::Result<Vec<Vec<f32>>, RequestError>>,
+    Fut: Future<Output = std::result::Result<Vec<T>, RequestError>>,
 {
     let total = inputs.len();
     let mut queue: VecDeque<Vec<String>> = VecDeque::from([inputs]);
@@ -154,8 +154,8 @@ where
 }
 
 /// Result of sending one piece of an adaptive batch.
-enum Sent {
-    Done(Vec<Vec<f32>>),
+enum Sent<T> {
+    Done(Vec<T>),
     /// A multi-input request the server found too big or too slow.
     TooLarge(String),
 }

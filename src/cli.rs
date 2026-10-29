@@ -149,9 +149,15 @@ pub enum Commands {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
         /// Native embedder id to serve. Defaults to the workspace's
-        /// `.minsync/config.toml` embedder, else the default model.
+        /// `.minsync/config.toml` embedder (`[sparse]` with `--sparse`), else
+        /// the default model.
         #[arg(long)]
         embedder: Option<String>,
+        /// Serve the learned-sparse (SPLADE) encoder instead of the dense
+        /// embedder: TEI's `POST /embed_sparse` and `GET /health`. A separate
+        /// server (and state directory) from the dense one.
+        #[arg(long)]
+        sparse: bool,
     },
     /// Run one materialization-stage session: JSONL requests on stdin,
     /// responses on stdout. Tracks which source items an external host
@@ -187,6 +193,21 @@ mod tests {
                 watch_on_sync_error: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn serve_sparse_is_a_flag_and_defaults_off() {
+        let dense = Cli::try_parse_from(["minsync", "serve"]).expect("serve parses");
+        assert!(matches!(
+            dense.command,
+            Commands::Serve { sparse: false, .. }
+        ));
+        let sparse =
+            Cli::try_parse_from(["minsync", "serve", "--sparse"]).expect("serve --sparse parses");
+        assert!(matches!(
+            sparse.command,
+            Commands::Serve { sparse: true, .. }
         ));
     }
 }

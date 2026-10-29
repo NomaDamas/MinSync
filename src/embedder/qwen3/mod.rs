@@ -17,11 +17,11 @@ mod attention;
 
 pub use attention::{AttentionBackend, AttentionRequest};
 
+use crate::embedder::hub::{hf_repo, safetensors_weight_files};
 use crate::error::{MinSyncError, Result as MinSyncResult};
 use attention::{attend, BatchMask};
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
-use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -462,66 +462,6 @@ impl Qwen3Embedder {
         let norm = (pooled.sqr()?.sum_keepdim(1)? + 1e-12)?.sqrt()?;
         pooled.broadcast_div(&norm)?.to_vec2::<f32>()
     }
-}
-
-fn hf_repo(repo_id: &str, default_cache_dir: PathBuf) -> MinSyncResult<ApiRepo> {
-    let cache_dir = std::env::var("HF_HOME")
-        .map(PathBuf::from)
-        .unwrap_or(default_cache_dir);
-    let endpoint =
-        std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-    let token = std::env::var("HF_TOKEN")
-        .ok()
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-        .or_else(default_hf_token);
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir)
-        .with_endpoint(endpoint)
-        .with_token(token)
-        .with_progress(true)
-        .build()
-        .map_err(|e| {
-            MinSyncError::Embedding(format!("native model API initialization failed: {e}"))
-        })?;
-    Ok(api.model(repo_id.to_string()))
-}
-
-/// Token written by `huggingface-cli login`; `Cache::default` panics without a home directory.
-fn default_hf_token() -> Option<String> {
-    let has_home = std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some();
-    has_home.then(|| hf_hub::Cache::default().token()).flatten()
-}
-
-/// Safetensors files of a repo, resolving `model.safetensors.index.json` for sharded checkpoints.
-fn safetensors_weight_files(repo: &ApiRepo) -> MinSyncResult<Vec<PathBuf>> {
-    const SINGLE_FILE: &str = "model.safetensors";
-    const INDEX_FILE: &str = "model.safetensors.index.json";
-    if let Ok(path) = repo.get(SINGLE_FILE) {
-        return Ok(vec![path]);
-    }
-    let fetch = |file: &str| {
-        repo.get(file).map_err(|e| {
-            MinSyncError::Embedding(format!(
-                "native model weights download failed ({file}): {e}"
-            ))
-        })
-    };
-    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(fetch(INDEX_FILE)?)?)
-        .map_err(|e| {
-            MinSyncError::Embedding(format!("native model {INDEX_FILE} is invalid: {e}"))
-        })?;
-    let mut shards: Vec<String> = index["weight_map"]
-        .as_object()
-        .ok_or_else(|| {
-            MinSyncError::Embedding(format!("native model {INDEX_FILE} has no weight_map"))
-        })?
-        .values()
-        .filter_map(|file| file.as_str().map(str::to_string))
-        .collect();
-    shards.sort_unstable();
-    shards.dedup();
-    shards.iter().map(|file| fetch(file)).collect()
 }
 
 #[cfg(test)]

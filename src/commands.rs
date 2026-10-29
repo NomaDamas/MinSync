@@ -53,6 +53,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         max_request_bytes,
         state_dir,
         embedder,
+        sparse,
     } = cli.command
     {
         let options = ServeArgs {
@@ -63,6 +64,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
             max_request_bytes,
             state_dir,
             embedder,
+            sparse,
         };
         return serve(&cli.format, &minsync_dir, options).await;
     }
@@ -600,6 +602,29 @@ struct ServeArgs {
     max_request_bytes: usize,
     state_dir: Option<PathBuf>,
     embedder: Option<String>,
+    sparse: bool,
+}
+
+/// Sparse encoder settings `serve --sparse` runs with: the workspace's
+/// `[sparse]` section when present, else defaults; `--embedder` overrides the id.
+fn serve_sparse_settings(
+    minsync_dir: &std::path::Path,
+    id: Option<String>,
+) -> Result<crate::config::SparseConfig> {
+    let config_path = minsync_dir.join("config.toml");
+    let mut settings = if config_path.exists() {
+        crate::config::Config::load(&config_path)?.sparse
+    } else {
+        crate::config::SparseConfig::default()
+    };
+    if let Some(id) = id {
+        settings.id = if id.contains(':') {
+            id
+        } else {
+            format!("native:{id}")
+        };
+    }
+    Ok(settings)
 }
 
 /// Embedder settings `serve` runs with: the workspace config when present
@@ -631,9 +656,23 @@ async fn serve(
     args: ServeArgs,
 ) -> Result<i32> {
     let host = crate::serve::parse_loopback_host(&args.host)?;
-    let settings = serve_settings(minsync_dir, args.embedder)?;
-    let instance = crate::serve::instance_key(&settings)?;
-    let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
+    // Dense and sparse servers differ only in the engine and the identity of
+    // the model instance; everything after that is shared.
+    let (instance, query_prefix, passage_prefix) = if args.sparse {
+        let settings = serve_sparse_settings(minsync_dir, args.embedder.clone())?;
+        (
+            crate::serve::sparse_instance_key(&settings)?,
+            settings.query_prefix,
+            settings.passage_prefix,
+        )
+    } else {
+        let settings = serve_settings(minsync_dir, args.embedder.clone())?;
+        (
+            crate::serve::instance_key(&settings)?,
+            settings.query_prefix,
+            settings.passage_prefix,
+        )
+    };
     let options = crate::serve::ServeOptions {
         host,
         port: args.port,
@@ -643,10 +682,11 @@ async fn serve(
         max_request_bytes: args.max_request_bytes.max(1),
         state_dir: args
             .state_dir
+            .clone()
             .unwrap_or_else(|| crate::serve::default_state_dir(&instance)),
         instance,
-        query_prefix: settings.query_prefix.clone(),
-        passage_prefix: settings.passage_prefix.clone(),
+        query_prefix,
+        passage_prefix,
     };
     let state_dir = options.state_dir.clone();
     let print = |event: &str, health: &crate::serve::Health| -> Result<()> {
@@ -671,7 +711,16 @@ async fn serve(
         std::io::stdout().flush()?;
         Ok(())
     };
-    let server = match crate::serve::start(std::sync::Arc::new(engine), options).await? {
+    let started = if args.sparse {
+        let settings = serve_sparse_settings(minsync_dir, args.embedder)?;
+        let engine = crate::sparse::native::NativeSparseEncoder::from_config(&settings)?;
+        crate::serve::start_sparse(std::sync::Arc::new(engine), options).await?
+    } else {
+        let settings = serve_settings(minsync_dir, args.embedder)?;
+        let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
+        crate::serve::start(std::sync::Arc::new(engine), options).await?
+    };
+    let server = match started {
         crate::serve::Started::Adopted(health) => {
             print("adopted", &health)?;
             return Ok(0);

@@ -1,0 +1,17 @@
+{
+ "pooling_strategy": "max",
+ "activation_function": "relu",
+ "embedding_dimension": 36282,
+ "chunk_size": 128,
+ "logit_shift": 10.0,
+ "top_k": null,
+ "prefix_token_ids": [
+  50000,
+  50001
+ ],
+ "masked_vocab_ids": [
+  50000,
+  50001
+ ],
+ "canonical_ids": "<50002 ids omitted>"
+}
