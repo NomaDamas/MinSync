@@ -1,0 +1,1 @@
+[{"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.base.modules.transformer.Transformer"}, {"idx": 1, "name": "1", "path": "1_ShiftedTopKSpladePooling", "type": "pooling.ShiftedTopKSpladePooling"}]

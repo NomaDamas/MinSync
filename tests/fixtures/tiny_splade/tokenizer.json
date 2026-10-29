@@ -1,0 +1,170 @@
+{
+  "version": "1.0",
+  "truncation": {
+    "direction": "Right",
+    "max_length": 8192,
+    "strategy": "LongestFirst",
+    "stride": 0
+  },
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 70,
+      "content": "[Q] ",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": true,
+      "special": false
+    },
+    {
+      "id": 71,
+      "content": "[D] ",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": true,
+      "special": false
+    }
+  ],
+  "normalizer": {
+    "type": "Lowercase"
+  },
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "<cls>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<sep>",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "<cls>": {
+        "id": "<cls>",
+        "ids": [
+          5
+        ],
+        "tokens": [
+          "<cls>"
+        ]
+      },
+      "<sep>": {
+        "id": "<sep>",
+        "ids": [
+          3
+        ],
+        "tokens": [
+          "<sep>"
+        ]
+      }
+    }
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "<s>": 1,
+      "<\\s>": 2,
+      "<sep>": 3,
+      "<mask>": 4,
+      "<cls>": 5,
+      "<pad>": 6,
+      "<r7>": 7,
+      "<r8>": 8,
+      "<r9>": 9,
+      "w0": 10,
+      "w1": 11,
+      "w2": 12,
+      "w3": 13,
+      "w4": 14,
+      "w5": 15,
+      "w6": 16,
+      "w7": 17,
+      "w8": 18,
+      "w9": 19,
+      "w10": 20,
+      "w11": 21,
+      "w12": 22,
+      "w13": 23,
+      "w14": 24,
+      "w15": 25,
+      "w16": 26,
+      "w17": 27,
+      "w18": 28,
+      "w19": 29,
+      "w20": 30,
+      "w21": 31,
+      "w22": 32,
+      "w23": 33,
+      "w24": 34,
+      "w25": 35,
+      "w26": 36,
+      "w27": 37,
+      "w28": 38,
+      "w29": 39,
+      "w30": 40,
+      "w31": 41,
+      "w32": 42,
+      "w33": 43,
+      "w34": 44,
+      "w35": 45,
+      "w36": 46,
+      "w37": 47,
+      "w38": 48,
+      "w39": 49,
+      "w40": 50,
+      "w41": 51,
+      "w42": 52,
+      "w43": 53,
+      "w44": 54,
+      "w45": 55,
+      "w46": 56,
+      "w47": 57,
+      "w48": 58,
+      "w49": 59,
+      "w50": 60,
+      "w51": 61,
+      "w52": 62,
+      "w53": 63,
+      "w54": 64,
+      "w55": 65,
+      "w56": 66,
+      "w57": 67,
+      "w58": 68,
+      "w59": 69
+    },
+    "unk_token": "<unk>"
+  }
+}

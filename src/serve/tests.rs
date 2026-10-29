@@ -497,3 +497,247 @@ fn instance_key_follows_what_changes_the_vectors() {
     tei.id = "tei:foo".into();
     assert!(instance_key(&tei).is_err());
 }
+
+// ---- sparse (SPLADE) engine: POST /embed_sparse ------------------------------
+
+use crate::sparse::SparseVector;
+
+/// Encodes a text as one term per distinct byte: `{byte: 1 + position-in-text-order}`.
+#[derive(Default)]
+struct FakeSparse {
+    seen: StdMutex<Vec<Vec<String>>>,
+    timeout: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl SparseServeEngine for FakeSparse {
+    async fn load(&self) -> Result<EngineInfo> {
+        Ok(EngineInfo {
+            model_id: "Fake/Sparse-1".to_string(),
+            dimension: 256,
+            dtype: "f32".to_string(),
+            device: "cpu".to_string(),
+            attention: "tiled".to_string(),
+            max_length: 4,
+        })
+    }
+
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        Ok(texts.iter().map(|t| t.split_whitespace().count()).collect())
+    }
+
+    async fn encode(&self, texts: Vec<String>) -> Result<Vec<SparseVector>> {
+        if self.timeout.load(Ordering::SeqCst) {
+            return Err(MinSyncError::Timeout("native sparse batch stuck".into()));
+        }
+        self.seen.lock().unwrap().push(texts.clone());
+        Ok(texts
+            .iter()
+            .map(|t| {
+                SparseVector::from_pairs(
+                    t.bytes()
+                        .enumerate()
+                        .map(|(i, b)| (u32::from(b), 1.0 + i as f32)),
+                )
+            })
+            .collect())
+    }
+}
+
+struct SparseHarness {
+    url: String,
+    engine: Arc<FakeSparse>,
+    stop: Arc<tokio::sync::Notify>,
+    stopped: tokio::task::JoinHandle<Result<StopReason>>,
+    _dir: tempfile::TempDir,
+}
+
+async fn spawn_sparse(engine: FakeSparse) -> SparseHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let engine = Arc::new(engine);
+    let Started::Serving(server) = start_sparse(engine.clone(), opts).await.unwrap() else {
+        panic!("expected a fresh server");
+    };
+    let url = server.health().url.clone();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let signal = stop.clone();
+    let stopped = tokio::spawn(async move {
+        server
+            .run_until(async move { signal.notified().await })
+            .await
+    });
+    SparseHarness {
+        url,
+        engine,
+        stop,
+        stopped,
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn embed_sparse_returns_tei_index_value_rows_in_order() {
+    let h = spawn_sparse(FakeSparse::default()).await;
+    let (status, body) = post(
+        &format!("{}/embed_sparse", h.url),
+        json!({"inputs": ["ab", "b"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // 'a' = 97 weight 1, 'b' = 98 weight 2 ; second text: 'b' weight 1.
+    assert_eq!(
+        body,
+        json!([
+            [{"index": 97, "value": 1.0}, {"index": 98, "value": 2.0}],
+            [{"index": 98, "value": 1.0}],
+        ])
+    );
+    let (status, body) = post(&format!("{}/embed_sparse", h.url), json!({"inputs": "a"})).await;
+    assert_eq!(
+        (status, body),
+        (200, json!([[{"index": 97, "value": 1.0}]]))
+    );
+}
+
+#[tokio::test]
+async fn embed_sparse_applies_prefixes_only_with_input_type_and_enforces_the_context() {
+    let h = spawn_sparse(FakeSparse::default()).await;
+    post(&format!("{}/embed_sparse", h.url), json!({"inputs": ["x"]})).await;
+    post(
+        &format!("{}/embed_sparse", h.url),
+        json!({"inputs": ["x"], "input_type": "query"}),
+    )
+    .await;
+    post(
+        &format!("{}/embed_sparse", h.url),
+        json!({"inputs": ["x"], "input_type": "passage"}),
+    )
+    .await;
+    assert_eq!(
+        h.engine.seen.lock().unwrap().clone(),
+        vec![
+            vec!["x".to_string()],
+            vec!["Q: x".to_string()],
+            vec!["P: x".to_string()]
+        ]
+    );
+
+    let long = "w w w w w"; // 5 tokens > max_length 4
+    let (status, body) = post(
+        &format!("{}/embed_sparse", h.url),
+        json!({"inputs": [long]}),
+    )
+    .await;
+    assert_eq!(status, 413, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("must have less than"));
+    let (status, _) = post(
+        &format!("{}/embed_sparse", h.url),
+        json!({"inputs": [long], "truncate": true}),
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn embed_sparse_rejects_bad_requests_and_keeps_serving() {
+    let h = spawn_sparse(FakeSparse::default()).await;
+    let url = format!("{}/embed_sparse", h.url);
+    let many: Vec<String> = (0..9).map(|i| i.to_string()).collect();
+    assert_eq!(post(&url, json!({"inputs": many})).await.0, 413);
+    assert_eq!(post(&url, json!({"inputs": []})).await.0, 422);
+    assert_eq!(post(&url, json!({"inputs": [1, 2]})).await.0, 422);
+    assert_eq!(
+        post(&url, json!({"inputs": ["a"], "prompt_name": "query"}))
+            .await
+            .0,
+        422,
+        "prompt_name is unsupported: send prefixed text or input_type"
+    );
+    assert_eq!(post(&url, json!({"inputs": ["ok"]})).await.0, 200);
+}
+
+#[tokio::test]
+async fn a_sparse_server_does_not_serve_dense_routes_and_reports_its_kind() {
+    let h = spawn_sparse(FakeSparse::default()).await;
+    let client = reqwest::Client::new();
+    let health: Value = client
+        .get(format!("{}/health", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["kind"], "sparse");
+    assert_eq!(health["model_id"], "Fake/Sparse-1");
+    for route in ["/embed", "/v1/embeddings"] {
+        let response = client
+            .post(format!("{}{route}", h.url))
+            .json(&json!({"inputs": ["a"], "input": ["a"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 404, "{route}");
+    }
+}
+
+#[tokio::test]
+async fn a_dense_server_reports_kind_dense_and_has_no_embed_sparse() {
+    let h = spawn().await;
+    let health: Value = reqwest::get(format!("{}/health", h.url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["kind"], "dense");
+    // axum's default 404 has an empty body, so check the status directly.
+    let response = reqwest::Client::new()
+        .post(format!("{}/embed_sparse", h.url))
+        .json(&json!({"inputs": ["a"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn a_wedged_sparse_pass_shuts_the_server_down_with_the_timeout_exit_code() {
+    let engine = FakeSparse::default();
+    engine.timeout.store(true, Ordering::SeqCst);
+    let h = spawn_sparse(engine).await;
+    let (status, body) = post(&format!("{}/embed_sparse", h.url), json!({"inputs": ["a"]})).await;
+    assert_eq!(status, 503, "{body}");
+    let reason = tokio::time::timeout(Duration::from_secs(5), h.stopped)
+        .await
+        .expect("server stops")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reason, StopReason::Wedged);
+    drop(h.stop);
+}
+
+#[test]
+fn sparse_instance_key_differs_from_a_dense_one_and_tracks_vector_inputs() {
+    let sparse = crate::config::SparseConfig::default();
+    let key = sparse_instance_key(&sparse).unwrap();
+    assert!(
+        key.starts_with("nlpai-lab-KURE-Sparse-nano-sparse-"),
+        "{key}"
+    );
+    let mut other = sparse.clone();
+    other.max_length = Some(512);
+    assert_ne!(key, sparse_instance_key(&other).unwrap());
+    // Batching knobs and prefixes do not change the vectors.
+    other = sparse.clone();
+    other.batch_size = 3;
+    other.query_prefix = None;
+    assert_eq!(key, sparse_instance_key(&other).unwrap());
+    other.id = "tei:foo/bar".to_string();
+    assert!(sparse_instance_key(&other).is_err());
+}

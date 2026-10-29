@@ -109,6 +109,37 @@ mod tests {
     }
 
     #[test]
+    fn test_sparse_section_defaults_to_the_kure_model_and_is_optional_on_disk() {
+        let config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        assert_eq!(config.sparse.id, DEFAULT_SPARSE_ID);
+        assert_eq!(DEFAULT_SPARSE_ID, "native:nlpai-lab/KURE-Sparse-nano");
+        assert_eq!(config.sparse.query_prefix.as_deref(), Some("[Q] "));
+        assert_eq!(config.sparse.passage_prefix.as_deref(), Some("[D] "));
+
+        // A config written before `[sparse]` existed still loads, with defaults.
+        let full = toml::to_string_pretty(&config).unwrap();
+        let start = full.find("[sparse]").expect("serialized [sparse] table");
+        let end = full[start + 1..]
+            .find("\n[")
+            .map_or(full.len(), |offset| start + 1 + offset + 1);
+        let legacy = format!("{}{}", &full[..start], &full[end..]);
+        assert!(!legacy.contains("[sparse]"), "{legacy}");
+        let loaded: Config = toml::from_str(&legacy).unwrap();
+        assert_eq!(loaded.sparse, config.sparse);
+    }
+
+    #[test]
+    fn test_sparse_section_roundtrips_remote_settings() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default_for("abcdef12-1234-4234-9234-123456789abc");
+        config.sparse.id = "tei:nlpai-lab/KURE-Sparse-nano".to_string();
+        config.sparse.base_url = Some("http://localhost:8081".to_string());
+        config.save(&path).expect("save config");
+        assert_eq!(Config::load(&path).expect("load config"), config);
+    }
+
+    #[test]
     fn test_is_lexical_only_only_for_none_embedder() {
         let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
         assert!(!config.is_lexical_only());

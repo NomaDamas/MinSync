@@ -3,7 +3,11 @@
 //! Protocols:
 //! * TEI: `POST /embed` `{ "inputs", "truncate"? }` -> `[[f32]]`
 //! * OpenAI: `POST /v1/embeddings` `{ "model", "input" }` -> `{ "data", ... }`
-//! * `GET /health`: model id, dimension, dtype, device, pid, port.
+//! * `GET /health`: model id, dimension, dtype, device, pid, port, `kind`.
+//!
+//! A server is `dense` (the routes above) or `sparse` (`minsync serve
+//! --sparse`: `POST /embed_sparse`, TEI's learned-sparse protocol); a sparse
+//! server answers 404 on the dense routes and vice versa.
 //!
 //! Both embedding routes accept an `input_type: "query" | "passage"`
 //! extension that applies the configured prefix; without it the text is
@@ -69,6 +73,50 @@ pub trait ServeEngine: Send + Sync {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
 }
 
+/// What a sparse (SPLADE) server needs from an encoder.
+#[async_trait::async_trait]
+pub trait SparseServeEngine: Send + Sync {
+    /// Load the model (once) and describe it. `dimension` is the number of
+    /// terms in the output space.
+    async fn load(&self) -> Result<EngineInfo>;
+
+    /// Tokens per input, as the model would see them before truncation.
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>>;
+
+    /// Encode `texts` exactly as given (no prefixes added).
+    async fn encode(&self, texts: Vec<String>) -> Result<Vec<crate::sparse::SparseVector>>;
+}
+
+/// The engine behind one server.
+#[derive(Clone)]
+enum Engine {
+    Dense(Arc<dyn ServeEngine>),
+    Sparse(Arc<dyn SparseServeEngine>),
+}
+
+impl Engine {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Dense(_) => "dense",
+            Self::Sparse(_) => "sparse",
+        }
+    }
+
+    async fn load(&self) -> Result<EngineInfo> {
+        match self {
+            Self::Dense(engine) => engine.load().await,
+            Self::Sparse(engine) => engine.load().await,
+        }
+    }
+
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        match self {
+            Self::Dense(engine) => engine.token_counts(texts).await,
+            Self::Sparse(engine) => engine.token_counts(texts).await,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineInfo {
     pub model_id: String,
@@ -95,10 +143,18 @@ pub struct ServeOptions {
     pub passage_prefix: Option<String>,
 }
 
+fn dense_kind() -> String {
+    "dense".to_string()
+}
+
 /// `GET /health` body; also what an adopting process reports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Health {
     pub status: String,
+    /// `dense` or `sparse`. Absent from servers older than sparse support,
+    /// which are all dense.
+    #[serde(default = "dense_kind")]
+    pub kind: String,
     pub model_id: String,
     pub dimension: usize,
     pub dtype: String,
@@ -160,7 +216,7 @@ pub struct Server {
 }
 
 struct AppState {
-    engine: Arc<dyn ServeEngine>,
+    engine: Engine,
     info: EngineInfo,
     health: Health,
     max_inputs: usize,
@@ -270,6 +326,40 @@ pub fn instance_key(settings: &crate::config::EmbedderConfig) -> Result<String> 
     Ok(format!("{name}-{}", &digest[..12]))
 }
 
+/// Identity of a served sparse model: everything that changes the vectors the
+/// native sparse engine produces. The `-sparse-` infix keeps its state
+/// directory apart from a dense model of the same name.
+pub fn sparse_instance_key(settings: &crate::config::SparseConfig) -> Result<String> {
+    let Some(model) = settings.id.strip_prefix("native:") else {
+        return Err(MinSyncError::Config(format!(
+            "minsync serve --sparse only serves native: encoders, got '{}'",
+            settings.id
+        )));
+    };
+    let auto = |value: &Option<String>| value.clone().unwrap_or_else(|| "auto".to_string());
+    let material = json!({
+        "kind": "sparse",
+        "model": model,
+        "device": auto(&settings.device),
+        "dtype": auto(&settings.dtype),
+        "max_length": settings
+            .max_length
+            .unwrap_or(crate::config::DEFAULT_SPARSE_MAX_LENGTH),
+    });
+    let digest = hex::encode(Sha256::digest(material.to_string()));
+    let name: String = model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    Ok(format!("{name}-sparse-{}", &digest[..12]))
+}
+
 /// Default state directory for an instance:
 /// `~/.cache/minsync/serve/<instance>` (`%LOCALAPPDATA%\minsync\serve` on
 /// Windows).
@@ -314,6 +404,18 @@ fn base_url(addr: SocketAddr) -> String {
 /// Become the server for `options.instance`, or adopt the one that already
 /// is. Loads the model only in the first case.
 pub async fn start(engine: Arc<dyn ServeEngine>, options: ServeOptions) -> Result<Started> {
+    start_engine(Engine::Dense(engine), options).await
+}
+
+/// Like [`start`], for a sparse (SPLADE) engine: serves `POST /embed_sparse`.
+pub async fn start_sparse(
+    engine: Arc<dyn SparseServeEngine>,
+    options: ServeOptions,
+) -> Result<Started> {
+    start_engine(Engine::Sparse(engine), options).await
+}
+
+async fn start_engine(engine: Engine, options: ServeOptions) -> Result<Started> {
     std::fs::create_dir_all(&options.state_dir)?;
     let lock = acquire_or_adopt(&options).await?;
     let lock = match lock {
@@ -339,6 +441,7 @@ pub async fn start(engine: Arc<dyn ServeEngine>, options: ServeOptions) -> Resul
     let addr = listener.local_addr()?;
     let health = Health {
         status: "ok".to_string(),
+        kind: engine.kind().to_string(),
         model_id: info.model_id.clone(),
         dimension: info.dimension,
         dtype: info.dtype.clone(),
@@ -514,10 +617,14 @@ impl Drop for Busy<'_> {
 }
 
 fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/embed", post(tei_embed))
-        .route("/v1/embeddings", post(openai_embeddings))
+    let routes = Router::new().route("/health", get(health));
+    let routes = match state.engine {
+        Engine::Dense(_) => routes
+            .route("/embed", post(tei_embed))
+            .route("/v1/embeddings", post(openai_embeddings)),
+        Engine::Sparse(_) => routes.route("/embed_sparse", post(tei_embed_sparse)),
+    };
+    routes
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(BodyLimited {
             state,
@@ -701,16 +808,22 @@ struct Embedded {
     tokens: usize,
 }
 
-/// Validate, prefix, check the context, embed. `count_all` tokenizes every
-/// input (OpenAI usage); otherwise only inputs that may exceed the context.
-async fn embed_inputs(
+/// Inputs that passed validation, with the exact prompt tokens when counted.
+struct Checked {
+    texts: Vec<String>,
+    tokens: usize,
+}
+
+/// Validate, prefix and check the context. `count_all` tokenizes every input
+/// (OpenAI usage); otherwise only inputs that may exceed the context.
+async fn checked_inputs_counting(
     state: &AppState,
     texts: Vec<String>,
     input_type: Option<InputType>,
     truncate: bool,
     count_all: bool,
     protocol: Protocol,
-) -> std::result::Result<Embedded, ApiError> {
+) -> std::result::Result<Checked, ApiError> {
     if texts.is_empty() {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -767,20 +880,44 @@ async fn embed_inputs(
         }
     }
     let tokens = counts.iter().map(|&t| t.min(max_length)).sum();
-    let vectors = state
-        .engine
+    Ok(Checked { texts, tokens })
+}
+
+async fn checked_inputs(
+    state: &AppState,
+    texts: Vec<String>,
+    input_type: Option<InputType>,
+    truncate: bool,
+    protocol: Protocol,
+) -> std::result::Result<Vec<String>, ApiError> {
+    Ok(
+        checked_inputs_counting(state, texts, input_type, truncate, false, protocol)
+            .await?
+            .texts,
+    )
+}
+
+/// Validate, prefix, check the context, embed (dense servers only).
+async fn embed_inputs(
+    state: &AppState,
+    texts: Vec<String>,
+    input_type: Option<InputType>,
+    truncate: bool,
+    count_all: bool,
+    protocol: Protocol,
+) -> std::result::Result<Embedded, ApiError> {
+    let Engine::Dense(engine) = &state.engine else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "this server serves sparse vectors; use /embed_sparse",
+        ));
+    };
+    let Checked { texts, tokens } =
+        checked_inputs_counting(state, texts, input_type, truncate, count_all, protocol).await?;
+    let vectors = engine
         .embed(texts)
         .await
-        .map_err(|error| match error {
-            MinSyncError::Timeout(_) => {
-                state.wedged.notify_one();
-                ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("{error}; the server is shutting down"),
-                )
-            }
-            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+        .map_err(|error| engine_error(state, error))?;
     Ok(Embedded { vectors, tokens })
 }
 
@@ -909,5 +1046,86 @@ async fn openai_embeddings(
             .into_response()
         }
         Err(error) => error.render(Protocol::OpenAi),
+    }
+}
+
+/// An engine failure as an HTTP error. A deadline means the model's thread is
+/// stuck for good, so the server also schedules its own shutdown.
+fn engine_error(state: &AppState, error: MinSyncError) -> ApiError {
+    match error {
+        MinSyncError::Timeout(_) => {
+            state.wedged.notify_one();
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{error}; the server is shutting down"),
+            )
+        }
+        other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+#[derive(Serialize)]
+struct SparseValue {
+    index: u32,
+    value: f32,
+}
+
+/// `POST /embed_sparse`: TEI's learned-sparse protocol.
+async fn tei_embed_sparse(
+    State(app): State<BodyLimited>,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> Response {
+    let state = &app.state;
+    let _busy = state.busy();
+    let result = async {
+        let request: TeiRequest = parse_body(body, app.max_request_bytes)?;
+        if request.prompt_name.is_some() {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "`prompt_name` is not supported: send prefixed text or `input_type`",
+            ));
+        }
+        if request
+            .truncation_direction
+            .as_deref()
+            .is_some_and(|d| !d.eq_ignore_ascii_case("right"))
+        {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "only `truncation_direction: \"right\"` is supported",
+            ));
+        }
+        let texts = input_texts(request.inputs, "inputs")?;
+        let truncate = request.truncate.unwrap_or(false);
+        let Engine::Sparse(engine) = &state.engine else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "this server serves dense vectors; use /embed",
+            ));
+        };
+        let texts =
+            checked_inputs(state, texts, request.input_type, truncate, Protocol::Tei).await?;
+        engine
+            .encode(texts)
+            .await
+            .map_err(|error| engine_error(state, error))
+    }
+    .await;
+    match result {
+        Ok(vectors) => Json(
+            vectors
+                .iter()
+                .map(|vector| {
+                    vector
+                        .indices()
+                        .iter()
+                        .zip(vector.values())
+                        .map(|(&index, &value)| SparseValue { index, value })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => error.render(Protocol::Tei),
     }
 }

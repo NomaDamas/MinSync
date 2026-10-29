@@ -56,7 +56,7 @@ const MAX_BATCH_TOKENS: usize = 4096;
 const SPECIAL_TOKEN_SLACK: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeDevice {
+pub(crate) enum NativeDevice {
     Auto,
     Cpu,
     Metal,
@@ -64,7 +64,7 @@ enum NativeDevice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeDtype {
+pub(crate) enum NativeDtype {
     F32,
     F16,
     Bf16,
@@ -89,18 +89,18 @@ struct LoadedModel {
 /// A lazily loaded value that can be dropped again and reloaded on demand.
 ///
 /// Concurrent callers share one load; a failed load is not cached.
-struct LoadSlot<T> {
+pub(crate) struct LoadSlot<T> {
     value: AsyncMutex<Option<T>>,
 }
 
 impl<T: Clone> LoadSlot<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             value: AsyncMutex::new(None),
         }
     }
 
-    async fn get_or_load<F, Fut>(&self, load: F) -> Result<T>
+    pub(crate) async fn get_or_load<F, Fut>(&self, load: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -116,13 +116,13 @@ impl<T: Clone> LoadSlot<T> {
 
     /// Drop the held value; true when one was resident. Waits for an
     /// in-progress load first, so the load's value is dropped too.
-    async fn unload(&self) -> bool {
+    pub(crate) async fn unload(&self) -> bool {
         self.value.lock().await.take().is_some()
     }
 
     /// True when a value is resident. A load or unload in progress reports
     /// false.
-    fn is_loaded(&self) -> bool {
+    pub(crate) fn is_loaded(&self) -> bool {
         self.value
             .try_lock()
             .map(|slot| slot.is_some())
@@ -169,7 +169,7 @@ pub struct NativeEmbedder {
 /// model it holds) until exit, so every `NativeEmbedder` in the process —
 /// including ones rebuilt per call by `DeferredEmbedder` — must fail fast
 /// instead of loading another model.
-static NATIVE_DEADLINE: BatchDeadline = BatchDeadline::new();
+pub(crate) static NATIVE_DEADLINE: BatchDeadline = BatchDeadline::new();
 
 impl NativeEmbedder {
     pub fn from_config(settings: &EmbedderConfig) -> Result<Self> {
@@ -572,7 +572,7 @@ fn plan_batches(
 
 /// Deadline for one forward pass in the config: `per_batch_timeout_seconds`,
 /// else `timeout_seconds`.
-fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
+pub(crate) fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
     let seconds = settings
         .per_batch_timeout_seconds
         .unwrap_or(settings.timeout_seconds);
@@ -594,7 +594,11 @@ pub(crate) const CPU_BATCH_TIMEOUT: Duration = Duration::from_secs(900);
 /// `per_batch_timeout_seconds` always wins; otherwise CPU gets at least
 /// [`CPU_BATCH_TIMEOUT`] (a larger `timeout_seconds` is kept) and GPUs keep the
 /// configured value.
-fn effective_batch_timeout(configured: Duration, explicit: bool, on_cpu: bool) -> Duration {
+pub(crate) fn effective_batch_timeout(
+    configured: Duration,
+    explicit: bool,
+    on_cpu: bool,
+) -> Duration {
     if on_cpu && !explicit {
         configured.max(CPU_BATCH_TIMEOUT)
     } else {
@@ -642,7 +646,7 @@ fn test_tokenizer() -> Tokenizer {
     .expect("build test tokenizer")
 }
 
-fn parse_device(value: Option<&str>) -> Result<NativeDevice> {
+pub(crate) fn parse_device(value: Option<&str>) -> Result<NativeDevice> {
     match value {
         None | Some("auto") => Ok(NativeDevice::Auto),
         Some("cpu") => Ok(NativeDevice::Cpu),
@@ -654,7 +658,7 @@ fn parse_device(value: Option<&str>) -> Result<NativeDevice> {
     }
 }
 
-fn parse_dtype(value: Option<&str>) -> Result<Option<NativeDtype>> {
+pub(crate) fn parse_dtype(value: Option<&str>) -> Result<Option<NativeDtype>> {
     match value {
         None | Some("auto") => Ok(None),
         Some("f32") => Ok(Some(NativeDtype::F32)),
@@ -670,7 +674,7 @@ fn parse_dtype(value: Option<&str>) -> Result<Option<NativeDtype>> {
 /// precision on Metal, where it cuts the model's footprint by a third at no
 /// measurable retrieval cost; f32 elsewhere, where half-precision kernels are
 /// either slow (CPU, pre-Volta CUDA) or not worth the precision.
-fn default_dtype(device: &Device) -> DType {
+pub(crate) fn default_dtype(device: &Device) -> DType {
     if device.is_metal() {
         DType::F16
     } else {
@@ -679,7 +683,7 @@ fn default_dtype(device: &Device) -> DType {
 }
 
 impl NativeDtype {
-    fn to_candle(self) -> DType {
+    pub(crate) fn to_candle(self) -> DType {
         match self {
             Self::F32 => DType::F32,
             Self::F16 => DType::F16,
@@ -688,7 +692,7 @@ impl NativeDtype {
     }
 }
 
-fn dtype_name(dtype: DType) -> &'static str {
+pub(crate) fn dtype_name(dtype: DType) -> &'static str {
     match dtype {
         DType::F32 => "f32",
         DType::F16 => "f16",
@@ -698,7 +702,7 @@ fn dtype_name(dtype: DType) -> &'static str {
 }
 
 /// `cpu`, `metal` or `cuda`, from a [`device_label`] such as `metal:0`.
-fn device_kind(label: &str) -> &'static str {
+pub(crate) fn device_kind(label: &str) -> &'static str {
     match label.split(':').next() {
         Some("metal") => "metal",
         Some("cuda") => "cuda",
@@ -706,7 +710,7 @@ fn device_kind(label: &str) -> &'static str {
     }
 }
 
-fn resolve_device(spec: NativeDevice) -> Result<Device> {
+pub(crate) fn resolve_device(spec: NativeDevice) -> Result<Device> {
     match spec {
         NativeDevice::Cpu => Ok(Device::Cpu),
         NativeDevice::Auto => Ok(auto_device()),
@@ -744,11 +748,11 @@ fn metal_device() -> Result<Device> {
 
 /// Cache directory for model files. `FASTEMBED_CACHE_DIR` is the name earlier
 /// releases used (and documented), so it stays the override.
-fn model_cache_dir() -> String {
+pub(crate) fn model_cache_dir() -> String {
     std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".to_string())
 }
 
-fn apply_cache_dir(configured: Option<&std::path::Path>) {
+pub(crate) fn apply_cache_dir(configured: Option<&std::path::Path>) {
     if let Some(dir) = configured {
         let _ = std::fs::create_dir_all(dir);
         std::env::set_var("FASTEMBED_CACHE_DIR", dir);
@@ -780,7 +784,7 @@ pub(crate) fn minsync_cache_root() -> PathBuf {
     }
 }
 
-fn device_label(device: &Device) -> String {
+pub(crate) fn device_label(device: &Device) -> String {
     // Metal's `gpu_id` is an IORegistry id, not an ordinal; candle always
     // opens device 0, so the label carries no index.
     match device.location() {
