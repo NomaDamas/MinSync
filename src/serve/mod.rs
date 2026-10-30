@@ -369,6 +369,21 @@ pub fn default_state_dir(instance: &str) -> PathBuf {
         .join(instance)
 }
 
+/// HTTP client for talking to a `minsync serve` on this machine.
+///
+/// The server is loopback plain HTTP, so TLS never runs; building the client
+/// without the platform root-certificate store skips what would otherwise be
+/// the dominant cost of every CLI start (reading the system keychain took
+/// ~90 ms on macOS). Proxies are bypassed because the peer is local.
+pub(crate) fn loopback_client(timeout: Duration) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .build()
+        .ok()
+}
+
 /// Read `port`/`host` in `state_dir` and return the server's health when it
 /// answers as `instance`.
 pub async fn probe(state_dir: &Path, instance: &str) -> Option<Health> {
@@ -382,11 +397,7 @@ pub async fn probe(state_dir: &Path, instance: &str) -> Option<Health> {
         .unwrap_or_else(|_| "127.0.0.1".to_string());
     let ip = parse_loopback_host(&host).ok()?;
     let url = base_url(SocketAddr::new(ip, port));
-    let health: Health = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .no_proxy()
-        .build()
-        .ok()?
+    let health: Health = loopback_client(Duration::from_secs(2))?
         .get(format!("{url}/health"))
         .send()
         .await
