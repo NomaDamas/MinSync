@@ -25,7 +25,14 @@ use tokenizers::{Tokenizer, TruncationParams};
 /// Default cap on padded tokens (`inputs x longest input`) per forward pass.
 /// Bounds activations and keeps one pass short enough to finish inside the
 /// per-batch deadline on a loaded CPU.
-const MAX_BATCH_TOKENS: usize = 8192;
+///
+/// Measured on KURE-Sparse-nano, inputs sorted longest first, Metal and CPU
+/// f32: throughput falls as the budget grows (SciFact on Metal: 17.7 chunks/s
+/// at 512 tokens, 13.7 at 4096, 12.2 at 8192) because the forward pass costs
+/// more per token the larger the batch. 1024 is within 5% of the best value
+/// on every corpus measured and does not shrink batches of short chunks the
+/// way 128-256 does.
+const MAX_BATCH_TOKENS: usize = 1024;
 
 /// Process-wide, like the dense engine: a timed-out forward pass strands its
 /// thread (and the model) until exit, so later calls must fail fast.
@@ -193,15 +200,25 @@ impl NativeSparseEncoder {
                 })??
         };
         let lengths: Vec<usize> = tokenized.iter().map(Vec::len).collect();
-        let batches = plan_batches(&lengths, self.batch_size, self.max_batch_tokens);
-        let tokenized = Arc::new(tokenized);
-        let mut all = Vec::with_capacity(tokenized.len());
+        // Longest first, so the chunks of one batch have similar lengths and
+        // padding stays small; `order[position]` is the input that sits at
+        // `position` in the sorted run. Results go back to input order below.
+        let order = longest_first(&lengths);
+        let mut slots: Vec<Option<Vec<u32>>> = tokenized.into_iter().map(Some).collect();
+        let sorted: Vec<Vec<u32>> = order
+            .iter()
+            .map(|&index| slots[index].take().unwrap_or_default())
+            .collect();
+        let sorted_lengths: Vec<usize> = sorted.iter().map(Vec::len).collect();
+        let batches = plan_batches(&sorted_lengths, self.batch_size, self.max_batch_tokens);
+        let sorted = Arc::new(sorted);
+        let mut encoded = Vec::with_capacity(sorted.len());
         for range in batches {
             let expected = range.len();
             let _turn = self.gate.lock().await;
             let forward = Arc::clone(&self.forward);
             let model = Arc::clone(&loaded);
-            let rows = Arc::clone(&tokenized);
+            let rows = Arc::clone(&sorted);
             let vectors = SPARSE_DEADLINE
                 .run(
                     "native sparse encoding batch",
@@ -222,9 +239,19 @@ impl NativeSparseEncoder {
                     vectors.len()
                 )));
             }
-            all.extend(vectors);
+            encoded.extend(vectors);
         }
-        Ok(all)
+        let mut all: Vec<Option<SparseVector>> = (0..encoded.len()).map(|_| None).collect();
+        for (position, vector) in encoded.into_iter().enumerate() {
+            all[order[position]] = Some(vector);
+        }
+        all.into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    MinSyncError::Embedding("native sparse encoder lost an input".to_string())
+                })
+            })
+            .collect()
     }
 }
 
@@ -364,6 +391,14 @@ fn encode_batch(loaded: &Loaded, rows: &[Vec<u32>]) -> Result<Vec<SparseVector>>
             Ok(vector)
         })
         .collect()
+}
+
+/// Input indices ordered by token length, longest first; equal lengths keep
+/// their input order, so the result is deterministic.
+pub(crate) fn longest_first(lengths: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(lengths[index]));
+    order
 }
 
 /// Split inputs (by token length, in order) into consecutive batches of at
@@ -706,5 +741,68 @@ pub(crate) mod tests {
         assert!(plan_batches(&[], 4, 100).is_empty());
         // A lone over-budget input still gets a batch of its own.
         assert_eq!(plan_batches(&[500], 4, 100), vec![0..1]);
+    }
+
+    #[test]
+    fn longest_first_orders_by_token_length_and_keeps_ties_in_input_order() {
+        assert_eq!(longest_first(&[3, 9, 3, 7, 9]), vec![1, 4, 3, 0, 2]);
+        assert!(longest_first(&[]).is_empty());
+    }
+
+    #[test]
+    fn sorting_before_batching_cuts_padding() {
+        // Short and long inputs alternate: in input order every batch pads its
+        // short members up to a long one.
+        let lengths: Vec<usize> = (0..64).map(|i| if i % 2 == 0 { 20 } else { 400 }).collect();
+        let padded = |lengths: &[usize]| -> usize {
+            plan_batches(lengths, 64, 2048)
+                .iter()
+                .map(|range| range.len() * lengths[range.clone()].iter().max().unwrap())
+                .sum()
+        };
+        let sorted: Vec<usize> = longest_first(&lengths)
+            .iter()
+            .map(|&index| lengths[index])
+            .collect();
+        let (before, after) = (padded(&lengths), padded(&sorted));
+        assert!(after * 10 < before * 7, "padded tokens {before} -> {after}");
+    }
+
+    #[tokio::test]
+    async fn results_follow_input_order_when_batches_are_sorted_by_length() {
+        // The golden texts differ in length, so sorting moves them; every vector
+        // must still land on the text it came from.
+        let case = golden()
+            .cases
+            .into_iter()
+            .find(|c| c.kind == "document" && c.max_length == 64)
+            .unwrap();
+        let alone = NativeSparseEncoder::from_config(&SparseConfig {
+            batch_size: 1,
+            ..tiny_settings()
+        })
+        .unwrap();
+        let mut want = Vec::new();
+        for text in &case.texts {
+            want.push(
+                alone
+                    .encode(std::slice::from_ref(text))
+                    .await
+                    .unwrap()
+                    .remove(0),
+            );
+        }
+        let got = NativeSparseEncoder::from_config(&tiny_settings())
+            .unwrap()
+            .encode(&case.texts)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), want.len());
+        for (index, (got, want)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(got.indices(), want.indices(), "text {index}: terms");
+            for (a, b) in got.values().iter().zip(want.values()) {
+                assert!((a - b).abs() < 1e-4, "text {index}: {a} vs {b}");
+            }
+        }
     }
 }

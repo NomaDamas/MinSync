@@ -266,7 +266,7 @@ max_length = 2048
 
 # 선택 사항이며 기본값은 설정되지 않음:
 # per_batch_timeout_seconds = 120      # native 전용; 기본은 timeout_seconds(CPU에서는 최소 900)
-# max_batch_tokens = 8192             # native 전용
+# max_batch_tokens = 1024             # native 전용; forward pass당 padded token 수(입력 수 x 가장 긴 입력)
 # model_cache_dir = "~/.cache/minsync/models"
 # base_url = "http://localhost:8081"  # tei: 전용
 ```

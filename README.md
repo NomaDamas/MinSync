@@ -329,7 +329,7 @@ max_length = 2048
 
 # Optional, unset by default:
 # per_batch_timeout_seconds = 120      # native only; defaults to timeout_seconds (at least 900 on CPU)
-# max_batch_tokens = 8192             # native only
+# max_batch_tokens = 1024             # native only; padded tokens (inputs x longest) per forward pass
 # model_cache_dir = "~/.cache/minsync/models"
 # base_url = "http://localhost:8081"  # tei: only
 ```
