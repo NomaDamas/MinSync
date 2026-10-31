@@ -273,7 +273,7 @@ max_length = 2048
 
 Provider:
 
-- `native:`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(약 100 MB)를 model cache로 받습니다.
+- `native:`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(299 MB)를 model cache로 받으며, 모델은 f32로 메모리에 올라가 약 600 MB를 차지합니다.
 - `tei:`는 Text Embeddings Inference 서버의 `POST /embed_sparse`를 호출하며 `base_url`이 그 서버를 가리킵니다.
 - `native:`는 실행 중인 `minsync serve --sparse`를 자동으로 채택합니다(discovery 규칙은 dense embedder와 같으며 `MINSYNC_SERVER=off`로 끕니다). `minsync serve --sparse`는 TEI 호환 `POST /embed_sparse`와 `GET /health`(kind `sparse`)를 제공합니다.
 
@@ -295,6 +295,27 @@ sync에서 재시도됩니다.
 `minsync check`는 sparse encoder도 probe해 `sparse_ok`를 보고합니다. library는
 `MinSync::with_sparse_encoder(Arc<dyn SparseEncoder>)`를 제공하며, 이것이 없으면
 sync는 dense-only로 sparse 단계를 수행하지 않습니다.
+
+### 메모리
+
+Apple Silicon에서 측정한 값입니다(peak footprint; 모델은 f32로 올라가며 299 MB
+bf16 파일을 memory-map합니다).
+
+| 프로세스 | Peak |
+|---|---|
+| 실행 중인 `minsync serve --sparse`를 쓰는 `minsync query` / `sync` | 25-250 MB |
+| `minsync query --mode sparse`, in-process | 약 1.3 GB (Metal), 0.85 GB (CPU) |
+| `minsync sync`, in-process, Metal | 1.4-1.6 GB, 5,203 chunk 전체 실행 동안 일정 |
+| `minsync sync`, in-process, CPU | 0.9-1.0 GB |
+| `minsync serve --sparse`, 로드 직후 idle | 약 1.1 GB |
+
+모델 가중치가 그 중 약 0.6 GB이고, 나머지는 forward pass 한 번에 처리하는 양에
+비례하는 scratch 메모리입니다. 두 가지 한도로 상한이 정해집니다.
+`max_batch_tokens`(forward pass당 padded token 수, 기본 1024)와 vocabulary
+projection 및 pooling에 쓰는 고정 128-token 블록입니다(여기서 token 하나가 약
+200 KB). 처리량을 조금 양보하고 메모리를 줄이려면 `max_batch_tokens`를 낮추세요.
+chunk를 길이순으로 정렬한 뒤 batch로 묶기 때문에 작은 값에서도 처리량이 유지됩니다.
+`MINSYNC_SERVER=off`로 in-process 인코딩을 강제할 수 있습니다.
 
 ### BM25 시절 index에서 업그레이드
 

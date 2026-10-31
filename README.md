@@ -336,7 +336,7 @@ max_length = 2048
 
 Providers:
 
-- `native:` runs the model in-process on [candle](https://github.com/huggingface/candle) (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (about 100 MB).
+- `native:` runs the model in-process on [candle](https://github.com/huggingface/candle) (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
 - `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
@@ -358,6 +358,27 @@ rejects is reported with stage `sparse` and retried by the next sync.
 `minsync check` also probes the sparse encoder and reports `sparse_ok`. The
 library exposes `MinSync::with_sparse_encoder(Arc<dyn SparseEncoder>)`; without
 it a sync is dense-only and runs no sparse phase.
+
+### Memory
+
+Measured on Apple Silicon (peak footprint; the model is held as f32 and
+memory-mapped from the 299 MB bf16 file):
+
+| Process | Peak |
+|---|---|
+| `minsync query` / `sync` using a running `minsync serve --sparse` | 25-250 MB |
+| `minsync query --mode sparse`, in-process | about 1.3 GB (Metal), 0.85 GB (CPU) |
+| `minsync sync`, in-process, Metal | 1.4-1.6 GB, flat across a 5,203-chunk run |
+| `minsync sync`, in-process, CPU | 0.9-1.0 GB |
+| `minsync serve --sparse`, idle after load | about 1.1 GB |
+
+The model weights are about 0.6 GB of that. The rest is scratch memory that
+scales with the work done per forward pass. Two limits bound it:
+`max_batch_tokens` (padded tokens per forward pass, default 1024) and a fixed
+128-token block for the vocabulary projection and pooling (one token costs
+about 200 KB there). Lower `max_batch_tokens` to trade a little throughput for
+less memory. Sorting chunks by length before batching keeps throughput up at
+small values. Set `MINSYNC_SERVER=off` to force in-process encoding.
 
 ### Upgrading from a BM25-era index
 

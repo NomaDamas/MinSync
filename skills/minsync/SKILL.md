@@ -109,7 +109,7 @@ dimension = 384
 
 MinSync also supports learned-sparse (SPLADE) retrieval, independent of the dense embedder, configured under `[sparse]` in `.minsync/config.toml` (default model `native:nlpai-lab/KURE-Sparse-nano`, Apache-2.0). Providers:
 
-- `native:` runs the ModernBERT + SPLADE model in-process on candle (no Python, no ONNX runtime); the weights download from Hugging Face on first use (~100 MB).
+- `native:` runs the ModernBERT + SPLADE model in-process on candle (no Python, no ONNX runtime); the weights (299 MB) download from Hugging Face on first use and are held in memory as f32 (about 600 MB).
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse` at `base_url`.
 - A running `minsync serve --sparse` is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
