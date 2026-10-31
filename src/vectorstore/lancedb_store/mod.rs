@@ -955,6 +955,47 @@ mod tests {
         assert_eq!(store.doc_count(), 3);
     }
 
+    /// 40 commits of 10 rows, a checkpoint after each; returns the fragments left.
+    fn fragments_after_many_small_commits(indexing: IndexingConfig) -> usize {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store =
+            LanceDbStore::open_with_indexing(dir.path(), 4, indexing).expect("create store");
+        for batch in 0..40 {
+            let docs: Vec<_> = (0..10)
+                .map(|i| {
+                    doc(
+                        &format!("id-{batch}-{i}"),
+                        "a.txt",
+                        "t",
+                        vec![1.0, 0.0, 0.0, 0.0],
+                    )
+                })
+                .collect();
+            store.upsert(&docs).expect("upsert");
+            store.checkpoint().expect("checkpoint");
+        }
+        assert_eq!(store.doc_count(), 400);
+        store.fragment_count().expect("fragments")
+    }
+
+    #[test]
+    fn test_compaction_target_keeps_full_fragments_from_being_rewritten() {
+        // Below the target every compaction folds the whole table into one
+        // fragment, so a long sync rewrites everything written so far each time.
+        let merged = fragments_after_many_small_commits(IndexingConfig {
+            compact_fragment_threshold: 4,
+            ..IndexingConfig::default()
+        });
+        // With a 100-row target a fragment that has filled up is left alone.
+        let kept = fragments_after_many_small_commits(IndexingConfig {
+            compact_fragment_threshold: 4,
+            compact_target_rows: 100,
+            ..IndexingConfig::default()
+        });
+        assert!(merged < 4, "small table folds into few fragments: {merged}");
+        assert!(kept >= 4, "full fragments must survive checkpoints: {kept}");
+    }
+
     #[test]
     fn test_existing_ids_returns_only_present_ids() {
         let (_dir, mut store) = store();

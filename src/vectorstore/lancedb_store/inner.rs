@@ -3,7 +3,9 @@
 use super::filters::{
     column_in_filter, filter_to_sql, has_sparse_filter, id_in_filter, missing_sparse_filter,
 };
-use super::index::{compact_if_fragmented, maintain_index, maintain_scalar_indexes};
+use super::index::{
+    compact_if_fragmented, compaction_options, maintain_index, maintain_scalar_indexes,
+};
 use super::schema::{
     batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse, batch_to_query_hits,
     batch_to_scored_hits, batch_to_sparse_targets, dedupe_documents, docs_to_batch, schema,
@@ -531,7 +533,7 @@ impl LanceDbInner {
     pub(super) async fn flush(&self) -> Result<()> {
         self.table
             .optimize(OptimizeAction::Compact {
-                options: lancedb::table::CompactionOptions::default(),
+                options: compaction_options(self.indexing.compact_target_rows),
                 remap_options: None,
             })
             .await
@@ -546,7 +548,12 @@ impl LanceDbInner {
     /// when fragments pile up, and prune old versions. Never retrains the
     /// ANN/FTS indexes — that stays in [`Self::flush`].
     pub(super) async fn checkpoint(&self) -> Result<()> {
-        compact_if_fragmented(&self.table, self.indexing.compact_fragment_threshold).await?;
+        compact_if_fragmented(
+            &self.table,
+            self.indexing.compact_fragment_threshold,
+            self.indexing.compact_target_rows,
+        )
+        .await?;
         maintain_scalar_indexes(&self.table).await?;
         self.prune().await
     }

@@ -11,6 +11,12 @@ use lancedb::Table;
 pub(super) const DEFAULT_INDEX_BUILD_THRESHOLD: usize = 256;
 pub(super) const DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD: usize = 10_000;
 pub(super) const DEFAULT_COMPACT_FRAGMENT_THRESHOLD: usize = 64;
+/// Rows a fragment may hold before compaction leaves it alone. Lance's own
+/// default is 1M rows, which makes every fragment of a table smaller than that a
+/// candidate, so each compaction rewrote the whole table (measured: a sync that
+/// added 85k files to a 21k-row SPLADE index wrote 48 GB for 0.25 GB of data).
+/// 16k rows is about 80 MB with a sparse vector per row.
+pub(super) const DEFAULT_COMPACT_TARGET_ROWS: usize = 16_384;
 
 /// Columns every sync filter hits: `id` (fetch / metadata update / upsert
 /// replace) and `path` (per-file sweep). Without a scalar index each such
@@ -43,6 +49,9 @@ pub struct IndexingConfig {
     /// fragments. Bounds how fragmented the store can get inside one long
     /// sync (and so how slow a killed-and-restarted sync is to reopen).
     pub compact_fragment_threshold: usize,
+    /// A fragment with at least this many rows is full: compaction merges the
+    /// smaller ones among themselves but never rewrites it.
+    pub compact_target_rows: usize,
     /// Build and maintain the ANN index over the vector column. Off for
     /// sparse-only stores, whose vectors are placeholders: an HNSW build over
     /// identical zero vectors is meaningless and can fail.
@@ -55,6 +64,7 @@ impl Default for IndexingConfig {
             index_build_threshold: DEFAULT_INDEX_BUILD_THRESHOLD,
             index_optimize_delta_threshold: DEFAULT_INDEX_OPTIMIZE_DELTA_THRESHOLD,
             compact_fragment_threshold: DEFAULT_COMPACT_FRAGMENT_THRESHOLD,
+            compact_target_rows: DEFAULT_COMPACT_TARGET_ROWS,
             build_ann_index: true,
         }
     }
@@ -79,6 +89,9 @@ impl IndexingConfig {
         if let Some(value) = options.get("compact_fragment_threshold") {
             config.compact_fragment_threshold =
                 parse_positive_usize(value, "compact_fragment_threshold")?;
+        }
+        if let Some(value) = options.get("compact_target_rows") {
+            config.compact_target_rows = parse_positive_usize(value, "compact_target_rows")?;
         }
         Ok(config)
     }
@@ -143,9 +156,22 @@ pub(super) async fn maintain_scalar_indexes(table: &Table) -> Result<()> {
     Ok(())
 }
 
-/// Compact all fragments (rewriting deletions) when the table holds at
-/// least `threshold` of them. Returns whether a compaction ran.
-pub(super) async fn compact_if_fragmented(table: &Table, threshold: usize) -> Result<bool> {
+/// Compaction settings shared by the mid-sync checkpoint and the final flush.
+pub(super) fn compaction_options(target_rows: usize) -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment: target_rows,
+        ..CompactionOptions::default()
+    }
+}
+
+/// Compact fragments (rewriting deletions) when the table holds at least
+/// `threshold` of them. Fragments that already hold `target_rows` rows are left
+/// alone. Returns whether a compaction ran.
+pub(super) async fn compact_if_fragmented(
+    table: &Table,
+    threshold: usize,
+    target_rows: usize,
+) -> Result<bool> {
     let fragments = table
         .stats()
         .await
@@ -157,7 +183,7 @@ pub(super) async fn compact_if_fragmented(table: &Table, threshold: usize) -> Re
     }
     table
         .optimize(OptimizeAction::Compact {
-            options: CompactionOptions::default(),
+            options: compaction_options(target_rows),
             remap_options: None,
         })
         .await
