@@ -31,6 +31,13 @@ pub struct SyncResult {
     /// content hash) instead of being embedded again.
     #[serde(default)]
     pub embeddings_reused: usize,
+    /// Chunks that got a sparse (SPLADE) vector from the encoder this run.
+    #[serde(default)]
+    pub sparse_encoded: usize,
+    /// Chunks whose sparse vector was copied from an identical chunk (same
+    /// content hash, same model) instead of being encoded again.
+    #[serde(default)]
+    pub sparse_reused: usize,
     pub estimated_tokens: usize,
     pub files_checked: usize,
     pub freshness_check_only: bool,
@@ -64,6 +71,8 @@ pub enum FileStage {
     Truncate,
     Embed,
     Store,
+    /// The sparse encoder rejected one of the file's chunks.
+    Sparse,
 }
 
 impl std::fmt::Display for FileStage {
@@ -75,6 +84,7 @@ impl std::fmt::Display for FileStage {
             Self::Truncate => "truncate",
             Self::Embed => "embed",
             Self::Store => "store",
+            Self::Sparse => "sparse",
         })
     }
 }
@@ -102,14 +112,13 @@ pub struct QueryResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bm25_rank: Option<usize>,
+    pub sparse_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_state: Option<IndexState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexState {
-    pub fts_indexed: bool,
     pub ann_indexed: bool,
     pub unindexed_rows: Option<usize>,
 }
@@ -137,6 +146,9 @@ pub enum SyncState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckResult {
     pub embedder_ok: bool,
+    /// The sparse encoder answered a probe (true when there is none to probe).
+    #[serde(default)]
+    pub sparse_ok: bool,
     pub vectorstore_ok: bool,
     pub all_passed: bool,
     pub errors: Vec<String>,

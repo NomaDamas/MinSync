@@ -5,8 +5,9 @@
 use super::inner::LanceDbInner;
 use super::{to_store_error, IndexingConfig};
 use crate::error::Result;
+use crate::sparse::SparseVector;
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit};
+use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget};
 use std::collections::HashMap;
 use std::sync::mpsc;
 
@@ -27,8 +28,25 @@ pub(super) enum Command {
         topk: usize,
         resp: Resp<Vec<QueryHit>>,
     },
-    QueryText {
-        text: String,
+    RowsMissingSparse {
+        model: String,
+        limit: usize,
+        resp: Resp<Vec<SparseTarget>>,
+    },
+    CountMissingSparse(String, Resp<usize>),
+    SetSparse {
+        model: String,
+        rows: Vec<(String, SparseVector)>,
+        resp: Resp<()>,
+    },
+    FetchSparseByContentHash {
+        model: String,
+        hashes: Vec<String>,
+        resp: Resp<HashMap<String, SparseVector>>,
+    },
+    QuerySparse {
+        model: String,
+        vector: SparseVector,
         filter: Option<Filter>,
         topk: usize,
         resp: Resp<Vec<QueryHit>>,
@@ -47,7 +65,6 @@ pub(super) fn run_worker(
     uri: String,
     dim: usize,
     indexing: IndexingConfig,
-    language: String,
     read_only: bool,
     cmd_rx: mpsc::Receiver<Command>,
     init_tx: mpsc::Sender<Result<()>>,
@@ -64,7 +81,7 @@ pub(super) fn run_worker(
         }
     };
 
-    let inner = match rt.block_on(LanceDbInner::open(&uri, dim, indexing, language, read_only)) {
+    let inner = match rt.block_on(LanceDbInner::open(&uri, dim, indexing, read_only)) {
         Ok(inner) => inner,
         Err(error) => {
             let _ = init_tx.send(Err(error));
@@ -103,12 +120,33 @@ pub(super) fn run_worker(
                 topk,
                 resp,
             } => send_response(resp, rt.block_on(inner.query(vector, filter, topk))),
-            Command::QueryText {
-                text,
+            Command::RowsMissingSparse { model, limit, resp } => {
+                send_response(resp, rt.block_on(inner.rows_missing_sparse(model, limit)))
+            }
+            Command::CountMissingSparse(model, resp) => {
+                send_response(resp, rt.block_on(inner.count_missing_sparse(model)))
+            }
+            Command::SetSparse { model, rows, resp } => {
+                send_response(resp, rt.block_on(inner.set_sparse(model, rows)))
+            }
+            Command::FetchSparseByContentHash {
+                model,
+                hashes,
+                resp,
+            } => send_response(
+                resp,
+                rt.block_on(inner.fetch_sparse_by_content_hash(model, hashes)),
+            ),
+            Command::QuerySparse {
+                model,
+                vector,
                 filter,
                 topk,
                 resp,
-            } => send_response(resp, rt.block_on(inner.query_text(text, filter, topk))),
+            } => send_response(
+                resp,
+                rt.block_on(inner.query_sparse(model, vector, filter, topk)),
+            ),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
             Command::Checkpoint(resp) => send_response(resp, rt.block_on(inner.checkpoint())),
             Command::FragmentCount(resp) => {

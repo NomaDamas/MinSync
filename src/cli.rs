@@ -32,7 +32,7 @@ pub enum ProgressFormat {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum QueryMode {
     Vector,
-    Bm25,
+    Sparse,
     Hybrid,
 }
 
@@ -40,7 +40,7 @@ impl QueryMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Vector => "vector",
-            Self::Bm25 => "bm25",
+            Self::Sparse => "sparse",
             Self::Hybrid => "hybrid",
         }
     }
@@ -52,14 +52,12 @@ pub enum Commands {
     Init {
         #[arg(long)]
         force: bool,
-        /// Embedder id (`native:`, `tei:`, `openai:`), or `none` for a
-        /// BM25-only index that needs no model or API key.
+        /// Dense embedder id (`native:`, `tei:`, `openai:`), or `none` for a
+        /// sparse-only index that needs no dense model or API key.
         #[arg(long, default_value = crate::config::DEFAULT_EMBEDDER_ID)]
         embedder: String,
         #[arg(long, default_value = "recursive")]
         chunker: String,
-        #[arg(long, default_value = "simple")]
-        language: String,
     },
     /// Sync files to vector index
     Sync {
@@ -93,7 +91,7 @@ pub enum Commands {
         text: String,
         #[arg(long, short, default_value = "10")]
         k: usize,
-        /// Retrieval mode. Defaults to `vector`, or to `bm25` in a workspace
+        /// Retrieval mode. Defaults to `vector`, or to `sparse` in a workspace
         /// initialised with `--embedder none`.
         #[arg(long, value_enum)]
         mode: Option<QueryMode>,
@@ -209,5 +207,23 @@ mod tests {
             sparse.command,
             Commands::Serve { sparse: true, .. }
         ));
+    }
+
+    #[test]
+    fn query_modes_are_vector_sparse_and_hybrid_only() {
+        for mode in ["vector", "sparse", "hybrid"] {
+            assert!(
+                Cli::try_parse_from(["minsync", "query", "q", "--mode", mode]).is_ok(),
+                "{mode} must parse"
+            );
+        }
+        let bm25 = Cli::try_parse_from(["minsync", "query", "q", "--mode", "bm25"]);
+        assert!(bm25.is_err(), "bm25 search no longer exists");
+    }
+
+    #[test]
+    fn init_has_no_language_flag() {
+        assert!(Cli::try_parse_from(["minsync", "init", "--language", "ko"]).is_err());
+        assert!(Cli::try_parse_from(["minsync", "init"]).is_ok());
     }
 }

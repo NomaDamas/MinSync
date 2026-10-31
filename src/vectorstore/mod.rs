@@ -39,6 +39,15 @@ pub struct QueryHit {
     pub content_hash: String,
 }
 
+/// A stored chunk that still needs a sparse vector from the current model.
+#[derive(Debug, Clone)]
+pub struct SparseTarget {
+    pub id: String,
+    pub path: String,
+    pub content_hash: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum Filter {
     Eq(String, String),
@@ -83,8 +92,35 @@ pub trait VectorStore: Send + Sync {
     }
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize>;
     fn query(&self, vector: &[f32], filter: Option<&Filter>, topk: usize) -> Result<Vec<QueryHit>>;
-    fn query_text(&self, text: &str, filter: Option<&Filter>, topk: usize)
-        -> Result<Vec<QueryHit>>;
+
+    /// At most `limit` rows that hold no sparse vector from `model`: never
+    /// encoded, or encoded by another model. Sync encodes these, so a fresh
+    /// row, an old row after a model change and a row left over from an
+    /// interrupted run are all the same case.
+    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>>;
+    /// How many rows [`VectorStore::rows_missing_sparse`] would return without a limit.
+    fn count_missing_sparse(&self, model: &str) -> Result<usize>;
+    /// Attach sparse vectors from `model` to existing rows by id. An id that
+    /// is no longer stored is ignored, never inserted. An empty vector is a
+    /// valid answer (the text has no terms) and marks the row as done.
+    fn set_sparse(&mut self, model: &str, rows: &[(String, SparseVector)]) -> Result<()>;
+    /// A stored sparse vector from `model` for each of `content_hashes` that
+    /// has one, keyed by content hash. Identical text encodes identically,
+    /// so sync copies these instead of running the model again.
+    fn fetch_sparse_by_content_hash(
+        &self,
+        model: &str,
+        content_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, SparseVector>>;
+    /// Exact top-`topk` by inner product against rows encoded by `model`;
+    /// rows that share no term with `vector` are not hits.
+    fn query_sparse(
+        &self,
+        model: &str,
+        vector: &SparseVector,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>>;
     fn flush(&mut self) -> Result<()>;
     /// Cheap mid-sync maintenance so a long run that is killed leaves a
     /// store that is still fast to reopen: compact once fragments pile up
@@ -103,6 +139,7 @@ pub trait VectorStore: Send + Sync {
 
 use crate::config::Config;
 use crate::error::MinSyncError;
+use crate::sparse::SparseVector;
 use std::path::Path;
 
 /// Construct a [`VectorStore`] implementation from the vectorstore id in `config`.
@@ -131,28 +168,18 @@ fn create_vectorstore_with_mode(
         "lancedb" => {
             let options = Some(&config.vectorstore.options);
             let mut indexing = lancedb_store::IndexingConfig::from_options(options)?;
-            let dimension = if config.is_lexical_only() {
+            let dimension = if config.is_sparse_only() {
                 // Vectors are placeholders: pin the width so a stale
                 // `dimension` option cannot reject them, and skip ANN.
                 indexing.build_ann_index = false;
-                crate::config::LEXICAL_ONLY_DIMENSION
+                crate::config::SPARSE_ONLY_DIMENSION
             } else {
                 lancedb_store::LanceDbStore::dimension_from_options(options)?
             };
             let store = if read_only {
-                lancedb_store::LanceDbStore::open_readonly(
-                    store_path,
-                    dimension,
-                    indexing,
-                    &config.lexical.language,
-                )?
+                lancedb_store::LanceDbStore::open_readonly(store_path, dimension, indexing)?
             } else {
-                lancedb_store::LanceDbStore::open_with_language(
-                    store_path,
-                    dimension,
-                    indexing,
-                    &config.lexical.language,
-                )?
+                lancedb_store::LanceDbStore::open_with_indexing(store_path, dimension, indexing)?
             };
             Ok(Box::new(store))
         }
@@ -180,7 +207,7 @@ mod factory_tests {
     }
 
     #[test]
-    fn test_create_vectorstore_lexical_only_ignores_dimension_and_skips_ann() {
+    fn test_create_vectorstore_sparse_only_ignores_dimension_and_skips_ann() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
         config.embedder.id = "none".to_string();
@@ -194,7 +221,7 @@ mod factory_tests {
         let docs: Vec<Document> = (0..4)
             .map(|i| Document {
                 id: format!("id-{i}"),
-                embedding: vec![0.0; crate::config::LEXICAL_ONLY_DIMENSION],
+                embedding: vec![0.0; crate::config::SPARSE_ONLY_DIMENSION],
                 text: format!("lexical row {i}"),
                 source_id: "s".to_string(),
                 path: format!("{i}.txt"),
@@ -209,9 +236,8 @@ mod factory_tests {
         store.flush().expect("flush must not build an ANN index");
 
         let state = store.index_state().expect("state").expect("lancedb state");
-        assert!(state.fts_indexed);
         assert!(!state.ann_indexed);
-        assert_eq!(store.query_text("row", None, 10).expect("bm25").len(), 4);
+        assert_eq!(store.doc_count(), 4);
     }
 
     #[test]

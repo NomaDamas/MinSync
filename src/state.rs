@@ -14,12 +14,12 @@ pub struct Cursor {
     pub chunk_schema_id: String,
     pub embedder_id: String,
     pub collection_path: String,
-    #[serde(default = "default_lexical_language")]
-    pub lexical_language: String,
-}
-
-fn default_lexical_language() -> String {
-    "simple".to_string()
+    /// The sparse model every stored row was encoded with at the end of the
+    /// last sync. Absent before sparse retrieval existed, or while the
+    /// encoding phase has not completed (an interrupted or failed run):
+    /// sparse and hybrid queries refuse such an index.
+    #[serde(default)]
+    pub sparse_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -154,7 +154,7 @@ mod tests {
             chunk_schema_id: "schema-1".to_string(),
             embedder_id: "embedder-1".to_string(),
             collection_path: ".minsync/collection".to_string(),
-            lexical_language: "simple".to_string(),
+            sparse_id: Some("nlpai-lab/KURE-Sparse-nano".to_string()),
         }
     }
 
@@ -168,6 +168,26 @@ mod tests {
         let loaded = Cursor::load(&path).expect("load cursor");
 
         assert_eq!(cursor, loaded);
+    }
+
+    #[test]
+    fn test_cursor_from_the_bm25_era_loads_without_a_sparse_model() {
+        // What sync wrote before sparse retrieval: `lexical_language`, no
+        // `sparse_id`. It must load (as "never sparse-encoded"), not fail.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("cursor.json");
+        std::fs::write(
+            &path,
+            r#"{"source_id":"s","last_synced_at":"2026-05-28T00:00:00Z","manifest_hash":"sha256:abc",
+               "chunk_schema_id":"recursive","embedder_id":"e","collection_path":"store",
+               "lexical_language":"ko"}"#,
+        )
+        .expect("write legacy cursor");
+
+        let loaded = Cursor::load(&path).expect("legacy cursor loads");
+
+        assert_eq!(loaded.sparse_id, None);
+        assert_eq!(loaded.embedder_id, "e");
     }
 
     #[test]

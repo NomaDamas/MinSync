@@ -10,6 +10,8 @@ use std::process::Output;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+
 const DIMENSION: usize = 4;
 /// `MinSyncError::Embedding`, the code `sync` already uses for a failed embedder.
 const EXIT_EMBEDDING: i32 = 5;
@@ -32,6 +34,7 @@ fn setup(root: &Path, base_url: &str) {
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(DIMENSION as i64));
     config.vectorstore.options = toml::Value::Table(options);
+    common::use_tiny_sparse(&mut config);
     config.save(&config_path).expect("save config");
 }
 
@@ -114,14 +117,48 @@ async fn the_text_report_fails_the_same_way() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bm25_only_workspace_has_no_embedder_to_fail() {
+async fn a_sparse_only_workspace_has_no_dense_embedder_to_fail() {
     let dir = tempfile::tempdir().unwrap();
     minsync(dir.path())
         .args(["init", "--embedder", "none"])
         .assert()
         .success();
+    // `check` still probes the sparse encoder, so it must not reach for the
+    // real KURE weights.
+    common::use_tiny_sparse_in(dir.path());
 
     let output = run_check(dir.path(), &["--format", "json"]).await;
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["embedder_ok"], true);
+    assert_eq!(result["sparse_ok"], true);
+    assert_eq!(result["all_passed"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sparse_encoder_that_cannot_load_fails_check_with_the_embedding_code() {
+    let server = gateway(200, serde_json::json!([[0.5, 0.5, 0.5, 0.5]])).await;
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path(), &server.uri());
+
+    // The dense embedder still answers, but the sparse encoder points at a
+    // checkpoint that does not exist on disk.
+    let config_path = dir.path().join(".minsync/config.toml");
+    let mut config = Config::load(&config_path).expect("load config");
+    config.sparse.id = "native:/nonexistent/model-dir".to_string();
+    config.save(&config_path).expect("save config");
+
+    let output = run_check(dir.path(), &["--format", "json"]).await;
+
+    assert_eq!(output.status.code(), Some(EXIT_EMBEDDING), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).expect("json report on stdout");
+    assert_eq!(result["sparse_ok"], false);
+    assert_eq!(
+        result["embedder_ok"], true,
+        "the dense probe is independent"
+    );
+    assert_eq!(result["all_passed"], false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sparse encoder check failed"), "{stderr}");
 }

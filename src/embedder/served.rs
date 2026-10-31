@@ -105,11 +105,7 @@ impl ServedEmbedder {
         self.remote
             .get_or_init(|| async {
                 let health = crate::serve::probe(&self.state_dir, &self.instance).await?;
-                let client = reqwest::Client::builder()
-                    .timeout(self.timeout)
-                    .no_proxy()
-                    .build()
-                    .ok()?;
+                let client = crate::serve::loopback_client(self.timeout)?;
                 tracing::info!(url = %health.url, pid = health.pid, "using running minsync serve");
                 Some(Remote {
                     url: health.url,

@@ -174,6 +174,30 @@ fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> CResult<LayerNorm> {
 /// input costs ~100 MB of scratch instead of ~3 GB.
 const QUERY_TILE: usize = 256;
 
+/// Tokens (rows x positions) the decoder projection and the pooling handle at
+/// once. The projection is `tokens x vocab` f32, 200 KB per token for this
+/// vocabulary, and pooling holds several temporaries of that size, so this
+/// number alone sets the scratch memory of the encoder, whatever the batch.
+///
+/// Measured on KURE-Sparse-nano with a full sync: 128 tokens encode as fast as
+/// 1024 (SciFact 15.6 vs 15.2-15.7 chunks/s, Korean 31.7-35.7 vs 32.8) and cut
+/// the Metal peak from 2.2 GB to 1.56 GB and the CPU peak from 3.4 GB to 1.0 GB.
+const LOGIT_TOKENS: usize = 128;
+
+/// Rows and positions of one decoder/pooling block: at most `chunk` positions
+/// (the pooling module's `chunk_size`, the whole sequence when unset) and at
+/// most `cap` tokens (rows x positions) in total; never below 1 x 1.
+pub(crate) fn logit_shape(seq: usize, chunk: Option<usize>, cap: usize) -> (usize, usize) {
+    let cap = cap.max(1);
+    let positions = chunk
+        .filter(|&size| size > 0)
+        .unwrap_or(seq)
+        .min(seq)
+        .min(cap)
+        .max(1);
+    (cap / positions, positions)
+}
+
 struct Rotary {
     cos: Tensor,
     sin: Tensor,
@@ -321,6 +345,8 @@ pub struct ModernBertMlm {
     positions: usize,
     /// Query rows per attention block ([`QUERY_TILE`]).
     tile: usize,
+    /// Tokens per decoder/pooling block ([`LOGIT_TOKENS`]).
+    logit_tokens: usize,
     device: Device,
     dtype: DType,
     vocab_size: usize,
@@ -401,6 +427,7 @@ impl ModernBertMlm {
             half_window: cfg.local_attention / 2,
             positions,
             tile: QUERY_TILE,
+            logit_tokens: LOGIT_TOKENS,
             vocab_size: cfg.vocab_size,
         })
     }
@@ -421,6 +448,13 @@ impl ModernBertMlm {
     #[cfg(test)]
     pub(crate) fn with_tile(mut self, tile: usize) -> Self {
         self.tile = tile.max(1);
+        self
+    }
+
+    /// Tokens per decoder/pooling block; tests shrink it to exercise blocking.
+    #[cfg(test)]
+    pub(crate) fn with_logit_tokens(mut self, tokens: usize) -> Self {
+        self.logit_tokens = tokens.max(1);
         self
     }
 
@@ -505,9 +539,11 @@ impl ModernBertMlm {
     /// SPLADE term weights, one dense `[dimension]` row per input.
     ///
     /// `rows` are the real token ids of each input (the same ones that were
-    /// right-padded into `ids`). The decoder projection and the pooling run
-    /// `pooling.chunk_size` positions at a time, so peak logit memory is
-    /// `batch x chunk x vocab` whatever the sequence length.
+    /// right-padded into `ids`). The decoder projection and the pooling work
+    /// on blocks of at most `logit_tokens` (rows x positions) at a time, so
+    /// the logit tensors and the temporaries derived from them stay bounded
+    /// whatever the batch size or the sequence length. The max over positions
+    /// and the per-row result are exact across any blocking.
     pub fn splade(
         &self,
         ids: &Tensor,
@@ -518,21 +554,33 @@ impl ModernBertMlm {
         let inner = || -> CResult<Vec<Vec<f32>>> {
             let states = self.head_states(ids, &lengths)?;
             let (batch, seq, _) = states.dims3()?;
-            let chunk = pooling
-                .chunk_size
-                .filter(|&size| size > 0)
-                .unwrap_or(seq)
-                .min(seq.max(1));
+            let (block_rows, block_positions) =
+                logit_shape(seq, pooling.chunk_size, self.logit_tokens);
             let mask = PoolMask::new(pooling, rows, seq, self.vocab_size, &self.device)?;
-            let mut pooled = Tensor::zeros((batch, self.vocab_size), DType::F32, &self.device)?;
-            let mut start = 0;
-            while start < seq {
-                let take = chunk.min(seq - start);
-                let logits = self.decoder.forward(&states.narrow(1, start, take)?)?;
-                pooled = pooling.accumulate(&pooled, &logits, &mask, start, take)?;
-                start += take;
+            let mut out = Vec::with_capacity(batch);
+            let mut first = 0;
+            while first < batch {
+                let take_rows = block_rows.min(batch - first);
+                let block = states.narrow(0, first, take_rows)?;
+                let keep = mask.keep.narrow(0, first, take_rows)?;
+                let mut pooled =
+                    Tensor::zeros((take_rows, self.vocab_size), DType::F32, &self.device)?;
+                let mut start = 0;
+                while start < seq {
+                    let take = block_positions.min(seq - start);
+                    let logits = self.decoder.forward(&block.narrow(1, start, take)?)?;
+                    pooled = pooling.accumulate(
+                        &pooled,
+                        &logits,
+                        &keep.narrow(1, start, take)?,
+                        &mask.open,
+                    )?;
+                    start += take;
+                }
+                out.extend(pooling.fold(&pooled)?);
+                first += take_rows;
             }
-            pooling.fold(&pooled)
+            Ok(out)
         };
         inner().map_err(|error| {
             MinSyncError::Embedding(format!("native sparse forward failed: {error}"))
@@ -652,23 +700,21 @@ impl SpladePooling {
             .map_or(vocab_size, |max| *max as usize + 1)
     }
 
-    /// Fold positions `[start, start + take)` of `logits`
-    /// (`[batch, take, vocab]`) into the running per-term max `pooled`
-    /// (`[batch, vocab]`, f32). `max` is exact across any chunking, and every
-    /// weight is >= 0, so the accumulator starts at zero.
+    /// Fold one block of `logits` (`[rows, take, vocab]`) into the running
+    /// per-term max `pooled` (`[rows, vocab]`, f32). `keep` is the block's
+    /// `[rows, take, 1]` slice of the position mask, `open` the vocabulary
+    /// mask. `max` is exact across any blocking, and every weight is >= 0, so
+    /// the accumulator starts at zero.
     fn accumulate(
         &self,
         pooled: &Tensor,
         logits: &Tensor,
-        mask: &PoolMask,
-        start: usize,
-        take: usize,
+        keep: &Tensor,
+        open: &Tensor,
     ) -> CResult<Tensor> {
-        let keep = mask.keep.narrow(1, start, take)?;
         // The reference multiplies the *shifted* logit by the mask before relu.
-        let shifted = ((logits.to_dtype(DType::F32)? - self.logit_shift)?
-            .broadcast_mul(&mask.open)?)
-        .broadcast_mul(&keep)?;
+        let shifted = ((logits.to_dtype(DType::F32)? - self.logit_shift)?.broadcast_mul(open)?)
+            .broadcast_mul(keep)?;
         let weights = (shifted.relu()? + 1.0)?.log()?;
         pooled.maximum(&weights.max(1)?)
     }
@@ -706,7 +752,7 @@ impl SpladePooling {
             let (batch, seq, _) = logits.dims3()?;
             let mask = PoolMask::new(self, rows, seq, vocab_size, logits.device())?;
             let zeros = Tensor::zeros((batch, vocab_size), DType::F32, logits.device())?;
-            self.fold(&self.accumulate(&zeros, logits, &mask, 0, seq)?)
+            self.fold(&self.accumulate(&zeros, logits, &mask.keep, &mask.open)?)
         };
         inner().map_err(|error| {
             MinSyncError::Embedding(format!("native sparse pooling failed: {error}"))
@@ -1092,5 +1138,103 @@ mod tests {
         let mut types = cfg.clone();
         types.layer_types = Some(vec!["sliding_attention".into(); cfg.num_hidden_layers]);
         assert!(types.validate().is_err());
+    }
+
+    #[test]
+    fn pooling_matches_a_plain_reference_on_random_logits_and_masks() {
+        // Ragged rows (padding positions), a prefix token and masked terms,
+        // checked term by term against the formula written out in plain Rust:
+        // max over real, non-prefix positions of ln(1 + relu(logit - shift)),
+        // and nothing at all for a masked term.
+        let (batch, seq, vocab) = (3usize, 9usize, 17usize);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 8.0 - 3.0
+        };
+        let flat: Vec<f32> = (0..batch * seq * vocab).map(|_| next()).collect();
+        let logits = Tensor::from_vec(flat.clone(), (batch, seq, vocab), &Device::Cpu).unwrap();
+        let rows: Vec<Vec<u32>> = vec![vec![9, 5, 6, 7, 8, 5, 6, 7, 8], vec![9, 5, 6], vec![5]];
+        let masked = [3u32, 11];
+        let pooling = pooling_with(1.5, &[9], &masked, None);
+        let got = pooling.pool(&logits, &rows, vocab).unwrap();
+        for (row, ids) in rows.iter().enumerate() {
+            for term in 0..vocab {
+                let mut want = 0f32;
+                if !masked.contains(&(term as u32)) {
+                    for (position, id) in ids.iter().enumerate() {
+                        if *id == 9 {
+                            continue;
+                        }
+                        let logit = flat[(row * seq + position) * vocab + term];
+                        want = want.max(((logit - 1.5).max(0.0) + 1.0).ln());
+                    }
+                }
+                assert!(
+                    (got[row][term] - want).abs() < 1e-5,
+                    "row {row} term {term}: {} vs {want}",
+                    got[row][term]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn logit_blocks_never_exceed_the_token_cap_and_cover_the_batch() {
+        for (seq, chunk, cap) in [
+            (40, Some(128), 1000),
+            (4000, Some(128), 256),
+            (4000, None, 256),
+            (10, Some(0), 1),
+            (1, None, 1),
+            (7, Some(3), 100),
+            (5, Some(2), 0),
+        ] {
+            let (rows, positions) = logit_shape(seq, chunk, cap);
+            assert!(rows >= 1 && positions >= 1, "{seq} {chunk:?} {cap}");
+            assert!(
+                positions <= seq.max(1),
+                "{seq} {chunk:?} {cap}: {positions}"
+            );
+            assert!(
+                rows * positions <= cap.max(1),
+                "{seq} {chunk:?} {cap}: {rows} x {positions}"
+            );
+        }
+        assert_eq!(logit_shape(40, Some(128), 1000), (25, 40));
+        assert_eq!(logit_shape(4000, Some(128), 256), (2, 128));
+        assert_eq!(logit_shape(4000, None, 256), (1, 256));
+    }
+
+    #[test]
+    fn row_blocking_of_the_logit_working_set_does_not_change_the_result() {
+        // Ragged rows in one batch, then the decoder + pooling cut into blocks of
+        // 1, 2, 5, 16 tokens and one block that holds everything.
+        let (model, pooling, cfg) = load_model(DType::F32);
+        let golden: Golden =
+            serde_json::from_slice(&std::fs::read(fixture_dir().join("golden.json")).unwrap())
+                .unwrap();
+        let rows: Vec<Vec<u32>> = golden.cases[0]
+            .alone
+            .iter()
+            .map(|row| row.ids.clone())
+            .collect();
+        assert!(rows.len() >= 3, "the fixture needs several rows to block");
+        let reference = run(&model, &pooling, cfg.vocab_size, &rows);
+        for tokens in [1, 2, 5, 16, 10_000] {
+            let blocked = load_model(DType::F32).0.with_logit_tokens(tokens);
+            let got = run(&blocked, &pooling, cfg.vocab_size, &rows);
+            for (index, (a, b)) in got.iter().zip(&reference).enumerate() {
+                assert_eq!(a.indices(), b.indices(), "tokens {tokens} row {index}");
+                for (x, y) in a.values().iter().zip(b.values()) {
+                    assert!(
+                        (x - y).abs() < 1e-5,
+                        "tokens {tokens} row {index}: {x} vs {y}"
+                    );
+                }
+            }
+        }
     }
 }

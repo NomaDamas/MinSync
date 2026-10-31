@@ -98,11 +98,7 @@ impl ServedSparseEncoder {
                 if health.kind != "sparse" {
                     return None;
                 }
-                let client = reqwest::Client::builder()
-                    .timeout(self.timeout)
-                    .no_proxy()
-                    .build()
-                    .ok()?;
+                let client = crate::serve::loopback_client(self.timeout)?;
                 tracing::info!(url = %health.url, pid = health.pid, "using running minsync serve --sparse");
                 Some(Remote {
                     url: health.url,

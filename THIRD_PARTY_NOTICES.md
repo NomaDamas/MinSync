@@ -16,37 +16,29 @@ Changes made in MinSync: the text-embedding path only (no vision-language
 code); per-device attention backends; candle's fused RMSNorm; host-side padding
 mask and rotary tables; pooling and normalization on the last token in f32.
 
-## kiwi-rs: Korean BM25 tokenizer binding
+## candle: ModernBERT sparse encoder
 
-The `ko` and `multilingual` BM25 tokenizers call the [Kiwi](https://github.com/bab2min/Kiwi)
-Korean morphological analyzer through the
-[`kiwi-rs`](https://crates.io/crates/kiwi-rs) crate
-(source: <https://github.com/JAICHANGPARK/kiwi-rs>), which is statically linked
-into the `minsync` executable. `kiwi-rs` is not modified.
+`src/sparse/modernbert.rs` implements the ModernBERT masked-LM with
+`ShiftedTopK` SPLADE pooling that the default sparse checkpoint family ships.
+It is written against that checkpoint family rather than reusing
+`candle_transformers::models::modernbert`, which is not a dependency of this
+crate, applies no padding mask to the sliding window of padded keys, and has no
+MLM-logit chunking. Weight names and numerics follow the Hugging Face
+reference; the golden test reproduces its output.
 
-- Crate: `kiwi-rs` 2026.8.26 (`Cargo.lock`)
-- License: GNU Lesser General Public License, version 2.1 or later
-  (<https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html>)
-- Copyright: the `kiwi-rs` authors
+- Library: [candle](https://github.com/huggingface/candle) (`candle-core`,
+  `candle-nn`)
+- License: Apache License, Version 2.0 or MIT
+  (<http://www.apache.org/licenses/LICENSE-2.0> or
+  <https://opensource.org/licenses/MIT>)
 
-The Kiwi native library (`libkiwi`) and its model are **not** part of MinSync.
-They are separate files that `kiwi-rs` loads at run time (`KIWI_LIBRARY_PATH`,
-`KIWI_MODEL_PATH`). Kiwi 0.24.0 and later, and its models, are Apache-2.0;
-Kiwi 0.23.2 and earlier are LGPL.
+## nlpai-lab/KURE-Sparse-nano: learned sparse (SPLADE) model
 
-### Relinking against a modified `kiwi-rs` (LGPL-2.1 section 6)
+Sparse retrieval uses the
+[KURE-Sparse-nano](https://huggingface.co/nlpai-lab/KURE-Sparse-nano) model as
+its default. The weights are **not** part of MinSync: the `native:` encoder
+downloads them from Hugging Face on first use, and a `tei:` endpoint or
+`minsync serve --sparse` serves them separately.
 
-MinSync is MIT licensed and its complete source is public, so the executable can
-be rebuilt against a modified `kiwi-rs`. Check out the MinSync tag that matches
-the executable and point Cargo at your copy of the crate:
-
-```bash
-git clone https://github.com/NomaDamas/MinSync && cd MinSync
-git checkout <tag>   # e.g. v0.4.11
-cargo build --release \
-  --config 'patch.crates-io.kiwi-rs.path="/path/to/your/kiwi-rs"'
-```
-
-Do not add `--locked`: a `[patch]` changes the lock file. Users may modify
-`kiwi-rs` for their own use and reverse engineer the result to debug those
-modifications.
+- Model: `nlpai-lab/KURE-Sparse-nano` (0.1B parameters)
+- License: Apache License, Version 2.0 (<http://www.apache.org/licenses/LICENSE-2.0>)
