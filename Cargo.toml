@@ -45,7 +45,7 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 async-trait = "0.1"
 fs2 = "0.4"
-lancedb = "0.30"
+lancedb = "0.31"
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 futures = "0.3"
