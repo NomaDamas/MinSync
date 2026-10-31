@@ -398,10 +398,12 @@ Measured on the corpora above (Apple Silicon, KURE-Sparse-nano):
 
 - **Exact strings.** The model works on word pieces, so an identifier such as
   `ERR-48213`, a hash or a version string is not matched the way BM25 matches a
-  token. On 300 synthetic documents that each carry one such identifier, a query
-  for the identifier ranked the right document first 26% of the time (BM25:
-  100%; dense Qwen3-Embedding-0.6B: 2%; dense+sparse hybrid: 7%). Use `grep`
-  for exact lookups.
+  token. Every document of the test carries one random identifier and the query
+  is the identifier alone. With 300 such documents the right one is in the top
+  1 / 5 / 10 for 26% / 53% / 66% of the queries (BM25: 100% / 100% / 100%; dense
+  Qwen3-Embedding-0.6B: 2% / 9% / 14%; dense+sparse hybrid: 7% / 23% / 33%).
+  With 3,000 such documents SPLADE drops to 6% / 22% / 29% while BM25 keeps
+  97% / 100% / 100%. Use `grep` for exact lookups.
 - **Corpus size.** `--mode sparse` scores every stored chunk; there is no index
   over the sparse columns. A query (CLI, in-process) takes 206 ms at 21k chunks
   and 508 ms at 106k, growing linearly.
