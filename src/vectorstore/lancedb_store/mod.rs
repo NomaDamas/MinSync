@@ -18,8 +18,9 @@ pub use filters::filter_to_sql;
 pub use index::IndexingConfig;
 
 use crate::error::{MinSyncError, Result};
+use crate::sparse::SparseVector;
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, VectorStore};
+use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, VectorStore};
 use lancedb::DistanceType;
 use std::path::Path;
 use std::sync::mpsc;
@@ -30,6 +31,10 @@ const DEFAULT_DIMENSION: usize = 1536;
 const TABLE_NAME: &str = "documents";
 const VECTOR_COLUMN: &str = "vector";
 const DISTANCE_COLUMN: &str = "_distance";
+/// Which model produced the row's sparse vector (null: not encoded yet).
+const SPARSE_MODEL_COLUMN: &str = "sparse_model";
+const SPARSE_INDICES_COLUMN: &str = "sparse_indices";
+const SPARSE_VALUES_COLUMN: &str = "sparse_values";
 
 /// The distance metric used for BOTH index construction and query time. These
 /// must match: an index trained with one metric returns invalid results when
@@ -52,39 +57,23 @@ impl LanceDbStore {
         dimension: usize,
         indexing: IndexingConfig,
     ) -> Result<Self> {
-        Self::open_with_language(path, dimension, indexing, "simple")
-    }
-
-    pub fn open_with_language(
-        path: &Path,
-        dimension: usize,
-        indexing: IndexingConfig,
-        language: &str,
-    ) -> Result<Self> {
-        Self::open(path, dimension, indexing, language, false)
+        Self::open(path, dimension, indexing, false)
     }
 
     /// Open the store for read-only queries. Never creates the table or
     /// applies schema migrations, so it is safe to run concurrently with a
     /// sync holding the writer lock: Lance versions are immutable snapshots,
     /// and a query pins the latest version at open time.
-    pub fn open_readonly(
-        path: &Path,
-        dimension: usize,
-        indexing: IndexingConfig,
-        language: &str,
-    ) -> Result<Self> {
-        Self::open(path, dimension, indexing, language, true)
+    pub fn open_readonly(path: &Path, dimension: usize, indexing: IndexingConfig) -> Result<Self> {
+        Self::open(path, dimension, indexing, true)
     }
 
     fn open(
         path: &Path,
         dimension: usize,
         indexing: IndexingConfig,
-        language: &str,
         read_only: bool,
     ) -> Result<Self> {
-        crate::tokenizer::validate_language(language)?;
         let dim = if dimension == 0 {
             DEFAULT_DIMENSION
         } else {
@@ -98,10 +87,8 @@ impl LanceDbStore {
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
-        let language = language.to_string();
-        let worker = thread::spawn(move || {
-            run_worker(uri, dim, indexing, language, read_only, cmd_rx, init_tx)
-        });
+        let worker =
+            thread::spawn(move || run_worker(uri, dim, indexing, read_only, cmd_rx, init_tx));
 
         match init_rx.recv().map_err(to_store_error)? {
             Ok(()) => Ok(Self {
@@ -223,14 +210,48 @@ impl VectorStore for LanceDbStore {
         })
     }
 
-    fn query_text(
+    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>> {
+        self.request(|resp| Command::RowsMissingSparse {
+            model: model.to_string(),
+            limit,
+            resp,
+        })
+    }
+
+    fn count_missing_sparse(&self, model: &str) -> Result<usize> {
+        self.request(|resp| Command::CountMissingSparse(model.to_string(), resp))
+    }
+
+    fn set_sparse(&mut self, model: &str, rows: &[(String, SparseVector)]) -> Result<()> {
+        self.request(|resp| Command::SetSparse {
+            model: model.to_string(),
+            rows: rows.to_vec(),
+            resp,
+        })
+    }
+
+    fn fetch_sparse_by_content_hash(
         &self,
-        text: &str,
+        model: &str,
+        content_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, SparseVector>> {
+        self.request(|resp| Command::FetchSparseByContentHash {
+            model: model.to_string(),
+            hashes: content_hashes.to_vec(),
+            resp,
+        })
+    }
+
+    fn query_sparse(
+        &self,
+        model: &str,
+        vector: &SparseVector,
         filter: Option<&Filter>,
         topk: usize,
     ) -> Result<Vec<QueryHit>> {
-        self.request(|resp| Command::QueryText {
-            text: text.to_string(),
+        self.request(|resp| Command::QuerySparse {
+            model: model.to_string(),
+            vector: vector.clone(),
             filter: filter.cloned(),
             topk,
             resp,
@@ -565,8 +586,7 @@ mod tests {
     #[test]
     fn test_readonly_open_missing_table_errors() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let result =
-            LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default(), "simple");
+        let result = LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default());
         assert!(
             matches!(result, Err(crate::error::MinSyncError::NeverSynced)),
             "read-only open on a missing table must report NeverSynced"
@@ -585,9 +605,8 @@ mod tests {
         // A second, read-only connection must open and query while the writer
         // connection stays open — this is the `minsync query` during
         // `minsync sync` scenario.
-        let reader =
-            LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default(), "simple")
-                .expect("open read-only store alongside writer");
+        let reader = LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default())
+            .expect("open read-only store alongside writer");
         let hits = reader
             .query(&[1.0, 0.0, 0.0, 0.0], None, 1)
             .expect("query through read-only store");
@@ -608,9 +627,8 @@ mod tests {
 
         // A freshly opened reader sees the new state.
         drop(reader);
-        let reader =
-            LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default(), "simple")
-                .expect("reopen read-only store");
+        let reader = LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default())
+            .expect("reopen read-only store");
         assert_eq!(reader.doc_count(), 2);
     }
 
@@ -696,7 +714,6 @@ mod tests {
             !indices.iter().any(|name| name.contains("vector")),
             "disabled ANN must not be built, got {indices:?}"
         );
-        assert!(store.index_state().expect("state").fts_indexed);
     }
 
     #[test]
@@ -708,8 +725,8 @@ mod tests {
         store.flush().expect("flush");
         let indices = store.index_names().expect("list indices");
         assert!(
-            indices.iter().any(|name| name.contains("text")),
-            "BM25 text index should exist, got {indices:?}"
+            !indices.iter().any(|name| name.contains("text")),
+            "no full-text index exists any more, got {indices:?}"
         );
         assert!(
             !indices.iter().any(|name| name.contains("vector")),
@@ -938,6 +955,47 @@ mod tests {
         assert_eq!(store.doc_count(), 3);
     }
 
+    /// 40 commits of 10 rows, a checkpoint after each; returns the fragments left.
+    fn fragments_after_many_small_commits(indexing: IndexingConfig) -> usize {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store =
+            LanceDbStore::open_with_indexing(dir.path(), 4, indexing).expect("create store");
+        for batch in 0..40 {
+            let docs: Vec<_> = (0..10)
+                .map(|i| {
+                    doc(
+                        &format!("id-{batch}-{i}"),
+                        "a.txt",
+                        "t",
+                        vec![1.0, 0.0, 0.0, 0.0],
+                    )
+                })
+                .collect();
+            store.upsert(&docs).expect("upsert");
+            store.checkpoint().expect("checkpoint");
+        }
+        assert_eq!(store.doc_count(), 400);
+        store.fragment_count().expect("fragments")
+    }
+
+    #[test]
+    fn test_compaction_target_keeps_full_fragments_from_being_rewritten() {
+        // Below the target every compaction folds the whole table into one
+        // fragment, so a long sync rewrites everything written so far each time.
+        let merged = fragments_after_many_small_commits(IndexingConfig {
+            compact_fragment_threshold: 4,
+            ..IndexingConfig::default()
+        });
+        // With a 100-row target a fragment that has filled up is left alone.
+        let kept = fragments_after_many_small_commits(IndexingConfig {
+            compact_fragment_threshold: 4,
+            compact_target_rows: 100,
+            ..IndexingConfig::default()
+        });
+        assert!(merged < 4, "small table folds into few fragments: {merged}");
+        assert!(kept >= 4, "full fragments must survive checkpoints: {kept}");
+    }
+
     #[test]
     fn test_existing_ids_returns_only_present_ids() {
         let (_dir, mut store) = store();
@@ -1014,5 +1072,422 @@ mod tests {
             .expect("delete in");
         assert_eq!(deleted, 2);
         assert_eq!(store.all_paths(), vec!["y.txt"]);
+    }
+
+    fn sv(pairs: &[(u32, f32)]) -> SparseVector {
+        SparseVector::from_pairs(pairs.iter().copied())
+    }
+
+    #[test]
+    fn test_fresh_rows_are_missing_sparse_until_set() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "b.txt", "t", vec![0.0, 1.0, 0.0, 0.0]),
+            ])
+            .expect("seed");
+        // Null columns, not just a different model: the SQL predicate must
+        // keep NULL rows in the "missing" set.
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 2);
+        let rows = store.rows_missing_sparse("m", 10).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.text.starts_with("text ")));
+
+        store
+            .set_sparse("m", &[("a".to_string(), sv(&[(3, 1.5), (9, 0.25)]))])
+            .expect("set sparse");
+
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 1);
+        let missing = store.rows_missing_sparse("m", 10).expect("rows");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].id, "b");
+        // Another model has encoded nothing.
+        assert_eq!(store.count_missing_sparse("other").expect("count"), 2);
+    }
+
+    #[test]
+    fn test_rows_missing_sparse_honours_the_limit() {
+        let (_dir, mut store) = store();
+        let docs: Vec<_> = (0..7)
+            .map(|i| doc(&format!("d{i}"), "x.txt", "t", vec![1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        store.upsert(&docs).expect("seed");
+        assert_eq!(store.rows_missing_sparse("m", 3).expect("rows").len(), 3);
+        assert!(store.rows_missing_sparse("m", 0).expect("rows").is_empty());
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 7);
+    }
+
+    #[test]
+    fn test_query_sparse_is_exact_inner_product_with_filter() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "b.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("c", "c.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("d", "d.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+            ])
+            .expect("seed");
+        store
+            .set_sparse(
+                "m",
+                &[
+                    ("a".to_string(), sv(&[(1, 1.0), (2, 1.0)])),
+                    ("b".to_string(), sv(&[(1, 3.0)])),
+                    ("c".to_string(), sv(&[(9, 5.0)])),
+                    ("d".to_string(), SparseVector::default()),
+                ],
+            )
+            .expect("set sparse");
+
+        let hits = store
+            .query_sparse("m", &sv(&[(1, 2.0), (2, 0.5)]), None, 10)
+            .expect("query");
+        let ranked: Vec<(&str, f32)> = hits.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();
+        assert_eq!(ranked, vec![("b", 6.0), ("a", 2.5)]);
+        assert_eq!(hits[0].path, "b.txt");
+        assert_eq!(hits[0].text, "text b");
+        assert_eq!(hits[0].content_hash, "hash-b");
+
+        let only_a = store
+            .query_sparse(
+                "m",
+                &sv(&[(1, 2.0)]),
+                Some(&Filter::Eq("path".to_string(), "a.txt".to_string())),
+                10,
+            )
+            .expect("filtered");
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].doc_id, "a");
+
+        assert_eq!(
+            store
+                .query_sparse("m", &sv(&[(1, 2.0)]), None, 1)
+                .expect("topk")
+                .len(),
+            1
+        );
+        assert!(store
+            .query_sparse("m", &sv(&[(1, 2.0)]), None, 0)
+            .expect("k0")
+            .is_empty());
+        assert!(store
+            .query_sparse("m", &SparseVector::default(), None, 5)
+            .expect("empty")
+            .is_empty());
+        assert!(store
+            .query_sparse("other-model", &sv(&[(1, 2.0)]), None, 5)
+            .expect("other model")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_query_sparse_scores_rows_across_many_batches() {
+        // Enough rows that the scan streams several record batches.
+        let (_dir, mut store) = store();
+        let docs: Vec<_> = (0..3000)
+            .map(|i| doc(&format!("d{i:05}"), "x.txt", "t", vec![1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        store.insert_new(&docs).expect("seed");
+        let rows: Vec<(String, SparseVector)> = (0..3000)
+            .map(|i| (format!("d{i:05}"), sv(&[(1, 1.0 + (i % 100) as f32)])))
+            .collect();
+        for chunk in rows.chunks(1000) {
+            store.set_sparse("m", chunk).expect("set sparse");
+        }
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 0);
+
+        let hits = store
+            .query_sparse("m", &sv(&[(1, 1.0)]), None, 5)
+            .expect("query");
+        let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        // Score 100 is shared by d00099, d00199, ...; ties go to the smaller id.
+        assert_eq!(ids, vec!["d00099", "d00199", "d00299", "d00399", "d00499"]);
+        assert!(hits.iter().all(|h| h.score == 100.0));
+    }
+
+    #[test]
+    fn test_set_sparse_ignores_unknown_ids_and_last_write_wins() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("seed");
+        store
+            .set_sparse(
+                "m",
+                &[
+                    ("ghost".to_string(), sv(&[(1, 1.0)])),
+                    ("a".to_string(), sv(&[(1, 1.0)])),
+                    ("a".to_string(), sv(&[(2, 4.0)])),
+                ],
+            )
+            .expect("set sparse");
+        assert_eq!(store.doc_count(), 1, "an unknown id is never inserted");
+        let hits = store
+            .query_sparse("m", &sv(&[(2, 1.0)]), None, 5)
+            .expect("query");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 4.0);
+        store
+            .set_sparse("m", &[])
+            .expect("an empty batch is a no-op");
+    }
+
+    #[test]
+    fn test_replacing_a_row_clears_its_sparse_vector() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("seed");
+        store
+            .set_sparse("m", &[("a".to_string(), sv(&[(1, 1.0)]))])
+            .expect("set sparse");
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 0);
+
+        // The same id written again is new content as far as sparse goes.
+        store
+            .upsert(&[doc("a", "a.txt", "t2", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("replace");
+
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 1);
+        assert!(store
+            .query_sparse("m", &sv(&[(1, 1.0)]), None, 5)
+            .expect("query")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_update_keeps_the_sparse_vector() {
+        // A reused chunk (same id) only moves path/heading/token: its text,
+        // and so its sparse vector, are unchanged.
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[doc("a", "old.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("seed");
+        store
+            .set_sparse("m", &[("a".to_string(), sv(&[(1, 2.0)]))])
+            .expect("set sparse");
+
+        store
+            .update(&[DocumentUpdate {
+                id: "a".to_string(),
+                seen_token: "t2".to_string(),
+                path: "new.txt".to_string(),
+                heading_path: "h".to_string(),
+            }])
+            .expect("update");
+
+        let hits = store
+            .query_sparse("m", &sv(&[(1, 1.0)]), None, 5)
+            .expect("query");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "new.txt");
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 0);
+    }
+
+    #[test]
+    fn test_fetch_sparse_by_content_hash_is_model_scoped() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "b.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("c", "c.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+            ])
+            .expect("seed");
+        store
+            .set_sparse("m", &[("a".to_string(), sv(&[(4, 2.0)]))])
+            .expect("m");
+        store
+            .set_sparse("old", &[("b".to_string(), sv(&[(5, 1.0)]))])
+            .expect("old");
+
+        let found = store
+            .fetch_sparse_by_content_hash(
+                "m",
+                &[
+                    "hash-a".to_string(),
+                    "hash-b".to_string(),
+                    "hash-c".to_string(),
+                ],
+            )
+            .expect("fetch");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found["hash-a"], sv(&[(4, 2.0)]));
+        assert!(store
+            .fetch_sparse_by_content_hash("m", &[])
+            .expect("empty")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_sparse_survives_reopen_and_flush() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut store = LanceDbStore::open_or_create(dir.path(), 4).expect("create");
+            store
+                .upsert(&[doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+                .expect("seed");
+            store
+                .set_sparse("m", &[("a".to_string(), sv(&[(7, 3.0)]))])
+                .expect("set");
+            store.flush().expect("flush compacts and prunes");
+        }
+        let store = LanceDbStore::open_or_create(dir.path(), 4).expect("reopen");
+        let hits = store
+            .query_sparse("m", &sv(&[(7, 1.0)]), None, 5)
+            .expect("query");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 3.0);
+        let state = store.index_state().expect("state");
+        assert!(!state.ann_indexed);
+    }
+
+    /// A table exactly as the BM25 release wrote it: `lexical_text` column
+    /// and an FTS index on it, no sparse columns.
+    fn write_bm25_era_table(path: &std::path::Path, rows: usize) {
+        use arrow_array::types::Float32Type;
+        use arrow_array::{FixedSizeListArray, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lancedb::index::scalar::FtsIndexBuilder;
+        use lancedb::index::Index;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+            Field::new("text", DataType::Utf8, false),
+            Field::new("lexical_text", DataType::Utf8, false),
+            Field::new("source_id", DataType::Utf8, false),
+            Field::new("path", DataType::Utf8, false),
+            Field::new("chunk_schema_id", DataType::Utf8, false),
+            Field::new("chunk_type", DataType::Utf8, false),
+            Field::new("heading_path", DataType::Utf8, false),
+            Field::new("content_hash", DataType::Utf8, false),
+            Field::new("seen_token", DataType::Utf8, false),
+        ]));
+        let strings = |f: &dyn Fn(usize) -> String| -> Arc<StringArray> {
+            Arc::new(StringArray::from_iter_values((0..rows).map(f)))
+        };
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            (0..rows).map(|i| Some(vec![Some(i as f32), Some(1.0), Some(0.0), Some(0.0)])),
+            4,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                strings(&|i| format!("old{i}")),
+                Arc::new(vectors),
+                strings(&|i| format!("legacy text {i}")),
+                strings(&|i| format!("legacy tokenized {i}")),
+                strings(&|_| "source-1".to_string()),
+                strings(&|i| format!("f{i}.txt")),
+                strings(&|_| "schema-1".to_string()),
+                strings(&|_| "text".to_string()),
+                strings(&|_| String::new()),
+                strings(&|i| format!("hash-old{i}")),
+                strings(&|_| "token".to_string()),
+            ],
+        )
+        .expect("legacy batch");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let conn = lancedb::connect(path.to_str().unwrap())
+                .execute()
+                .await
+                .unwrap();
+            let table = conn
+                .create_table("documents", vec![batch])
+                .execute()
+                .await
+                .unwrap();
+            table
+                .create_index(&["lexical_text"], Index::FTS(FtsIndexBuilder::default()))
+                .execute()
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn test_bm25_era_table_is_migrated_in_place_and_keeps_dense_vectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bm25_era_table(dir.path(), 5);
+
+        let mut store = LanceDbStore::open_or_create(dir.path(), 4).expect("open migrates");
+
+        assert_eq!(store.doc_count(), 5, "no row is lost");
+        let fetched = store.fetch(&["old3".to_string()]).expect("fetch");
+        assert_eq!(fetched[0].text, "legacy text 3");
+        assert_eq!(
+            fetched[0].embedding,
+            vec![3.0, 1.0, 0.0, 0.0],
+            "dense vector untouched"
+        );
+        // Every row reads as not-yet-encoded, so the next sync encodes it.
+        assert_eq!(store.count_missing_sparse("m").expect("count"), 5);
+        // The FTS index is gone with its column.
+        let indices = store.index_names().expect("indices");
+        assert!(
+            !indices.iter().any(|name| name.contains("lexical")),
+            "FTS index must be dropped, got {indices:?}"
+        );
+        // And the table now behaves like any sparse-ready one.
+        store
+            .set_sparse("m", &[("old3".to_string(), sv(&[(1, 1.0)]))])
+            .expect("set sparse on a migrated table");
+        let hits = store
+            .query_sparse("m", &sv(&[(1, 1.0)]), None, 5)
+            .expect("query");
+        assert_eq!(hits[0].doc_id, "old3");
+        store.flush().expect("flush on a migrated table");
+        // Dense search still answers.
+        assert_eq!(
+            store.query(&[3.0, 1.0, 0.0, 0.0], None, 1).expect("dense")[0].doc_id,
+            "old3"
+        );
+    }
+
+    #[test]
+    fn test_migration_is_idempotent_across_reopens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bm25_era_table(dir.path(), 2);
+        {
+            let mut store = LanceDbStore::open_or_create(dir.path(), 4).expect("migrate");
+            store
+                .set_sparse("m", &[("old0".to_string(), sv(&[(2, 2.0)]))])
+                .expect("set");
+        }
+        let store = LanceDbStore::open_or_create(dir.path(), 4).expect("reopen");
+        assert_eq!(store.doc_count(), 2);
+        assert_eq!(
+            store.count_missing_sparse("m").expect("count"),
+            1,
+            "sparse data kept"
+        );
+    }
+
+    #[test]
+    fn test_readonly_open_refuses_a_bm25_era_table_without_touching_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bm25_era_table(dir.path(), 2);
+
+        let error = LanceDbStore::open_readonly(dir.path(), 4, IndexingConfig::default())
+            .err()
+            .expect("read-only must not migrate");
+        let message = error.to_string();
+        assert!(message.contains("minsync sync"), "{message}");
+
+        // Still a legacy table afterwards: a writer migrates it, not a reader.
+        let writer = LanceDbStore::open_or_create(dir.path(), 4).expect("writer migrates");
+        assert_eq!(writer.doc_count(), 2);
     }
 }

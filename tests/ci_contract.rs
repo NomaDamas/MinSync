@@ -223,7 +223,8 @@ fn release_workflow_smokes_windows_cli_contract() {
     for needle in [
         "Smoke test Windows CLI contract",
         "matrix.target == 'x86_64-pc-windows-msvc'",
-        "init --language simple --help",
+        "init --help",
+        "--embedder",
         "query alpha --mode $mode --help",
         "query alpha --mode nope",
         "possible values",

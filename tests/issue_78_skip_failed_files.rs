@@ -8,6 +8,8 @@ use std::path::Path;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 const DIMENSION: usize = 4;
 
 /// TEI stand-in: rejects any request containing `POISON`, else returns a
@@ -54,14 +56,21 @@ fn setup(root: &Path, base_url: &str, on_file_error: OnFileError) {
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(DIMENSION as i64));
     config.vectorstore.options = toml::Value::Table(options);
+    common::use_tiny_sparse(&mut config);
     config.save(&config_path).expect("save config");
 }
 
 fn write_files(root: &Path) {
+    // The tiny checkpoint only knows the `w<n>` vocabulary, so give the files
+    // a queryable term the sparse query below shares with them.
     for name in ["a", "b", "d", "e"] {
-        std::fs::write(root.join(format!("{name}.txt")), format!("good {name}")).unwrap();
+        std::fs::write(
+            root.join(format!("{name}.txt")),
+            format!("w1 w2 good {name}"),
+        )
+        .unwrap();
     }
-    std::fs::write(root.join("c-bad.txt"), "POISON text").unwrap();
+    std::fs::write(root.join("c-bad.txt"), "POISON w1 text").unwrap();
 }
 
 async fn tei_server() -> MockServer {
@@ -106,7 +115,7 @@ async fn poison_file_is_skipped_with_exit_6_and_reported_in_json() {
 
     let query = run(
         dir.path(),
-        &["--format", "json", "query", "good", "--mode", "bm25"],
+        &["--format", "json", "query", "w1", "--mode", "sparse"],
     )
     .await;
     assert!(query.status.success(), "{query:?}");

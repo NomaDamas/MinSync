@@ -27,12 +27,14 @@ use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::DebounceEventResult;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::chunker::Chunker;
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
+use crate::sparse::SparseEncoder;
 use crate::sync::MinSync;
 use crate::vectorstore::VectorStore;
 
@@ -65,6 +67,8 @@ pub enum WatchStartupStatus {
 }
 
 pub struct WatchControl {
+    /// Encodes the sparse vectors of every sync the watcher runs.
+    pub sparse: Option<Arc<dyn SparseEncoder>>,
     pub startup: WatchStartup,
     pub progress: Option<mpsc::UnboundedSender<crate::types::SyncResult>>,
     pub startup_status: Option<mpsc::UnboundedSender<WatchStartupStatus>>,
@@ -72,6 +76,7 @@ pub struct WatchControl {
 }
 
 struct WatchRuntime {
+    sparse: Option<Arc<dyn SparseEncoder>>,
     startup: WatchStartup,
     progress: Option<mpsc::UnboundedSender<crate::types::SyncResult>>,
     startup_status: Option<mpsc::UnboundedSender<WatchStartupStatus>>,
@@ -88,12 +93,14 @@ pub async fn run(
     root: PathBuf,
     chunker: &dyn Chunker,
     embedder: &dyn Embedder,
+    sparse: Option<Arc<dyn SparseEncoder>>,
     store: &mut dyn VectorStore,
     debounce_ms: Option<u64>,
     startup: WatchStartup,
 ) -> Result<()> {
     let _lock = crate::state::FileLock::acquire(&root.join(".minsync/lock"), false)?;
     let runtime = WatchRuntime {
+        sparse,
         startup,
         progress: None,
         startup_status: None,
@@ -108,11 +115,13 @@ pub(crate) async fn run_locked(
     root: PathBuf,
     chunker: &dyn Chunker,
     embedder: &dyn Embedder,
+    sparse: Option<Arc<dyn SparseEncoder>>,
     store: &mut dyn VectorStore,
     debounce_ms: Option<u64>,
     startup: WatchStartup,
 ) -> Result<()> {
     let runtime = WatchRuntime {
+        sparse,
         startup,
         progress: None,
         startup_status: None,
@@ -133,6 +142,7 @@ pub async fn run_with_shutdown(
 ) -> Result<()> {
     let _lock = crate::state::FileLock::acquire(&root.join(".minsync/lock"), false)?;
     let runtime = WatchRuntime {
+        sparse: control.sparse,
         startup: control.startup,
         progress: control.progress,
         startup_status: control.startup_status,
@@ -168,7 +178,10 @@ async fn run_inner(
 
     tracing::info!("Watching {} for indexable changes", root.display());
 
-    let sync = MinSync::new(root.clone());
+    let sync = match runtime.sparse.clone() {
+        Some(encoder) => MinSync::new(root.clone()).with_sparse_encoder(encoder),
+        None => MinSync::new(root.clone()),
+    };
 
     let initial = run_sync(&sync, chunker, embedder, store, lock_held).await;
     if let Ok(result) = initial.as_ref() {

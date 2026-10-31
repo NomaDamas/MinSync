@@ -55,9 +55,9 @@ jobs:
           $exe = "target/${{ matrix.target }}/release/minsync.exe"
           $help = (& $exe --help 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0 -or $help -notmatch "Usage:") { throw "top-level help failed" }
-          $init = (& $exe init --language simple --help 2>&1 | Out-String)
-          if ($LASTEXITCODE -ne 0 -or $init -notmatch "--language") { throw "init language flag failed" }
-          foreach ($mode in @("vector", "bm25", "hybrid")) {
+          $init = (& $exe init --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $init -notmatch "--embedder") { throw "init help failed" }
+          foreach ($mode in @("vector", "sparse", "hybrid")) {
             $query = (& $exe query alpha --mode $mode --help 2>&1 | Out-String)
             if ($LASTEXITCODE -ne 0 -or $query -notmatch "--mode") { throw "query mode $mode failed" }
           }

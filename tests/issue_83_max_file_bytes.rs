@@ -7,6 +7,8 @@ use std::path::Path;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 const DIMENSION: usize = 4;
 
 struct FixedTei;
@@ -45,6 +47,7 @@ fn setup(root: &Path, base_url: &str, max_file_bytes: u64) {
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(DIMENSION as i64));
     config.vectorstore.options = toml::Value::Table(options);
+    common::use_tiny_sparse(&mut config);
     config.save(&config_path).expect("save config");
 }
 
@@ -71,7 +74,7 @@ async fn oversized_file_is_reported_while_other_files_are_indexed() {
     let server = tei_server().await;
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path(), &server.uri(), 16);
-    std::fs::write(dir.path().join("good.txt"), "small text").unwrap();
+    std::fs::write(dir.path().join("good.txt"), "w1 small text").unwrap();
     std::fs::write(
         dir.path().join("large.txt"),
         "this file exceeds the configured limit",
@@ -101,7 +104,7 @@ async fn oversized_file_is_reported_while_other_files_are_indexed() {
 
     let query = run(
         dir.path(),
-        &["--format", "json", "query", "small", "--mode", "bm25"],
+        &["--format", "json", "query", "w1", "--mode", "sparse"],
     )
     .await;
     assert!(query.status.success(), "{query:?}");
@@ -120,7 +123,7 @@ async fn oversized_file_is_reported_while_other_files_are_indexed() {
 async fn failed_first_sync_does_not_restore_the_init_baseline_as_indexed() {
     let server = tei_server().await;
     let dir = tempfile::tempdir().unwrap();
-    let contents = format!("{} searchablemarker", "large ".repeat(40));
+    let contents = format!("w1 {} searchablemarker", "large ".repeat(40));
     std::fs::write(dir.path().join("large.txt"), &contents).unwrap();
     // `init` records this file in its baseline before the lower sync cap is
     // applied. That baseline must not be mistaken for indexed state.
@@ -155,14 +158,7 @@ async fn failed_first_sync_does_not_restore_the_init_baseline_as_indexed() {
 
     let query = run(
         dir.path(),
-        &[
-            "--format",
-            "json",
-            "query",
-            "searchablemarker",
-            "--mode",
-            "bm25",
-        ],
+        &["--format", "json", "query", "w1", "--mode", "sparse"],
     )
     .await;
     assert!(query.status.success(), "{query:?}");
@@ -179,7 +175,7 @@ async fn zero_disables_the_guard_and_lowering_the_limit_preserves_existing_chunk
     let server = tei_server().await;
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path(), &server.uri(), 0);
-    let contents = format!("{} searchablemarker", "large ".repeat(40));
+    let contents = format!("w1 {} searchablemarker", "large ".repeat(40));
     std::fs::write(dir.path().join("large.txt"), &contents).unwrap();
 
     let initial = run(dir.path(), &["--format", "json", "sync"]).await;
@@ -216,14 +212,7 @@ async fn zero_disables_the_guard_and_lowering_the_limit_preserves_existing_chunk
 
     let query = run(
         dir.path(),
-        &[
-            "--format",
-            "json",
-            "query",
-            "searchablemarker",
-            "--mode",
-            "bm25",
-        ],
+        &["--format", "json", "query", "w1", "--mode", "sparse"],
     )
     .await;
     assert!(query.status.success(), "{query:?}");

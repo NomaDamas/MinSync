@@ -53,6 +53,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         max_request_bytes,
         state_dir,
         embedder,
+        sparse,
     } = cli.command
     {
         let options = ServeArgs {
@@ -63,6 +64,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
             max_request_bytes,
             state_dir,
             embedder,
+            sparse,
         };
         return serve(&cli.format, &minsync_dir, options).await;
     }
@@ -78,8 +80,7 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
             force,
             embedder,
             chunker,
-            language,
-        } => init(&cli.format, root, force, &embedder, &chunker, &language),
+        } => init(&cli.format, root, force, &embedder, &chunker),
         Commands::Sync { .. } | Commands::Serve { .. } | Commands::Stage { .. } => {
             unreachable!("handled by run")
         }
@@ -112,13 +113,9 @@ fn init(
     force: bool,
     embedder: &str,
     chunker: &str,
-    language: &str,
 ) -> Result<()> {
     let ms = MinSync::new(root);
-    crate::tokenizer::validate_language(language)?;
-    let mut config = ms.init(force, embedder, chunker)?;
-    config.lexical.language = language.to_string();
-    config.save(&ms.minsync_dir().join("config.toml"))?;
+    let config = ms.init(force, embedder, chunker)?;
     match format {
         OutputFormat::Text => {
             println!("Initialized MinSync in .minsync/");
@@ -126,14 +123,25 @@ fn init(
             println!("  collection:  {}", config.collection.name);
             println!("  chunker:     {}", config.chunker.id);
             println!("  embedder:    {}", config.embedder.id);
+            println!("  sparse:      {}", config.sparse.id);
             println!("  vectorstore: {}", config.vectorstore.id);
-            println!("  language:    {}", config.lexical.language);
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&config)?);
         }
     }
     Ok(())
+}
+
+/// The sparse (SPLADE) encoder the workspace's `[sparse]` section describes.
+/// Construction is cheap: the native model loads on first use, so a command
+/// that never encodes (an up-to-date sync, `status`) never loads it.
+pub(crate) fn sparse_encoder(
+    config: &crate::config::Config,
+) -> Result<std::sync::Arc<dyn crate::sparse::SparseEncoder>> {
+    Ok(std::sync::Arc::from(
+        crate::sparse::served::create_sparse_encoder(&config.sparse)?,
+    ))
 }
 
 /// Where `minsync sync` sends its machine-readable progress stream.
@@ -231,11 +239,11 @@ async fn sync(
     if let Some(bs) = batch_size {
         config.embedder.batch_size = bs;
     }
+    let ms = ms.with_sparse_encoder(sparse_encoder(&config)?);
     let chunker = crate::chunker::create_chunker(&config)?;
     let embedder = crate::embedder::create_embedder(&config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
-
     let result = ms
         .sync_locked(
             chunker.as_ref(),
@@ -283,6 +291,8 @@ async fn sync(
                 writeln!(out, "  embedding API calls: {}", result.embedding_api_calls)?;
                 writeln!(out, "  embedded texts:      {}", result.embedded_texts)?;
                 writeln!(out, "  embeddings reused:   {}", result.embeddings_reused)?;
+                writeln!(out, "  sparse encoded:      {}", result.sparse_encoded)?;
+                writeln!(out, "  sparse reused:       {}", result.sparse_reused)?;
                 writeln!(out, "  chunks truncated:    {}", result.chunks_truncated)?;
                 writeln!(out, "  scan errors:         {}", result.scan_errors.len())?;
                 writeln!(out, "  estimated tokens:    {}", result.estimated_tokens)?;
@@ -335,29 +345,35 @@ async fn query(
     // available while a sync holds the lock. Results may lag the in-flight
     // sync; they are always consistent.
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
-    let mode = mode.unwrap_or(if config.is_lexical_only() {
-        QueryMode::Bm25
+    let mode = mode.unwrap_or(if config.is_sparse_only() {
+        QueryMode::Sparse
     } else {
         QueryMode::Vector
     });
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore_readonly(&config, &store_path)?;
-    let results = match mode {
-        QueryMode::Bm25 => crate::query::query_text(minsync_dir, text, k, store.as_ref(), None)?,
-        QueryMode::Vector | QueryMode::Hybrid => {
-            let embedder = crate::embedder::create_embedder(&config)?;
-            crate::query::query(
-                minsync_dir,
-                text,
-                k,
-                embedder.as_ref(),
-                store.as_ref(),
-                None,
-                mode,
-            )
-            .await?
-        }
+    // Each side is built only for the modes that use it: a sparse query never
+    // constructs the dense embedder (so it needs none of its credentials), a
+    // vector query never loads SPLADE.
+    let embedder: Box<dyn crate::embedder::Embedder> = match mode {
+        QueryMode::Sparse => Box::new(crate::embedder::SparseOnlyEmbedder),
+        QueryMode::Vector | QueryMode::Hybrid => crate::embedder::create_embedder(&config)?,
     };
+    let encoder = match mode {
+        QueryMode::Vector => None,
+        QueryMode::Sparse | QueryMode::Hybrid => Some(sparse_encoder(&config)?),
+    };
+    let results = crate::query::query(
+        minsync_dir,
+        text,
+        k,
+        embedder.as_ref(),
+        encoder.as_deref(),
+        store.as_ref(),
+        None,
+        mode,
+    )
+    .await?;
 
     match format {
         OutputFormat::Text => {
@@ -447,10 +463,17 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let embedder = crate::embedder::create_embedder(&config)?;
+    let encoder = sparse_encoder(&config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
-    let result = crate::verify::check(minsync_dir, embedder.as_ref(), store.as_ref()).await?;
+    let result = crate::verify::check(
+        minsync_dir,
+        embedder.as_ref(),
+        Some(encoder.as_ref()),
+        store.as_ref(),
+    )
+    .await?;
     match format {
         OutputFormat::Text => {
             println!("MinSync Health Check");
@@ -477,7 +500,7 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
     // The report above is for a person or a host that reads it; the exit code is for the host that does not.
     // `sync` already exits with these codes when the same stage fails, so a host maps them the same way.
     // The reason goes to stderr as it is: `result.errors` already says which stage failed.
-    let failed = if !result.embedder_ok {
+    let failed = if !result.embedder_ok || !result.sparse_ok {
         Some(MinSyncError::Embedding(String::new()).exit_code())
     } else if !result.vectorstore_ok {
         Some(MinSyncError::VectorStore(String::new()).exit_code())
@@ -580,6 +603,7 @@ async fn watch(
         root,
         chunker.as_ref(),
         embedder.as_ref(),
+        Some(sparse_encoder(&config)?),
         store.as_mut(),
         debounce_ms,
         if watch_on_sync_error {
@@ -600,6 +624,29 @@ struct ServeArgs {
     max_request_bytes: usize,
     state_dir: Option<PathBuf>,
     embedder: Option<String>,
+    sparse: bool,
+}
+
+/// Sparse encoder settings `serve --sparse` runs with: the workspace's
+/// `[sparse]` section when present, else defaults; `--embedder` overrides the id.
+fn serve_sparse_settings(
+    minsync_dir: &std::path::Path,
+    id: Option<String>,
+) -> Result<crate::config::SparseConfig> {
+    let config_path = minsync_dir.join("config.toml");
+    let mut settings = if config_path.exists() {
+        crate::config::Config::load(&config_path)?.sparse
+    } else {
+        crate::config::SparseConfig::default()
+    };
+    if let Some(id) = id {
+        settings.id = if id.contains(':') {
+            id
+        } else {
+            format!("native:{id}")
+        };
+    }
+    Ok(settings)
 }
 
 /// Embedder settings `serve` runs with: the workspace config when present
@@ -631,9 +678,23 @@ async fn serve(
     args: ServeArgs,
 ) -> Result<i32> {
     let host = crate::serve::parse_loopback_host(&args.host)?;
-    let settings = serve_settings(minsync_dir, args.embedder)?;
-    let instance = crate::serve::instance_key(&settings)?;
-    let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
+    // Dense and sparse servers differ only in the engine and the identity of
+    // the model instance; everything after that is shared.
+    let (instance, query_prefix, passage_prefix) = if args.sparse {
+        let settings = serve_sparse_settings(minsync_dir, args.embedder.clone())?;
+        (
+            crate::serve::sparse_instance_key(&settings)?,
+            settings.query_prefix,
+            settings.passage_prefix,
+        )
+    } else {
+        let settings = serve_settings(minsync_dir, args.embedder.clone())?;
+        (
+            crate::serve::instance_key(&settings)?,
+            settings.query_prefix,
+            settings.passage_prefix,
+        )
+    };
     let options = crate::serve::ServeOptions {
         host,
         port: args.port,
@@ -643,10 +704,11 @@ async fn serve(
         max_request_bytes: args.max_request_bytes.max(1),
         state_dir: args
             .state_dir
+            .clone()
             .unwrap_or_else(|| crate::serve::default_state_dir(&instance)),
         instance,
-        query_prefix: settings.query_prefix.clone(),
-        passage_prefix: settings.passage_prefix.clone(),
+        query_prefix,
+        passage_prefix,
     };
     let state_dir = options.state_dir.clone();
     let print = |event: &str, health: &crate::serve::Health| -> Result<()> {
@@ -671,7 +733,16 @@ async fn serve(
         std::io::stdout().flush()?;
         Ok(())
     };
-    let server = match crate::serve::start(std::sync::Arc::new(engine), options).await? {
+    let started = if args.sparse {
+        let settings = serve_sparse_settings(minsync_dir, args.embedder)?;
+        let engine = crate::sparse::native::NativeSparseEncoder::from_config(&settings)?;
+        crate::serve::start_sparse(std::sync::Arc::new(engine), options).await?
+    } else {
+        let settings = serve_settings(minsync_dir, args.embedder)?;
+        let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
+        crate::serve::start(std::sync::Arc::new(engine), options).await?
+    };
+    let server = match started {
         crate::serve::Started::Adopted(health) => {
             print("adopted", &health)?;
             return Ok(0);

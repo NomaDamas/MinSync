@@ -29,6 +29,8 @@ pub(super) fn empty_sync_result(dry_run: bool, already_up_to_date: bool) -> Sync
         embedding_api_calls: 0,
         embedded_texts: 0,
         embeddings_reused: 0,
+        sparse_encoded: 0,
+        sparse_reused: 0,
         estimated_tokens: 0,
         files_checked: 0,
         freshness_check_only: already_up_to_date,

@@ -2,21 +2,29 @@ use clap::Parser;
 use minsync::cli::{Cli, Commands, QueryMode};
 
 #[test]
-fn init_accepts_language() {
-    let cli = Cli::try_parse_from(["minsync", "init", "--language", "simple"])
-        .expect("init --language should parse");
+fn init_parses_with_the_default_embedder() {
+    let cli = Cli::try_parse_from(["minsync", "init"]).expect("init should parse");
 
     match cli.command {
-        Commands::Init { language, .. } => assert_eq!(language, "simple"),
+        Commands::Init { embedder, .. } => assert!(!embedder.is_empty()),
         _ => panic!("expected init command"),
     }
+}
+
+#[test]
+fn init_rejects_the_removed_language_flag() {
+    let error = match Cli::try_parse_from(["minsync", "init", "--language", "simple"]) {
+        Ok(_) => panic!("`init --language` was removed with the BM25 index"),
+        Err(error) => error,
+    };
+    assert_eq!(error.exit_code(), 2);
 }
 
 #[test]
 fn query_accepts_all_modes() {
     for (mode, expected) in [
         ("vector", QueryMode::Vector),
-        ("bm25", QueryMode::Bm25),
+        ("sparse", QueryMode::Sparse),
         ("hybrid", QueryMode::Hybrid),
     ] {
         let cli = Cli::try_parse_from(["minsync", "query", "alpha", "--mode", mode])
@@ -29,6 +37,15 @@ fn query_accepts_all_modes() {
             _ => panic!("expected query command"),
         }
     }
+}
+
+#[test]
+fn query_rejects_the_removed_bm25_mode() {
+    let error = match Cli::try_parse_from(["minsync", "query", "alpha", "--mode", "bm25"]) {
+        Ok(_) => panic!("`bm25` was replaced by `sparse`"),
+        Err(error) => error,
+    };
+    assert_eq!(error.exit_code(), 2);
 }
 
 #[test]
