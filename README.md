@@ -340,6 +340,18 @@ Providers:
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
 - `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
+Model download: nothing to install by hand. The first sync (or query, or
+`minsync serve --sparse`) fetches the model into `~/.cache/minsync/models`
+(`%LOCALAPPDATA%\minsync\models` on Windows, or `$HF_HOME` when set) and says so
+in the log, even when stderr is not a terminal. The weights are checked
+against the sha256 the Hub names the file after; a damaged download (an
+interrupted one that resumed on bad bytes, say) is discarded and fetched once
+more. Once cached, no later run touches the network. `HF_ENDPOINT` selects a
+mirror. For a machine that cannot reach the Hub, run any command once on a
+connected machine and copy the folder `models--nlpai-lab--KURE-Sparse-nano`
+from that cache to the same place on the other one; the model id recorded in
+the index stays `nlpai-lab/KURE-Sparse-nano`.
+
 Query-time encoding runs the same model on the query with the `query_prefix`;
 there is no inference-free query mode. There is no `--language` flag on
 `minsync init` and no `[lexical]` config table: an old `config.toml` that still

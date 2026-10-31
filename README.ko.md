@@ -277,6 +277,17 @@ Provider:
 - `tei:`는 Text Embeddings Inference 서버의 `POST /embed_sparse`를 호출하며 `base_url`이 그 서버를 가리킵니다.
 - `native:`는 실행 중인 `minsync serve --sparse`를 자동으로 채택합니다(discovery 규칙은 dense embedder와 같으며 `MINSYNC_SERVER=off`로 끕니다). `minsync serve --sparse`는 TEI 호환 `POST /embed_sparse`와 `GET /health`(kind `sparse`)를 제공합니다.
 
+모델 다운로드: 따로 설치할 것이 없습니다. 첫 sync(또는 query, `minsync serve
+--sparse`)가 모델을 `~/.cache/minsync/models`(Windows는
+`%LOCALAPPDATA%\minsync\models`, `$HF_HOME`이 있으면 그 경로)에 받고, stderr가
+터미널이 아니어도 log에 그렇게 알립니다. 가중치는 Hub가 파일 이름으로 쓰는
+sha256과 대조하며, 손상된 다운로드(중단됐다가 잘못된 바이트로 이어받은 경우
+등)는 버리고 한 번 다시 받습니다. 한 번 받은 뒤에는 이후 실행이 네트워크를 쓰지
+않습니다. `HF_ENDPOINT`로 mirror를 지정할 수 있습니다. Hub에 접속할 수 없는
+머신에는, 접속 가능한 머신에서 아무 명령이나 한 번 실행한 뒤 그 cache의
+`models--nlpai-lab--KURE-Sparse-nano` 폴더를 다른 머신의 같은 위치로 복사하세요.
+index에 기록되는 모델 id는 `nlpai-lab/KURE-Sparse-nano` 그대로입니다.
+
 Query-time encoding은 같은 모델을 query에 `query_prefix`와 함께 실행합니다.
 inference-free query 모드는 없습니다. `minsync init`에는 `--language` flag가
 없고 `[lexical]` config table도 없습니다. `[lexical]`이 남아 있는 예전
