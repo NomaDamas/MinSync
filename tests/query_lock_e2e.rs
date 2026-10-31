@@ -1,11 +1,16 @@
 use assert_cmd::Command;
 use minsync::config::Config;
+use minsync::sparse::native::NativeSparseEncoder;
+use minsync::sparse::SparseEncoder;
 use minsync::state::{Cursor, FileLock};
 use minsync::vectorstore::lancedb_store::LanceDbStore;
 use minsync::vectorstore::{Document, VectorStore};
 
-/// Prepare an initialized, synced workspace with one indexed document.
-fn synced_workspace() -> tempfile::TempDir {
+mod common;
+
+/// Prepare an initialized, synced workspace with one indexed document that
+/// carries a sparse vector from the same tiny model the config names.
+async fn synced_workspace() -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("create workspace");
     let minsync_dir = root.path().join(".minsync");
     std::fs::create_dir_all(&minsync_dir).expect("create state directory");
@@ -15,9 +20,24 @@ fn synced_workspace() -> tempfile::TempDir {
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(4));
     config.vectorstore.options = toml::Value::Table(options);
+    common::use_tiny_sparse(&mut config);
     config
         .save(&minsync_dir.join("config.toml"))
         .expect("save config");
+
+    // The native encoder records its id without the `native:` prefix, and the
+    // stored sparse vectors are keyed by exactly that string.
+    let encoder = NativeSparseEncoder::from_config(&config.sparse).expect("build tiny encoder");
+    let model = encoder.id().to_string();
+    let text = "w1 w2 concurrent query target".to_string();
+    let vector = encoder
+        .encode(std::slice::from_ref(&text))
+        .await
+        .expect("encode passage")
+        .into_iter()
+        .next()
+        .expect("one vector");
+
     Cursor {
         source_id: source_id.to_string(),
         last_synced_at: "2026-09-20T00:00:00Z".to_string(),
@@ -25,19 +45,19 @@ fn synced_workspace() -> tempfile::TempDir {
         chunk_schema_id: "recursive".to_string(),
         embedder_id: config.embedder.id.clone(),
         collection_path: config.collection.path.clone(),
-        lexical_language: config.lexical.language.clone(),
+        sparse_id: Some(model.clone()),
     }
     .save(&minsync_dir.join("cursor.json"))
     .expect("save cursor");
 
     let store_path = minsync_dir.join(&config.collection.path);
-    let mut store = LanceDbStore::open_with_language(&store_path, 4, Default::default(), "simple")
-        .expect("open LanceDB");
+    let mut store =
+        LanceDbStore::open_with_indexing(&store_path, 4, Default::default()).expect("open LanceDB");
     store
         .upsert(&[Document {
             id: "chunk-1".to_string(),
             embedding: vec![1.0, 0.0, 0.0, 0.0],
-            text: "concurrent query target".to_string(),
+            text,
             source_id: source_id.to_string(),
             path: "doc.md".to_string(),
             chunk_schema_id: "recursive".to_string(),
@@ -47,24 +67,38 @@ fn synced_workspace() -> tempfile::TempDir {
             seen_token: "lock".to_string(),
         }])
         .expect("upsert chunk");
-    store.flush().expect("build BM25 index");
+    store
+        .set_sparse(&model, &[("chunk-1".to_string(), vector)])
+        .expect("attach sparse vector");
     root
 }
 
-#[test]
-fn query_succeeds_while_writer_lock_is_held() {
-    let root = synced_workspace();
+fn run_minsync(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::cargo_bin("minsync")
+        .expect("find minsync binary")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .expect("run minsync")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_succeeds_while_writer_lock_is_held() {
+    let root = synced_workspace().await;
     // Simulate a running sync: hold the workspace lock for the duration of
     // the query, as `minsync sync` would.
     let _lock = FileLock::acquire(&root.path().join(".minsync/lock"), false)
         .expect("acquire workspace lock");
 
-    let output = Command::cargo_bin("minsync")
-        .expect("find minsync binary")
-        .current_dir(root.path())
-        .args(["--format", "json", "query", "concurrent", "--mode", "bm25"])
-        .output()
-        .expect("run query while locked");
+    let root_path = root.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        run_minsync(
+            &root_path,
+            &["--format", "json", "query", "w1", "--mode", "sparse"],
+        )
+    })
+    .await
+    .expect("join");
 
     assert!(
         output.status.success(),
@@ -76,18 +110,16 @@ fn query_succeeds_while_writer_lock_is_held() {
     assert_eq!(results[0]["doc_id"], "chunk-1");
 }
 
-#[test]
-fn sync_still_fails_while_writer_lock_is_held() {
-    let root = synced_workspace();
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_still_fails_while_writer_lock_is_held() {
+    let root = synced_workspace().await;
     let _lock = FileLock::acquire(&root.path().join(".minsync/lock"), false)
         .expect("acquire workspace lock");
 
-    let output = Command::cargo_bin("minsync")
-        .expect("find minsync binary")
-        .current_dir(root.path())
-        .args(["sync"])
-        .output()
-        .expect("run sync while locked");
+    let root_path = root.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || run_minsync(&root_path, &["sync"]))
+        .await
+        .expect("join");
 
     assert_eq!(
         output.status.code(),

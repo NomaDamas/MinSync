@@ -90,6 +90,21 @@ pub(super) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Rows that hold no sparse vector from `model`: never encoded (all three
+/// sparse columns null) or encoded by another model. `<>` alone would drop
+/// the null rows (SQL three-valued logic), so each case is spelled out.
+pub(super) fn missing_sparse_filter(model: &str) -> String {
+    format!(
+        "(sparse_model IS NULL OR sparse_model <> '{}' OR sparse_indices IS NULL OR sparse_values IS NULL)",
+        escape_sql_literal(model)
+    )
+}
+
+/// Rows whose sparse vector came from `model`.
+pub(super) fn has_sparse_filter(model: &str) -> String {
+    format!("sparse_model = '{}'", escape_sql_literal(model))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +188,21 @@ mod tests {
             sql,
             "(path = 'x') AND ((source_id = 's') AND (seen_token != 't'))"
         );
+    }
+}
+
+#[cfg(test)]
+mod sparse_filter_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_predicates_escape_the_model_and_keep_null_rows_in_the_missing_set() {
+        let missing = missing_sparse_filter("o'brien/model");
+        assert!(missing.contains("sparse_model IS NULL"), "{missing}");
+        assert!(
+            missing.contains("sparse_model <> 'o''brien/model'"),
+            "{missing}"
+        );
+        assert_eq!(has_sparse_filter("m"), "sparse_model = 'm'");
     }
 }

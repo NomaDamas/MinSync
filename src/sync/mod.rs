@@ -5,6 +5,7 @@
 mod indexer;
 mod reporter;
 mod result;
+mod sparse_phase;
 
 use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
@@ -12,6 +13,7 @@ use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use crate::incremental::journal::{Journal, Record, RunHeader, Status, JOURNAL_FILE};
 use crate::manifest::{FileChange, Manifest, ScanErrorKind};
+use crate::sparse::SparseEncoder;
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
@@ -32,6 +34,9 @@ pub struct MinSync {
     checkpoint_every: Option<usize>,
     /// Machine-readable progress stream (`--progress jsonl`); `None` = off.
     progress: Option<Arc<ProgressReporter>>,
+    /// Encodes the sparse (SPLADE) vector of every stored row. Without one a
+    /// sync is dense-only and leaves the sparse columns alone.
+    sparse: Option<Arc<dyn SparseEncoder>>,
 }
 
 impl MinSync {
@@ -42,6 +47,7 @@ impl MinSync {
             minsync_dir,
             checkpoint_every: None,
             progress: None,
+            sparse: None,
         }
     }
 
@@ -56,6 +62,14 @@ impl MinSync {
     /// `heartbeat`, `done`) to `reporter` while syncing.
     pub fn with_progress(mut self, reporter: Arc<ProgressReporter>) -> Self {
         self.progress = Some(reporter);
+        self
+    }
+
+    /// Encode a sparse vector for every stored row at the end of each sync
+    /// (the rows this run wrote, and any older row that has none from this
+    /// model), and record the model in the cursor.
+    pub fn with_sparse_encoder(mut self, encoder: Arc<dyn SparseEncoder>) -> Self {
+        self.sparse = Some(encoder);
         self
     }
 
@@ -147,8 +161,10 @@ impl MinSync {
 
 /// Fingerprint of everything that changes what a processed file writes to
 /// the store. A resume log is only trusted when this matches, so editing the
-/// chunker/normalizer/embedder/language between a crash and the retry
-/// re-indexes instead of silently keeping rows built the old way.
+/// chunker/normalizer/embedder between a crash and the retry
+/// re-indexes instead of silently keeping rows built the old way. The sparse
+/// encoder is not part of it: the sparse phase is driven by the store, so a
+/// changed model is found by what the rows hold, not by the resume log.
 fn config_fingerprint(config: &Config, chunker: &dyn Chunker, embedder: &dyn Embedder) -> String {
     let material = serde_json::json!({
         "chunker": &config.chunker,
@@ -156,7 +172,6 @@ fn config_fingerprint(config: &Config, chunker: &dyn Chunker, embedder: &dyn Emb
         "normalize": &config.normalize,
         "embedder": &config.embedder,
         "embedder_id": embedder.id(),
-        "lexical": &config.lexical,
         "vectorstore": &config.vectorstore,
         "collection": &config.collection,
     });
@@ -288,13 +303,7 @@ impl MinSync {
                     && cursor.manifest_hash == manifest.manifest_hash()
         );
         let initial_sync = !has_completed_sync;
-        let stored_lexical_language = stored_cursor
-            .as_ref()
-            .filter(|_| has_completed_sync)
-            .map(|cursor| cursor.lexical_language.clone())
-            .unwrap_or_else(|| config.lexical.language.clone());
-        let lexical_rebuild = stored_lexical_language != config.lexical.language;
-        let full = full || initial_sync || lexical_rebuild;
+        let full = full || initial_sync;
 
         // Read the interrupted run's log BEFORE clearing its txn marker.
         let resume_state = Journal::load(&progress_path).into_ledger(&progress_path);
@@ -372,7 +381,11 @@ impl MinSync {
             Filter::And(filters)
         };
 
-        if changes.is_empty() && !full {
+        let sparse_pending = match &self.sparse {
+            Some(encoder) if !dry_run => store.count_missing_sparse(encoder.id())? > 0,
+            _ => false,
+        };
+        if changes.is_empty() && !full && !sparse_pending {
             if let Some(progress) = &self.progress {
                 progress.start(RunStart {
                     started: start,
@@ -484,12 +497,6 @@ impl MinSync {
         result.files_checked = new_manifest.files.len();
         result.scan_errors = scan_errors;
         result.query_ready = true;
-        if lexical_rebuild {
-            // Rows indexed under the previous lexical language must go. Keyed
-            // on the token so a resumed run keeps what it already rewrote.
-            result.chunks_deleted +=
-                store.delete_by_filter(&sweep_filter(&sync_token, &result.files_failed))?;
-        }
 
         let checkpoint_every = self
             .checkpoint_every
@@ -644,6 +651,43 @@ impl MinSync {
 
         store.flush()?;
 
+        // The sparse phase: encode every row that lacks a vector from the
+        // current model. A failed file keeps its dense rows (their text is
+        // fine) and is retried by the next sync like any skipped file.
+        let dense_failures = result.files_failed.len();
+        let mut sparse_complete = true;
+        if let Some(encoder) = &self.sparse {
+            let progress = self.progress.clone();
+            let skip = skip_failures;
+            let sparse = sparse_phase::catch_up(
+                store,
+                encoder.as_ref(),
+                sparse_phase::ROWS_PER_BATCH,
+                |failure| {
+                    if !skip {
+                        return Err(MinSyncError::Embedding(format!(
+                            "{}: {}",
+                            failure.path, failure.error
+                        )));
+                    }
+                    if let Some(progress) = &progress {
+                        progress.file_failed(failure);
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+            result.sparse_encoded = sparse.encoded;
+            result.sparse_reused = sparse.reused;
+            sparse_complete = sparse.failures.is_empty();
+            for failure in sparse.failures {
+                if !result.files_failed.iter().any(|f| f.path == failure.path) {
+                    result.files_failed.push(failure);
+                }
+            }
+            store.flush()?;
+        }
+
         // A skipped file must be retried by the next sync, so the saved
         // manifest keeps its previous entry (or none, if it was never
         // indexed) instead of recording it as done.
@@ -656,7 +700,7 @@ impl MinSync {
         } else {
             None
         };
-        for failure in &result.files_failed {
+        for failure in &result.files_failed[..dense_failures] {
             match prior_indexed_manifest.and_then(|manifest| manifest.files.get(&failure.path)) {
                 Some(entry) => {
                     saved_manifest
@@ -677,12 +721,20 @@ impl MinSync {
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
             collection_path: config.collection.path.clone(),
-            // Repeat a partial lexical rebuild: a failed file may have lost
-            // its old rows during the pre-sweep before indexing failed.
-            lexical_language: if lexical_rebuild && !result.files_failed.is_empty() {
-                stored_lexical_language.clone()
-            } else {
-                config.lexical.language.clone()
+            // Only a complete sparse phase proves every row is searchable by
+            // this model; a partial one leaves the cursor as it was, so a
+            // sparse query refuses the index until a sync finishes the job.
+            sparse_id: match &self.sparse {
+                Some(encoder) if sparse_complete => Some(encoder.id().to_string()),
+                // No encoder this run: any chunk it wrote has no sparse
+                // vector, so the index no longer covers every row.
+                None if result.chunks_added == 0 => stored_cursor
+                    .as_ref()
+                    .and_then(|cursor| cursor.sparse_id.clone()),
+                None => None,
+                Some(_) => stored_cursor
+                    .as_ref()
+                    .and_then(|cursor| cursor.sparse_id.clone()),
             },
         }
         .save(&cursor_path)?;
@@ -1095,25 +1147,25 @@ mod tests {
         assert_eq!(store.doc_count(), result.chunks_added);
     }
 
-    struct ForbiddenLexicalOnlyEmbedder;
+    struct ForbiddenSparseOnlyEmbedder;
 
     #[async_trait::async_trait]
-    impl Embedder for ForbiddenLexicalOnlyEmbedder {
+    impl Embedder for ForbiddenSparseOnlyEmbedder {
         fn id(&self) -> &str {
             "none"
         }
 
-        fn is_lexical_only(&self) -> bool {
+        fn is_sparse_only(&self) -> bool {
             true
         }
 
         async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            panic!("a lexical-only sync must never embed");
+            panic!("a sparse-only sync must never embed");
         }
     }
 
     #[tokio::test]
-    async fn test_sync_lexical_only_stores_chunks_without_embedding() {
+    async fn test_sync_sparse_only_stores_chunks_without_embedding() {
         let (dir, sync, chunker, _embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma delta").expect("write file");
         sync.init(false, "none", "recursive")
@@ -1122,7 +1174,7 @@ mod tests {
         let result = sync
             .sync(
                 &chunker,
-                &ForbiddenLexicalOnlyEmbedder,
+                &ForbiddenSparseOnlyEmbedder,
                 &mut store,
                 true,
                 false,
@@ -1137,7 +1189,7 @@ mod tests {
         assert_eq!(store.doc_count(), result.chunks_added);
         let cursor = Cursor::load(&sync.minsync_dir.join("cursor.json")).expect("cursor");
         assert_eq!(cursor.embedder_id, "none");
-        let placeholder = vec![0.0; crate::config::LEXICAL_ONLY_DIMENSION];
+        let placeholder = vec![0.0; crate::config::SPARSE_ONLY_DIMENSION];
         assert!(store
             .all_embeddings()
             .iter()
@@ -1149,10 +1201,10 @@ mod tests {
         let (_dir, sync, _chunker, _embedder, _store) = fixture();
         let config = sync.init(false, "none", "recursive").expect("init");
         assert_eq!(config.embedder.id, "none");
-        assert!(config.is_lexical_only());
+        assert!(config.is_sparse_only());
         assert_eq!(
             config.vectorstore.options["dimension"].as_integer(),
-            Some(crate::config::LEXICAL_ONLY_DIMENSION as i64)
+            Some(crate::config::SPARSE_ONLY_DIMENSION as i64)
         );
     }
 
@@ -1732,13 +1784,38 @@ mod tests {
         ) -> Result<Vec<QueryHit>> {
             self.inner.query(vector, filter, topk)
         }
-        fn query_text(
+        fn rows_missing_sparse(
             &self,
-            text: &str,
+            model: &str,
+            limit: usize,
+        ) -> Result<Vec<crate::vectorstore::SparseTarget>> {
+            self.inner.rows_missing_sparse(model, limit)
+        }
+        fn count_missing_sparse(&self, model: &str) -> Result<usize> {
+            self.inner.count_missing_sparse(model)
+        }
+        fn set_sparse(
+            &mut self,
+            model: &str,
+            rows: &[(String, crate::sparse::SparseVector)],
+        ) -> Result<()> {
+            self.inner.set_sparse(model, rows)
+        }
+        fn fetch_sparse_by_content_hash(
+            &self,
+            model: &str,
+            hashes: &[String],
+        ) -> Result<std::collections::HashMap<String, crate::sparse::SparseVector>> {
+            self.inner.fetch_sparse_by_content_hash(model, hashes)
+        }
+        fn query_sparse(
+            &self,
+            model: &str,
+            vector: &crate::sparse::SparseVector,
             filter: Option<&Filter>,
             topk: usize,
         ) -> Result<Vec<QueryHit>> {
-            self.inner.query_text(text, filter, topk)
+            self.inner.query_sparse(model, vector, filter, topk)
         }
         fn flush(&mut self) -> Result<()> {
             self.inner.flush()
@@ -1883,7 +1960,7 @@ mod tests {
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: "mock".to_string(),
             collection_path: config.collection.path.clone(),
-            lexical_language: config.lexical.language.clone(),
+            sparse_id: None,
         }
         .save(&sync.minsync_dir.join("cursor.json"))
         .expect("write cursor from interrupted state commit");
@@ -3008,5 +3085,378 @@ mod tests {
 
         assert_eq!(result.files_failed.len(), 5);
         assert!(store.all_paths().is_empty());
+    }
+
+    /// Encodes a chunk as the term count of its words; rejects chunks that
+    /// contain a configured word. Counts every `encode` call it answers.
+    struct CountingSparse {
+        model: &'static str,
+        reject: Option<&'static str>,
+        encoded_texts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingSparse {
+        fn new(model: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                model,
+                reject: None,
+                encoded_texts: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn rejecting(model: &'static str, word: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                model,
+                reject: Some(word),
+                encoded_texts: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn encoded(&self) -> usize {
+            self.encoded_texts.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SparseEncoder for CountingSparse {
+        fn id(&self) -> &str {
+            self.model
+        }
+
+        async fn encode(&self, texts: &[String]) -> Result<Vec<crate::sparse::SparseVector>> {
+            if let Some(word) = self.reject {
+                if texts.iter().any(|text| text.contains(word)) {
+                    return Err(MinSyncError::Embedding(format!("cannot encode `{word}`")));
+                }
+            }
+            self.encoded_texts
+                .lock()
+                .unwrap()
+                .extend(texts.iter().cloned());
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    crate::sparse::SparseVector::from_pairs(
+                        text.split_whitespace().map(|word| (word.len() as u32, 1.0)),
+                    )
+                })
+                .collect())
+        }
+
+        async fn encode_query(&self, text: &str) -> Result<crate::sparse::SparseVector> {
+            Ok(self.encode(&[text.to_string()]).await?.remove(0))
+        }
+    }
+
+    fn cursor_of(sync: &MinSync) -> Cursor {
+        Cursor::load(&sync.minsync_dir.join("cursor.json")).expect("cursor")
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_an_encoder_encodes_every_chunk_and_records_the_model() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        std::fs::write(dir.path().join("b.txt"), "delta epsilon zeta eta").expect("write b");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+
+        assert!(result.chunks_added > 0);
+        assert_eq!(result.sparse_encoded, result.chunks_added);
+        assert_eq!(store.count_missing_sparse("m1").unwrap(), 0);
+        assert_eq!(cursor_of(&sync).sparse_id.as_deref(), Some("m1"));
+        assert!(!result.partial);
+    }
+
+    #[tokio::test]
+    async fn test_a_sync_with_nothing_changed_encodes_nothing() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first");
+        let before = encoder.encoded();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("second");
+
+        assert!(result.already_up_to_date);
+        assert_eq!(encoder.encoded(), before);
+    }
+
+    #[tokio::test]
+    async fn test_only_the_changed_files_chunks_are_encoded_on_an_incremental_sync() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        std::fs::write(dir.path().join("b.txt"), "delta epsilon zeta").expect("write b");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first");
+        let before = encoder.encoded();
+
+        std::fs::write(dir.path().join("b.txt"), "completely different words").expect("edit b");
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("incremental");
+
+        assert_eq!(result.sparse_encoded, result.chunks_added);
+        assert_eq!(encoder.encoded() - before, result.chunks_added);
+        assert_eq!(store.count_missing_sparse("m1").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_an_index_built_without_sparse_is_upgraded_by_a_plain_sync() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        std::fs::write(dir.path().join("b.txt"), "delta epsilon zeta").expect("write b");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        // The BM25 era: a completed sync with no sparse encoder.
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("legacy");
+        assert_eq!(cursor_of(&sync).sparse_id, None);
+
+        // Upgrade: same files, now with an encoder, no --full. The dense
+        // embedder must not be called at all.
+        let encoder = CountingSparse::new("m1");
+        let upgraded = MinSync::new(dir.path().to_path_buf()).with_sparse_encoder(encoder.clone());
+        let result = upgraded
+            .sync(&chunker, &NoDenseCalls, &mut store, false, false, false)
+            .await
+            .expect("upgrade sync");
+
+        assert!(!result.already_up_to_date, "the sparse backlog is work");
+        assert_eq!(result.files_processed, 0, "no file is re-read");
+        assert_eq!(result.chunks_added, 0, "no chunk is re-embedded");
+        assert_eq!(result.embedded_texts, 0);
+        assert!(result.sparse_encoded > 0);
+        assert_eq!(store.count_missing_sparse("m1").unwrap(), 0);
+        assert_eq!(cursor_of(&upgraded).sparse_id.as_deref(), Some("m1"));
+
+        let again = upgraded
+            .sync(&chunker, &NoDenseCalls, &mut store, false, false, false)
+            .await
+            .expect("settled");
+        assert!(again.already_up_to_date);
+    }
+
+    /// Same identity as `MockEmbedder`, but any call to embed is a bug.
+    struct NoDenseCalls;
+
+    #[async_trait::async_trait]
+    impl Embedder for NoDenseCalls {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("the sparse upgrade must not call the dense embedder");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_dry_run_never_encodes() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, true, false)
+            .await
+            .expect("dry run");
+
+        assert!(result.dry_run);
+        assert_eq!(encoder.encoded(), 0);
+        assert_eq!(store.doc_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_changing_the_model_re_encodes_every_row_without_touching_dense_vectors() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let first = sync.with_sparse_encoder(CountingSparse::new("old"));
+        first
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first");
+        let dense_before = store.all_embeddings();
+
+        let second_encoder = CountingSparse::new("new");
+        let second =
+            MinSync::new(dir.path().to_path_buf()).with_sparse_encoder(second_encoder.clone());
+        let result = second
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("model change");
+
+        assert!(result.sparse_encoded > 0);
+        assert_eq!(result.embedded_texts, 0, "dense side is untouched");
+        assert_eq!(store.count_missing_sparse("new").unwrap(), 0);
+        assert_eq!(cursor_of(&second).sparse_id.as_deref(), Some("new"));
+        let mut after = store.all_embeddings();
+        let mut before = dense_before;
+        after.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        before.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn test_a_chunk_the_encoder_rejects_fails_its_file_and_leaves_the_cursor_unsparse() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("good.txt"), "alpha beta gamma").expect("write good");
+        std::fs::write(dir.path().join("bad.txt"), "poison words here").expect("write bad");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let sync = sync.with_sparse_encoder(CountingSparse::rejecting("m1", "poison"));
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("skip policy completes");
+
+        assert!(result.partial);
+        assert_eq!(result.files_failed.len(), 1);
+        assert_eq!(result.files_failed[0].path, "bad.txt");
+        assert_eq!(result.files_failed[0].stage, FileStage::Sparse);
+        assert!(result.files_failed[0].error.contains("cannot encode"));
+        // The dense index is complete: a sparse failure must not cost it.
+        assert_eq!(store.all_paths(), vec!["bad.txt", "good.txt"]);
+        // Sparse search is refused until a sync finishes the job.
+        assert_eq!(cursor_of(&sync).sparse_id, None);
+        assert_eq!(store.count_missing_sparse("m1").unwrap(), 1);
+
+        // The encoder recovers: the next sync encodes the leftover row and
+        // only then records the model.
+        let healed = CountingSparse::new("m1");
+        let healed_sync =
+            MinSync::new(dir.path().to_path_buf()).with_sparse_encoder(healed.clone());
+        let retry = healed_sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("retry");
+        assert!(!retry.partial, "{:?}", retry.files_failed);
+        assert_eq!(healed.encoded(), 1, "only the leftover row");
+        assert_eq!(cursor_of(&healed_sync).sparse_id.as_deref(), Some("m1"));
+    }
+
+    #[tokio::test]
+    async fn test_a_sparse_failure_under_the_fail_policy_aborts_the_sync() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("bad.txt"), "poison words here").expect("write bad");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let mut config = Config::load(&sync.minsync_dir.join("config.toml")).expect("config");
+        config.sync.on_file_error = OnFileError::Fail;
+        config
+            .save(&sync.minsync_dir.join("config.toml"))
+            .expect("save");
+        let sync = sync.with_sparse_encoder(CountingSparse::rejecting("m1", "poison"));
+
+        let error = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect_err("fail policy aborts on the first sparse failure");
+
+        assert!(error.to_string().contains("bad.txt"), "{error}");
+        assert_eq!(
+            cursor_of_or_none(&sync),
+            None,
+            "a failed run records nothing"
+        );
+    }
+
+    fn cursor_of_or_none(sync: &MinSync) -> Option<Cursor> {
+        Cursor::load(&sync.minsync_dir.join("cursor.json")).ok()
+    }
+
+    #[tokio::test]
+    async fn test_a_dense_only_sync_after_a_sparse_one_forgets_that_the_index_is_covered() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let with_sparse = sync.with_sparse_encoder(CountingSparse::new("m1"));
+        with_sparse
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first");
+        assert_eq!(cursor_of(&with_sparse).sparse_id.as_deref(), Some("m1"));
+
+        // A library user (or an old binary) syncs without an encoder and adds a file.
+        std::fs::write(dir.path().join("b.txt"), "delta epsilon zeta").expect("write b");
+        let dense_only = MinSync::new(dir.path().to_path_buf());
+        dense_only
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("dense-only");
+
+        // b.txt's chunks have no sparse vector, so coverage must not be claimed.
+        assert_eq!(cursor_of(&dense_only).sparse_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_a_dense_only_sync_that_adds_nothing_keeps_the_recorded_model() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let with_sparse = sync.with_sparse_encoder(CountingSparse::new("m1"));
+        with_sparse
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first");
+
+        let dense_only = MinSync::new(dir.path().to_path_buf());
+        dense_only
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(cursor_of(&dense_only).sparse_id.as_deref(), Some("m1"));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_chunk_text_across_files_is_encoded_once() {
+        let (dir, sync, chunker, embedder, mut store) = fixture();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(name), "the very same sentence").expect("write");
+        }
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+
+        assert_eq!(result.chunks_added, 3);
+        assert_eq!(encoder.encoded(), 1);
+        assert_eq!(result.sparse_encoded, 1);
+        assert_eq!(result.sparse_reused, 2);
     }
 }

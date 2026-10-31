@@ -31,8 +31,8 @@ fn fragmented_workspace(chunks: usize) -> tempfile::TempDir {
         .save(&minsync_dir.join("config.toml"))
         .expect("save config");
     let store_path = minsync_dir.join(&config.collection.path);
-    let mut store = LanceDbStore::open_with_language(&store_path, 4, Default::default(), "simple")
-        .expect("open LanceDB");
+    let mut store =
+        LanceDbStore::open_with_indexing(&store_path, 4, Default::default()).expect("open LanceDB");
     for i in 0..chunks {
         store.upsert(&[doc(i)]).expect("upsert chunk");
     }
@@ -59,7 +59,7 @@ fn optimize_compacts_a_fragmented_store_without_losing_rows() {
     assert_eq!(json["optimized"], true);
 
     let store_path = root.path().join(".minsync/store");
-    let store = LanceDbStore::open_with_language(&store_path, 4, Default::default(), "simple")
+    let store = LanceDbStore::open_with_indexing(&store_path, 4, Default::default())
         .expect("reopen LanceDB");
     assert_eq!(store.doc_count(), 30);
     assert_eq!(store.fragment_count().expect("fragments"), 1);

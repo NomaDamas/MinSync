@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 const EVENTS: [&str; 4] = ["start", "batch", "heartbeat", "done"];
 
 struct SlowOnePerInput(Duration);
@@ -50,6 +52,7 @@ fn workspace(server: &MockServer, files: usize) -> tempfile::TempDir {
     let mut options = toml::value::Table::new();
     options.insert("dimension".into(), toml::Value::Integer(4));
     config.vectorstore.options = toml::Value::Table(options);
+    common::use_tiny_sparse(&mut config);
     config
         .save(&minsync_dir.join("config.toml"))
         .expect("save config");

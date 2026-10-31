@@ -26,7 +26,7 @@ MinSync was compared with
 [CocoIndex](https://github.com/cocoindex-io/cocoindex), which provides a broad
 incremental execution framework for AI data pipelines. CocoIndex can track
 arbitrary processing functions, dependencies, memoized results, and target
-states. Parsing, chunking, BM25 preparation, sparse encoding, vector embedding,
+states. Parsing, chunking, sparse encoding, vector embedding,
 image processing, and database writes can all be modeled as functions in such a
 framework.
 

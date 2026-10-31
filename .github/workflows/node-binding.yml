@@ -62,20 +62,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Kiwi
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          bash ../../scripts/install-kiwi.sh >> "$GITHUB_ENV"
-
-      - name: Install Kiwi
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          KIWI_VERSION: 0.22.2
-        run: |
-          ../../scripts/install-kiwi.ps1 | Out-File -FilePath $env:GITHUB_ENV -Append
-
       - run: npm ci
 
       - run: cargo clippy -p minsync-node --target ${{ matrix.target }} -- -D warnings
@@ -121,11 +107,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install Kiwi
-        shell: bash
-        run: |
-          bash scripts/install-kiwi.sh >> "$GITHUB_ENV"
 
       - uses: actions/cache@v4
         with:
