@@ -392,6 +392,28 @@ about 200 KB there). Lower `max_batch_tokens` to trade a little throughput for
 less memory. Sorting chunks by length before batching keeps throughput up at
 small values. Set `MINSYNC_SERVER=off` to force in-process encoding.
 
+### Limits of sparse retrieval
+
+Measured on the corpora above (Apple Silicon, KURE-Sparse-nano):
+
+- **Exact strings.** The model works on word pieces, so an identifier such as
+  `ERR-48213`, a hash or a version string is not matched the way BM25 matches a
+  token. On 300 synthetic documents that each carry one such identifier, a query
+  for the identifier ranked the right document first 26% of the time (BM25:
+  100%; dense Qwen3-Embedding-0.6B: 2%; dense+sparse hybrid: 7%). Use `grep`
+  for exact lookups.
+- **Corpus size.** `--mode sparse` scores every stored chunk; there is no index
+  over the sparse columns. A query (CLI, in-process) takes 206 ms at 21k chunks
+  and 508 ms at 106k, growing linearly.
+- **Indexing speed.** Every chunk goes through the model: about 16-25
+  chunks/s on Metal and 3-5 on CPU. SciFact's 5,183 files took BM25 6 s and
+  SPLADE 313 s on Metal.
+- **Disk.** An encoded chunk takes about 5 KB. Lance keeps replaced files for
+  10 minutes so that a concurrent query never loses its files, so right after a
+  long sync the store can be several times larger than its data until the next
+  sync prunes them (a sync that added 85k files to a 21k-chunk index left 12 GB
+  on disk for 0.5 GB of data).
+
 ### Upgrading from a BM25-era index
 
 The first `minsync sync` after upgrading automatically drops the old full-text

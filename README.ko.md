@@ -328,6 +328,26 @@ projection 및 pooling에 쓰는 고정 128-token 블록입니다(여기서 toke
 chunk를 길이순으로 정렬한 뒤 batch로 묶기 때문에 작은 값에서도 처리량이 유지됩니다.
 `MINSYNC_SERVER=off`로 in-process 인코딩을 강제할 수 있습니다.
 
+### Sparse retrieval의 한계
+
+위 corpus에서 측정한 값입니다(Apple Silicon, KURE-Sparse-nano).
+
+- **정확한 문자열.** 모델이 word piece 단위로 동작하므로 `ERR-48213` 같은
+  식별자, 해시, 버전 문자열은 BM25가 token을 맞추는 방식으로 매칭되지 않습니다.
+  식별자 하나씩을 담은 합성 문서 300개에서 식별자만으로 질의했을 때 정답 문서가
+  1위인 비율은 26%였습니다(BM25 100%, dense Qwen3-Embedding-0.6B 2%,
+  dense+sparse hybrid 7%). 정확한 조회는 `grep`을 쓰세요.
+- **corpus 크기.** `--mode sparse`는 저장된 모든 chunk의 점수를 계산하며 sparse
+  column에는 index가 없습니다. query(CLI, in-process)가 21k chunk에서 206 ms,
+  106k에서 508 ms로 선형으로 늘어납니다.
+- **색인 속도.** 모든 chunk가 모델을 거칩니다. Metal에서 초당 약 16-25 chunk,
+  CPU에서 3-5 chunk입니다. SciFact 5,183개 파일은 BM25가 6초, SPLADE가 Metal에서
+  313초 걸렸습니다.
+- **디스크.** 인코딩된 chunk 하나가 약 5 KB입니다. 동시에 실행 중인 query가 파일을
+  잃지 않도록 Lance가 교체된 파일을 10분간 보관하므로, 긴 sync 직후에는 다음
+  sync가 정리하기 전까지 store가 데이터의 몇 배가 될 수 있습니다(21k chunk
+  index에 파일 85k개를 추가한 sync 뒤 데이터 0.5 GB에 디스크 12 GB).
+
 ### BM25 시절 index에서 업그레이드
 
 업그레이드 후 첫 `minsync sync`가 이전 full-text(FTS) index와 `lexical_text`
