@@ -155,10 +155,10 @@ summary의 `scan_errors`(`path`, `kind` = `transient` 또는 `permanent`, `error
 
 | id | 전략 | 편집 시 boundary 안정성 |
 |---|---|---|
-| `recursive` (기본값) | paragraph, sentence, line split을 size budget에 맞게 병합 | 파일 상단 편집이 downstream boundary를 밀 수 있습니다. |
+| `recursive` | paragraph, sentence, line split을 size budget에 맞게 병합 | 파일 상단 편집이 downstream boundary를 밀 수 있습니다. |
 | `chonkie` | delimiter/size 기반 chonkie-core chunking | `recursive`와 같은 drift caveat가 있습니다. |
 | `cdc` | FastCDC 스타일 rolling hash 기반 content-defined chunking | 작은 편집은 보통 변경 지점 근처 chunk에만 영향을 줍니다. |
-| `line-cdc` | 줄 끝에서만 자르는 content-defined chunking, 크기는 embedder와 sparse encoder가 자르지 않고 받는 token 수 | 편집은 편집된 줄이 든 chunk에만 영향을 줍니다. |
+| `line-cdc` (기본값) | 줄 끝에서만 자르는 content-defined chunking, 크기는 embedder와 sparse encoder가 자르지 않고 받는 token 수 | 편집은 편집된 줄이 든 chunk에만 영향을 줍니다. |
 
 `recursive` chunker는 paragraph break, sentence delimiter(`. `, `? `,
 `! `), line break를 기준으로 나눈 뒤 `chunker.options.max_chunk_size`
@@ -194,7 +194,7 @@ chunker에서는 token을 세는 `max_chunk_size`를 넘지 않습니다. Token�
 chunk가 header와 separator 줄로 시작하고, separator와 첫 row 사이에서는 자르지
 않습니다.
 
-초기화 시 선택:
+`minsync init`은 따로 지정하지 않으면 `line-cdc`를 씁니다. 초기화 시 다른 chunker를 고르려면:
 
 ```bash
 minsync init --chunker cdc
@@ -208,6 +208,9 @@ id = "cdc"
 ```
 
 Chunker를 바꾸면 chunk schema가 달라지므로 이후 `minsync sync --full`을 실행하세요.
+
+이전 버전에서 만든 workspace는 `config.toml`에 적힌 chunker를 그대로 쓰므로,
+업그레이드해도 기존 index의 chunking은 바뀌지 않습니다.
 
 ### Heading context
 
@@ -236,8 +239,13 @@ heading이 아니므로, `.py`나 `.txt` chunk에는 경로만 붙습니다.
 이 줄을 위해 `max_chunk_size`의 1/8을 떼어 두므로, 줄이 붙어도 chunk는 cap을
 넘지 않습니다. 자리가 모자라면 바깥쪽 heading부터 빼고, 그래도 넘으면 경로의
 끝을 자릅니다. 파일 이름을 바꾸면 그 파일의 모든 chunk text가 바뀌어 다시
-임베딩됩니다. 이 옵션은 chunk schema(`recursive+heading` 등)에 포함되므로, 켜거나
-끈 뒤에는 `minsync sync --full`을 실행하세요.
+임베딩되고, 경로가 다른 동일한 파일끼리는 vector를 공유하지 않습니다. 이 옵션은
+chunk schema(`recursive+heading` 등)에 포함되므로, 켜거나 끈 뒤에는
+`minsync sync --full`을 실행하세요.
+
+`minsync init`은 새 workspace에서 heading context를 켭니다. `heading_context`
+키가 없는 `config.toml`은 꺼진 상태를 뜻하므로, 이전 버전에서 만든 workspace는
+전과 같이 chunking됩니다. 다시 끄려면 `heading_context = false`로 설정하세요.
 
 ## Vector Store
 

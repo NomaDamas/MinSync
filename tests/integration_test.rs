@@ -1071,7 +1071,9 @@ fn test_factory_selects_backends() {
     let store = create_vectorstore(&config, dir.path()).expect("create lancedb store");
     assert_eq!(store.doc_count(), 0);
 
-    // Config::default_for sets chunker.id to "recursive".
+    // The factory builds whichever chunker the config names.
+    config.chunker.id = "recursive".to_string();
+    config.chunker.options.heading_context = false;
     let chunker = create_chunker(&config).expect("create recursive chunker");
     assert_eq!(chunker.schema_id(), "recursive");
 }

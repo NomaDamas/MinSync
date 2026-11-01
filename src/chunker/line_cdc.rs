@@ -797,6 +797,7 @@ mod tests {
     fn config(edit: impl FnOnce(&mut Config)) -> Config {
         let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
         config.chunker.id = "line-cdc".to_string();
+        config.chunker.options.heading_context = false;
         edit(&mut config);
         config
     }

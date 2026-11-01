@@ -12,6 +12,27 @@ fn init_parses_with_the_default_embedder() {
 }
 
 #[test]
+fn init_defaults_to_the_line_cdc_chunker() {
+    let cli = Cli::try_parse_from(["minsync", "init"]).expect("init should parse");
+
+    match cli.command {
+        Commands::Init { chunker, .. } => assert_eq!(chunker, "line-cdc"),
+        _ => panic!("expected init command"),
+    }
+}
+
+#[test]
+fn init_keeps_a_chunker_chosen_on_the_command_line() {
+    let cli = Cli::try_parse_from(["minsync", "init", "--chunker", "recursive"])
+        .expect("init should parse");
+
+    match cli.command {
+        Commands::Init { chunker, .. } => assert_eq!(chunker, "recursive"),
+        _ => panic!("expected init command"),
+    }
+}
+
+#[test]
 fn init_rejects_the_removed_language_flag() {
     let error = match Cli::try_parse_from(["minsync", "init", "--language", "simple"]) {
         Ok(_) => panic!("`init --language` was removed with the BM25 index"),

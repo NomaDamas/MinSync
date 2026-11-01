@@ -43,13 +43,13 @@ Use content-defined chunking for large files that change often:
 minsync init --chunker cdc
 ```
 
-For documents, tables and spreadsheet mirrors, `line-cdc` cuts only at line ends, keeps boundaries stable under edits, and sizes chunks so neither the embedder nor the sparse encoder truncates them:
+The default chunker, `line-cdc`, cuts only at line ends, keeps boundaries stable under edits, and sizes chunks so neither the embedder nor the sparse encoder truncates them. To use the older paragraph and sentence splitter instead:
 
 ```bash
-minsync init --chunker line-cdc
+minsync init --chunker recursive
 ```
 
-To give every chunk its file path and Markdown heading trail as its first line (read by both the dense and the sparse encoder), set `heading_context = true` under `[chunker.options]` in `.minsync/config.toml`, then run `minsync sync --full`.
+New workspaces start every chunk with its file path and Markdown heading trail as its first line (read by both the dense and the sparse encoder): `heading_context = true` under `[chunker.options]` in `.minsync/config.toml`. A workspace created by an earlier version keeps what its config says; to change it, edit that file and run `minsync sync --full`.
 
 State is stored in `.minsync/`: `config.toml`, `manifest.json`, `cursor.json`, `txn.json`, and `lock`.
 
