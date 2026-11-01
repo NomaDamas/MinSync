@@ -1,6 +1,6 @@
 {
   "name": "@nomadamas/minsync-native",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "MinSync's native embedder (Qwen3 on candle, Metal on macOS) as an in-process Node-API addon",
   "license": "MIT",
   "repository": {
