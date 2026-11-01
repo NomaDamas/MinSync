@@ -69,7 +69,7 @@ npx skills add github:NomaDamas/MinSync/skills/minsync
 - [ ] crates.io publishing succeeds with `CARGO_REGISTRY_TOKEN`.
 - [ ] Release notes mention text-only indexing and `.minsyncignore`.
 - [ ] `bindings/node/package.json` and `bindings/node/Cargo.toml` carry the same version as the root `Cargo.toml` (the `minsync-node` crate path-depends on `minsync`).
-- [ ] `.github/workflows/node-binding.yml` passes on the tag: three platform builds, the live CPU job (including bit-for-bit parity with the CLI embedder), then `publish` pushes `@nomadamas/minsync-native` and its per-platform packages to npm with provenance. Requires the `NPM_TOKEN` secret and the `@nomadamas` npm scope.
+- [ ] `.github/workflows/node-binding.yml` passes on the tag: three platform builds, the live CPU job (including bit-for-bit parity with the CLI embedder), then `publish` pushes `@nomadamas/minsync-native` and its three per-platform packages to npm with provenance. There is no token: each of the four packages is a trusted publisher for `NomaDamas/MinSync` + `node-binding.yml` (npmjs.com, package Settings, Trusted Publisher), and the job needs npm >= 11.5.1. The first publish of a new package has to be done by hand with `npm publish --access public`, because a trusted publisher can only be added to a package that exists; a trusted publisher stays `Pending validation` until the workflow has published once.
 
 ## 7. Post-Release Smoke Test
 

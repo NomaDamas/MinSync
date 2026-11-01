@@ -31,7 +31,6 @@
   "scripts": {
     "build": "napi build --platform --release --js binding.js --dts binding.d.ts",
     "artifacts": "napi artifacts",
-    "prepublishOnly": "napi pre-publish -t npm",
     "test": "node --test \"__test__/*.test.mjs\""
   },
   "devDependencies": {
