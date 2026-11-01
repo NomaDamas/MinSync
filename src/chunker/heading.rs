@@ -471,10 +471,12 @@ mod tests {
         let document = stress_document();
         let path = "보고서/2026/예산_편성_세부_내역서_최종본.hwp.md";
         // cdc pushes a cut forward to the next UTF-8 boundary: up to 3 bytes.
-        let cases: [(&str, Measure, usize); 3] = [
+        // line-cdc counts tokens, and its cap is at most 1843 (native 2048).
+        let cases: [(&str, Measure, usize); 4] = [
             ("recursive", chars, 0),
             ("cdc", str::len, 3),
             ("chonkie", str::len, 0),
+            ("line-cdc", crate::chunker::line_cdc::tokens_upper, 0),
         ];
         for (id, measure, slack) in cases {
             for cap in [200, 512, 4096] {
@@ -508,7 +510,7 @@ mod tests {
 
     #[test]
     fn the_context_is_part_of_the_chunk_schema() {
-        for id in ["recursive", "cdc", "chonkie"] {
+        for id in ["recursive", "cdc", "chonkie", "line-cdc"] {
             assert_eq!(chunker(id, 4096).schema_id(), format!("{id}+heading"));
         }
     }

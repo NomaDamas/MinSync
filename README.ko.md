@@ -158,6 +158,7 @@ summary의 `scan_errors`(`path`, `kind` = `transient` 또는 `permanent`, `error
 | `recursive` (기본값) | paragraph, sentence, line split을 size budget에 맞게 병합 | 파일 상단 편집이 downstream boundary를 밀 수 있습니다. |
 | `chonkie` | delimiter/size 기반 chonkie-core chunking | `recursive`와 같은 drift caveat가 있습니다. |
 | `cdc` | FastCDC 스타일 rolling hash 기반 content-defined chunking | 작은 편집은 보통 변경 지점 근처 chunk에만 영향을 줍니다. |
+| `line-cdc` | 줄 끝에서만 자르는 content-defined chunking, 크기는 embedder와 sparse encoder가 자르지 않고 받는 token 수 | 편집은 편집된 줄이 든 chunk에만 영향을 줍니다. |
 
 `recursive` chunker는 paragraph break, sentence delimiter(`. `, `? `,
 `! `), line break를 기준으로 나눈 뒤 `chunker.options.max_chunk_size`
@@ -174,6 +175,24 @@ header(또는 header만)가 cap을 넘으면 그 chunk는 문자 경계에서 �
 어떤 chunk도 `max_chunk_size`를 넘지 않으며, 나뉜 조각은 더 이상 유효한
 table 조각이 아닙니다. table 내부에서 boundary를 선택할 때도 warning을
 기록합니다.
+
+`line-cdc` chunker는 줄 끝에서만 자릅니다. 어느 줄 뒤에서 자를지는 그 줄
+내용의 hash로 정하므로, 줄을 넣거나 고치면 그 줄이 든 chunk만 바뀝니다. 그
+뒤의 경계는 그대로 남고, 그 chunk들은 다시 임베딩되지 않습니다. 줄에 token이
+많을수록 자를 확률이 커지고, 빈 줄·문장 끝 뒤와 heading·table 앞에서는 4배,
+heading 뒤와 문장 중간에서 꺾인 줄 뒤에서는 1/4입니다. Chunk 크기는 budget의
+절반 근처에 모입니다.
+
+Budget은 token 단위입니다. Dense embedder와 sparse encoder의 `max_length`에서
+각각 90%를 잡고 passage prefix를 뺀 값 중 작은 쪽(기본값 1840)이고, 이
+chunker에서는 token을 세는 `max_chunk_size`를 넘지 않습니다. Token은 글자별 싼
+상한으로 셉니다(한글 음절 1.5, ASCII 글자 0.5, 숫자·문장부호 1, id·URL·base64는
+글자당 1, 그 밖의 글자는 UTF-8 byte당 1). Remote(`openai:`, `tei:`) embedder에서는
+그 context guard와 같이 한글 음절을 2로 세므로 guard가 chunk를 자르지 않습니다.
+줄 하나가 혼자 budget을 넘을 때만 그 줄 안에서, 들어가는 범위의 마지막 문장
+끝이나 공백에서 자릅니다. Markdown table에서는 row가 든 모든
+chunk가 header와 separator 줄로 시작하고, separator와 첫 row 사이에서는 자르지
+않습니다.
 
 초기화 시 선택:
 

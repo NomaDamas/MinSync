@@ -116,6 +116,23 @@ impl Embedder for DeferredEmbedder {
     }
 }
 
+/// Context length, in tokens, of the dense embedder `config` describes, as
+/// [`create_embedder`] would build it. `None` for a sparse-only workspace or
+/// an id without a known provider prefix.
+pub fn dense_max_length(config: &Config) -> Option<usize> {
+    let settings = &config.embedder;
+    let id = settings.id.as_str();
+    if config.is_sparse_only() {
+        None
+    } else if id.starts_with("native:") {
+        Some(settings.max_length.unwrap_or(native::DEFAULT_MAX_LENGTH))
+    } else if id.starts_with("openai:") || id.starts_with("tei:") {
+        context_limit::InputLimit::for_model(id, settings.max_length).max_length()
+    } else {
+        None
+    }
+}
+
 /// Construct an [`Embedder`] implementation from the embedder id in `config`.
 ///
 /// Returns [`MinSyncError::Config`] when the id has no known provider prefix.
