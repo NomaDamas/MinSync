@@ -56,7 +56,7 @@ pub enum Commands {
         /// sparse-only index that needs no dense model or API key.
         #[arg(long, default_value = crate::config::DEFAULT_EMBEDDER_ID)]
         embedder: String,
-        #[arg(long, default_value = "recursive")]
+        #[arg(long, default_value = crate::config::DEFAULT_CHUNKER_ID)]
         chunker: String,
     },
     /// Sync files to vector index

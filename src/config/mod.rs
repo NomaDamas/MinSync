@@ -45,7 +45,9 @@ mod tests {
         assert_eq!(config.source_id, "12345678-1234-4234-9234-123456789abc");
         assert_eq!(config.collection.name, "minsync_12345678");
         assert_eq!(config.collection.path, "store");
-        assert_eq!(config.chunker.id, "recursive");
+        assert_eq!(config.chunker.id, DEFAULT_CHUNKER_ID);
+        assert_eq!(DEFAULT_CHUNKER_ID, "line-cdc");
+        assert!(config.chunker.options.heading_context);
         assert_eq!(config.chunker.options.max_chunk_size, 4096);
         assert_eq!(config.chunker.options.delimiters, "\n.?!");
         assert_eq!(config.embedder.id, DEFAULT_EMBEDDER_ID);
@@ -163,6 +165,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("config.toml");
         let mut config = Config::default_for("abcdef12-1234-4234-9234-123456789abc");
+        config.chunker.options.heading_context = false;
 
         // Off: the file (and the run fingerprint hashed from it) is what it
         // was before the option existed.
@@ -177,6 +180,39 @@ mod tests {
             .unwrap()
             .contains("heading_context = true"));
         assert_eq!(Config::load(&path).expect("load config"), config);
+    }
+
+    #[test]
+    fn test_new_workspaces_chunk_with_line_cdc_and_heading_context() {
+        let config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+
+        let chunker = crate::chunker::create_chunker(&config).expect("create default chunker");
+
+        assert_eq!(chunker.schema_id(), "line-cdc+heading");
+    }
+
+    #[test]
+    fn test_configs_from_before_the_new_defaults_keep_chunking_as_they_did() {
+        // `init` used to write `recursive` with no heading context, and leaves
+        // `heading_context` out of the file when it is off. Such a file, with
+        // or without a `[chunker.options]` table, must keep meaning exactly
+        // that: reading the missing key as on would change every chunk id and
+        // embed the whole index again.
+        for chunker_table in [
+            "[chunker]\nid = \"recursive\"\n",
+            "[chunker]\nid = \"recursive\"\n\n[chunker.options]\nmax_chunk_size = 1024\n",
+        ] {
+            let toml = format!(
+                "version = 1\nsource_id = \"source-1\"\n\n[collection]\nname = \"c\"\npath = \"store\"\n\n{chunker_table}\n[vectorstore]\nid = \"lancedb\"\n\n[embedder]\nid = \"tei:test\"\n"
+            );
+
+            let config: Config =
+                toml::from_str(&toml).expect("parse a config written before the defaults changed");
+
+            assert!(!config.chunker.options.heading_context, "{chunker_table}");
+            let chunker = crate::chunker::create_chunker(&config).expect("create chunker");
+            assert_eq!(chunker.schema_id(), "recursive", "{chunker_table}");
+        }
     }
 
     #[test]

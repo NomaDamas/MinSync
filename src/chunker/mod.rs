@@ -39,34 +39,36 @@ mod factory_tests {
     use super::*;
     use crate::config::Config;
 
+    /// A config for chunker `id` without heading context, so `schema_id` is
+    /// the bare id. The context has its own tests in `heading`.
+    fn config_for(id: &str) -> Config {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.chunker.id = id.to_string();
+        config.chunker.options.heading_context = false;
+        config
+    }
+
     #[test]
     fn test_create_chunker_recursive() {
-        let config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-        let chunker = create_chunker(&config).expect("create recursive chunker");
+        let chunker = create_chunker(&config_for("recursive")).expect("create recursive chunker");
         assert_eq!(chunker.schema_id(), "recursive");
     }
 
     #[test]
     fn test_create_chunker_chonkie() {
-        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-        config.chunker.id = "chonkie".to_string();
-        let chunker = create_chunker(&config).expect("create chonkie chunker");
+        let chunker = create_chunker(&config_for("chonkie")).expect("create chonkie chunker");
         assert_eq!(chunker.schema_id(), "chonkie");
     }
 
     #[test]
     fn test_create_chunker_cdc() {
-        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-        config.chunker.id = "cdc".to_string();
-        let chunker = create_chunker(&config).expect("create cdc chunker");
+        let chunker = create_chunker(&config_for("cdc")).expect("create cdc chunker");
         assert_eq!(chunker.schema_id(), "cdc");
     }
 
     #[test]
     fn test_create_chunker_unknown() {
-        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-        config.chunker.id = "bogus".to_string();
-        let result = create_chunker(&config);
+        let result = create_chunker(&config_for("bogus"));
         assert!(matches!(result, Err(MinSyncError::Config(_))));
     }
 }

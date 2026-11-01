@@ -190,10 +190,10 @@ about any file.
 
 | id | Strategy | Boundary stability under edits |
 |---|---|---|
-| `recursive` (default) | paragraph to sentence to line splits merged to a size budget | an edit near the top of a file can shift downstream boundaries |
+| `recursive` | paragraph to sentence to line splits merged to a size budget | an edit near the top of a file can shift downstream boundaries |
 | `chonkie` | delimiter/size-based chonkie-core chunking | same drift caveat as `recursive` |
 | `cdc` | content-defined chunking with FastCDC-style rolling hash | small edits usually affect only nearby chunks |
-| `line-cdc` | content-defined cuts at line ends, sized in tokens to what the embedder and the sparse encoder take whole | an edit changes only the chunks holding edited lines |
+| `line-cdc` (default) | content-defined cuts at line ends, sized in tokens to what the embedder and the sparse encoder take whole | an edit changes only the chunks holding edited lines |
 
 The `recursive` chunker splits on paragraph breaks, sentence delimiters
 (`. `, `? `, `! `), and line breaks, then merges those pieces up to
@@ -232,7 +232,7 @@ sentence end or space that fits. In a Markdown table, every chunk that
 holds rows starts them with the header and separator rows, and a chunk never
 ends between the separator and the first row.
 
-Select at init time:
+`minsync init` uses `line-cdc` unless told otherwise. To pick another chunker at init time:
 
 ```bash
 minsync init --chunker cdc
@@ -246,6 +246,9 @@ id = "cdc"
 ```
 
 Switching the chunker changes the chunk schema, so run `minsync sync --full` afterwards.
+
+A workspace created by an earlier version keeps the chunker its `config.toml`
+names, so upgrading never changes how an existing index is chunked.
 
 ### Heading context
 
@@ -274,9 +277,15 @@ types are not headings, so a `.py` or `.txt` chunk gets just its path.
 One eighth of `max_chunk_size` is reserved for the line, so a chunk with its
 context still never exceeds the cap. A trail too long for that room drops its
 outermost headings first, then the end of the path. Renaming a file changes
-the text of all its chunks, so they are embedded again. The option is part of
+the text of all its chunks, so they are embedded again, and identical files at
+two paths no longer share vectors. The option is part of
 the chunk schema (`recursive+heading`, ...): run `minsync sync --full` after
 turning it on or off.
+
+`minsync init` turns heading context on for new workspaces. A `config.toml`
+that does not have the key means off, so a workspace created by an earlier
+version is chunked as before. Set `heading_context = false` to turn it off
+again.
 
 ## Vector Store
 

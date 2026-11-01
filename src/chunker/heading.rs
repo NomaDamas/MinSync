@@ -518,6 +518,8 @@ mod tests {
     #[test]
     fn chunks_without_the_context_keep_an_empty_heading_path() {
         let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.chunker.id = "recursive".to_string();
+        config.chunker.options.heading_context = false;
         config.chunker.options.max_chunk_size = 64;
         let chunker = crate::chunker::create_chunker(&config).expect("create chunker");
 

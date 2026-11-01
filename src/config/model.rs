@@ -108,8 +108,9 @@ pub struct ChunkerOptions {
     /// heading trail it sits under (`docs/guide.md > Install > macOS`). The
     /// line is part of the chunk text, so the stored row, the dense embedder
     /// and the sparse encoder all read it; its room is reserved out of
-    /// `max_chunk_size`. Off by default; omitted from the file when off, so
-    /// existing configs and their run fingerprints stay unchanged.
+    /// `max_chunk_size`. `init` turns it on for new workspaces; a file without
+    /// the key means off, and off is omitted from the file, so configs written
+    /// before the option existed and their run fingerprints stay unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub heading_context: bool,
 }
@@ -298,6 +299,9 @@ fn default_timeout_seconds() -> u64 {
 /// works with no API key, TEI server, or Hugging Face gate.
 pub const DEFAULT_EMBEDDER_ID: &str = "native:Qwen/Qwen3-Embedding-0.6B";
 
+/// Chunker `init` picks when `--chunker` is not given.
+pub const DEFAULT_CHUNKER_ID: &str = "line-cdc";
+
 /// Reserved embedder id for sparse-only workspaces: no dense model, no API
 /// key, no ANN index. `sync` writes chunks with a placeholder vector and
 /// queries default to `--mode sparse`; `vector` and `hybrid` queries are
@@ -399,8 +403,15 @@ impl Config {
                 path: "store".to_string(),
             },
             chunker: ChunkerConfig {
-                id: "recursive".to_string(),
-                options: ChunkerOptions::default(),
+                id: DEFAULT_CHUNKER_ID.to_string(),
+                // What `init` starts a workspace with. `ChunkerOptions::default()`
+                // stays off: it is also what a file that lacks the key (every
+                // config written before heading context existed) means, and
+                // reading those as on would change every chunk id.
+                options: ChunkerOptions {
+                    heading_context: true,
+                    ..ChunkerOptions::default()
+                },
             },
             embedder: EmbedderConfig {
                 id: DEFAULT_EMBEDDER_ID.to_string(),

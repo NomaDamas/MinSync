@@ -80,9 +80,15 @@ fn paths(results: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The ranking the model itself implies for `query` over `corpus`.
+/// The ranking the model itself implies for `query` over `corpus`. A new
+/// workspace stores each file as its path line followed by its text (heading
+/// context is on), and that is what the encoder reads.
 fn ranking_over(corpus: &[(&str, &str)], query: &str) -> Vec<String> {
-    let docs: Vec<&str> = corpus.iter().map(|(_, text)| *text).collect();
+    let stored: Vec<String> = corpus
+        .iter()
+        .map(|(name, text)| format!("{name}\n{text}"))
+        .collect();
+    let docs: Vec<&str> = stored.iter().map(String::as_str).collect();
     let doc_vectors = common::encode_with_tiny(&docs, false);
     let query_vector = common::encode_with_tiny(&[query], true).remove(0);
     common::brute_force_ranking(&doc_vectors, &query_vector)
