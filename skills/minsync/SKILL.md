@@ -43,6 +43,8 @@ Use content-defined chunking for large files that change often:
 minsync init --chunker cdc
 ```
 
+To give every chunk its file path and Markdown heading trail as its first line (read by both the dense and the sparse encoder), set `heading_context = true` under `[chunker.options]` in `.minsync/config.toml`, then run `minsync sync --full`.
+
 State is stored in `.minsync/`: `config.toml`, `manifest.json`, `cursor.json`, `txn.json`, and `lock`.
 
 ## Ignore Binary and Generated Files

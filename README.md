@@ -226,6 +226,37 @@ id = "cdc"
 
 Switching the chunker changes the chunk schema, so run `minsync sync --full` afterwards.
 
+### Heading context
+
+With `heading_context` on, every chunk starts with one line naming the file it
+came from and, for Markdown files (`.md`, `.markdown`, `.mdx`), the headings
+it sits under:
+
+```toml
+[chunker.options]
+heading_context = true
+```
+
+```text
+docs/guide.md > Install > macOS
+Use Homebrew to install the CLI ...
+```
+
+The line is part of the chunk text: the stored row, the dense embedder and
+the sparse encoder all read exactly the same text, and `minsync query` returns
+it with the line in front. The same string is the chunk's `heading_path`, so a
+consumer can strip `heading_path + "\n"` to get the body. The trail is the
+headings in effect where the chunk starts; a chunk that opens with a heading
+names only that heading's parents. `#` lines in fenced code and in other file
+types are not headings, so a `.py` or `.txt` chunk gets just its path.
+
+One eighth of `max_chunk_size` is reserved for the line, so a chunk with its
+context still never exceeds the cap. A trail too long for that room drops its
+outermost headings first, then the end of the path. Renaming a file changes
+the text of all its chunks, so they are embedded again. The option is part of
+the chunk schema (`recursive+heading`, ...): run `minsync sync --full` after
+turning it on or off.
+
 ## Vector Store
 
 MinSync stores vectors in embedded LanceDB by default:

@@ -1,3 +1,4 @@
+use crate::chunker::heading::HeadingContext;
 use crate::chunker::Chunker;
 use crate::error::Result;
 use crate::types::Chunk;
@@ -6,19 +7,31 @@ pub struct ChonkieChunker {
     max_chunk_size: usize,
     delimiters: Vec<u8>,
     schema_id: String,
+    context: HeadingContext,
 }
 
 impl ChonkieChunker {
     pub fn new(max_chunk_size: usize, delimiters: &str) -> Self {
-        Self {
-            max_chunk_size,
-            delimiters: delimiters.as_bytes().to_vec(),
-            schema_id: "chonkie".to_string(),
-        }
+        Self::with_context(max_chunk_size, delimiters, HeadingContext::off(str::len))
     }
 
     pub fn from_config(options: &crate::config::ChunkerOptions) -> Self {
-        Self::new(options.max_chunk_size, &options.delimiters)
+        let context =
+            HeadingContext::new(options.heading_context, options.max_chunk_size, str::len);
+        Self::with_context(
+            context.body_cap(options.max_chunk_size),
+            &options.delimiters,
+            context,
+        )
+    }
+
+    fn with_context(max_chunk_size: usize, delimiters: &str, context: HeadingContext) -> Self {
+        Self {
+            max_chunk_size,
+            delimiters: delimiters.as_bytes().to_vec(),
+            schema_id: context.schema_id("chonkie"),
+            context,
+        }
     }
 }
 
@@ -27,31 +40,29 @@ impl Chunker for ChonkieChunker {
         &self.schema_id
     }
 
-    fn chunk(&self, text: &str, _path: &str) -> Result<Vec<Chunk>> {
+    fn chunk(&self, text: &str, path: &str) -> Result<Vec<Chunk>> {
         if text.is_empty() {
             return Ok(Vec::new());
         }
 
         let bytes = text.as_bytes();
-        let chunks: Vec<&[u8]> = chunk::chunk(bytes)
+        let chunks: Vec<(usize, Chunk)> = chunk::chunk(bytes)
             .size(self.max_chunk_size)
             .delimiters(&self.delimiters)
-            .collect();
-
-        let result = chunks
-            .into_iter()
-            .map(|c| {
-                let text = String::from_utf8_lossy(c).into_owned();
-                Chunk {
-                    text,
+            .map(|piece| {
+                // Every piece is a subslice of `bytes`.
+                let start = piece.as_ptr() as usize - bytes.as_ptr() as usize;
+                let chunk = Chunk {
+                    text: String::from_utf8_lossy(piece).into_owned(),
                     chunk_type: "chunk".to_string(),
                     heading_path: String::new(),
-                }
+                };
+                (start, chunk)
             })
-            .filter(|c| !c.text.trim().is_empty())
+            .filter(|(_, chunk)| !chunk.text.trim().is_empty())
             .collect();
 
-        Ok(result)
+        Ok(self.context.apply(text, path, chunks))
     }
 }
 
@@ -151,6 +162,7 @@ mod tests {
         let options = crate::config::ChunkerOptions {
             max_chunk_size: 8,
             delimiters: "\n".to_string(),
+            ..Default::default()
         };
         let chunker = ChonkieChunker::from_config(&options);
 

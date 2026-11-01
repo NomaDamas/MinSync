@@ -104,6 +104,14 @@ pub struct ChunkerOptions {
     pub max_chunk_size: usize,
     #[serde(default = "default_delimiters")]
     pub delimiters: String,
+    /// Start every chunk with a line naming its source path and the Markdown
+    /// heading trail it sits under (`docs/guide.md > Install > macOS`). The
+    /// line is part of the chunk text, so the stored row, the dense embedder
+    /// and the sparse encoder all read it; its room is reserved out of
+    /// `max_chunk_size`. Off by default; omitted from the file when off, so
+    /// existing configs and their run fingerprints stay unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub heading_context: bool,
 }
 
 fn default_max_chunk_size() -> usize {
@@ -119,6 +127,7 @@ impl Default for ChunkerOptions {
         Self {
             max_chunk_size: default_max_chunk_size(),
             delimiters: default_delimiters(),
+            heading_context: false,
         }
     }
 }

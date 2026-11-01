@@ -1,3 +1,4 @@
+use crate::chunker::heading::HeadingContext;
 use crate::chunker::Chunker;
 use crate::error::Result;
 use crate::types::Chunk;
@@ -13,25 +14,39 @@ pub struct CdcChunker {
     avg_size: usize,
     max_size: usize,
     schema_id: String,
+    context: HeadingContext,
 }
 
 impl CdcChunker {
     pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Self {
+        Self::with_context(min_size, avg_size, max_size, HeadingContext::off(str::len))
+    }
+
+    /// Derive CDC size parameters from `max_chunk_size`: max = max_chunk_size
+    /// (less the heading context's room), avg = max/2, min = avg/4, with
+    /// floors that keep the gear hash effective.
+    pub fn from_config(options: &crate::config::ChunkerOptions) -> Self {
+        let cap = options.max_chunk_size.max(64);
+        let context = HeadingContext::new(options.heading_context, cap, str::len);
+        let max_size = context.body_cap(cap);
+        let avg_size = (max_size / 2).max(32);
+        let min_size = (avg_size / 4).max(16);
+        Self::with_context(min_size, avg_size, max_size, context)
+    }
+
+    fn with_context(
+        min_size: usize,
+        avg_size: usize,
+        max_size: usize,
+        context: HeadingContext,
+    ) -> Self {
         Self {
             min_size,
             avg_size,
             max_size,
-            schema_id: "cdc".to_string(),
+            schema_id: context.schema_id("cdc"),
+            context,
         }
-    }
-
-    /// Derive CDC size parameters from `max_chunk_size`: max = max_chunk_size,
-    /// avg = max/2, min = avg/4, with floors that keep the gear hash effective.
-    pub fn from_config(options: &crate::config::ChunkerOptions) -> Self {
-        let max_size = options.max_chunk_size.max(64);
-        let avg_size = (max_size / 2).max(32);
-        let min_size = (avg_size / 4).max(16);
-        Self::new(min_size, avg_size, max_size)
     }
 }
 
@@ -69,7 +84,7 @@ impl Chunker for CdcChunker {
         &self.schema_id
     }
 
-    fn chunk(&self, text: &str, _path: &str) -> Result<Vec<Chunk>> {
+    fn chunk(&self, text: &str, path: &str) -> Result<Vec<Chunk>> {
         if text.is_empty() {
             return Ok(Vec::new());
         }
@@ -81,19 +96,21 @@ impl Chunker for CdcChunker {
             while cut < text.len() && !text.is_char_boundary(cut) {
                 cut += 1;
             }
-            chunks.push(&text[start..cut]);
+            let piece = &text[start..cut];
+            if !piece.trim().is_empty() {
+                chunks.push((
+                    start,
+                    Chunk {
+                        text: piece.to_string(),
+                        chunk_type: "chunk".to_string(),
+                        heading_path: String::new(),
+                    },
+                ));
+            }
             start = cut;
         }
 
-        Ok(chunks
-            .into_iter()
-            .filter(|chunk| !chunk.trim().is_empty())
-            .map(|chunk| Chunk {
-                text: chunk.to_string(),
-                chunk_type: "chunk".to_string(),
-                heading_path: String::new(),
-            })
-            .collect())
+        Ok(self.context.apply(text, path, chunks))
     }
 }
 
@@ -236,6 +253,7 @@ mod tests {
         let options = crate::config::ChunkerOptions {
             max_chunk_size: 256,
             delimiters: "\n".to_string(),
+            ..Default::default()
         };
         let chunker = CdcChunker::from_config(&options);
 
@@ -249,6 +267,7 @@ mod tests {
         let options = crate::config::ChunkerOptions {
             max_chunk_size: 1,
             delimiters: "\n".to_string(),
+            ..Default::default()
         };
         let chunker = CdcChunker::from_config(&options);
 

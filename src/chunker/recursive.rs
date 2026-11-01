@@ -1,27 +1,40 @@
+use crate::chunker::heading::HeadingContext;
 use crate::chunker::Chunker;
 use crate::error::Result;
 use crate::types::Chunk;
 use chunk::{merge_splits, IncludeDelim, PatternSplitter};
+use std::ops::Range;
 
 pub struct RecursiveChunker {
     splitter: PatternSplitter,
     max_chunk_size: usize,
     schema_id: String,
+    context: HeadingContext,
+}
+
+fn chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 impl RecursiveChunker {
     pub fn new(max_chunk_size: usize) -> Self {
+        Self::with_context(max_chunk_size, HeadingContext::off(chars))
+    }
+
+    pub fn from_config(options: &crate::config::ChunkerOptions) -> Self {
+        let context = HeadingContext::new(options.heading_context, options.max_chunk_size, chars);
+        Self::with_context(context.body_cap(options.max_chunk_size), context)
+    }
+
+    fn with_context(max_chunk_size: usize, context: HeadingContext) -> Self {
         let patterns: &[&[u8]] = &[b"\n\n", b". ", b"? ", b"! ", b"\n"];
 
         Self {
             splitter: PatternSplitter::new(patterns),
             max_chunk_size,
-            schema_id: "recursive".to_string(),
+            schema_id: context.schema_id("recursive"),
+            context,
         }
-    }
-
-    pub fn from_config(options: &crate::config::ChunkerOptions) -> Self {
-        Self::new(options.max_chunk_size)
     }
 }
 
@@ -30,12 +43,13 @@ impl Chunker for RecursiveChunker {
         &self.schema_id
     }
 
-    fn chunk(&self, text: &str, _path: &str) -> Result<Vec<Chunk>> {
+    fn chunk(&self, text: &str, path: &str) -> Result<Vec<Chunk>> {
         if text.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut chunks = Vec::new();
+        // Each chunk with the byte offset in `text` where it starts.
+        let mut chunks: Vec<(usize, Chunk)> = Vec::new();
         let mut plain_start = 0;
         let mut lines = text.split_inclusive('\n').peekable();
         let mut offset = 0;
@@ -54,25 +68,29 @@ impl Chunker for RecursiveChunker {
             }
 
             if line_start > plain_start {
-                chunks.extend(self.chunk_plain(&text[plain_start..line_start]));
+                chunks.extend(self.chunk_plain(text, plain_start..line_start));
             }
-            chunks.extend(self.chunk_table(&table));
+            chunks.extend(
+                self.chunk_table(&table)
+                    .into_iter()
+                    .map(|chunk| (line_start, chunk)),
+            );
             plain_start = offset;
         }
 
         if plain_start < text.len() {
-            chunks.extend(self.chunk_plain(&text[plain_start..]));
+            chunks.extend(self.chunk_plain(text, plain_start..text.len()));
         }
 
-        Ok(chunks
-            .into_iter()
-            .filter(|chunk: &Chunk| !chunk.text.trim().is_empty())
-            .collect())
+        chunks.retain(|(_, chunk)| !chunk.text.trim().is_empty());
+        Ok(self.context.apply(text, path, chunks))
     }
 }
 
 impl RecursiveChunker {
-    fn chunk_plain(&self, text: &str) -> Vec<Chunk> {
+    /// Chunks of `source[range]`, each with its start offset in `source`.
+    fn chunk_plain(&self, source: &str, range: Range<usize>) -> Vec<(usize, Chunk)> {
+        let text = &source[range.clone()];
         let bytes = text.as_bytes();
         let offsets = self.splitter.split(bytes, IncludeDelim::Prev, 0);
         let splits: Vec<&str> = offsets
@@ -87,11 +105,22 @@ impl RecursiveChunker {
             merge_splits(&splits, &token_counts, self.max_chunk_size).merged
         };
 
-        merged
-            .into_iter()
-            .flat_map(|text| self.hard_cap(&text))
-            .map(chunk)
-            .collect()
+        // Pieces are consecutive substrings of `text`; searching covers a
+        // split the splitter dropped.
+        let mut cursor = range.start;
+        let mut chunks = Vec::new();
+        for piece in merged.iter().flat_map(|text| self.hard_cap(text)) {
+            let rest = &source[cursor..range.end];
+            let start = if rest.starts_with(piece.as_str()) {
+                cursor
+            } else {
+                rest.find(piece.as_str())
+                    .map_or(cursor, |found| cursor + found)
+            };
+            cursor = (start + piece.len()).min(range.end);
+            chunks.push((start, chunk(piece)));
+        }
+        chunks
     }
 
     fn chunk_table(&self, table: &str) -> Vec<Chunk> {
@@ -343,6 +372,7 @@ mod tests {
         let options = crate::config::ChunkerOptions {
             max_chunk_size: 8,
             delimiters: "\n".to_string(),
+            ..Default::default()
         };
         let chunker = RecursiveChunker::from_config(&options);
 

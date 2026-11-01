@@ -5,6 +5,9 @@ use std::collections::HashMap;
 pub struct Chunk {
     pub text: String,
     pub chunk_type: String,
+    /// Source path and Markdown heading trail the chunk starts under
+    /// (`docs/guide.md > Install`), also the first line of `text`, when
+    /// `chunker.options.heading_context` is on; empty otherwise.
     pub heading_path: String,
 }
 

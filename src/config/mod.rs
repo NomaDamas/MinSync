@@ -159,6 +159,27 @@ mod tests {
     }
 
     #[test]
+    fn test_heading_context_roundtrips_and_is_absent_from_files_that_leave_it_off() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default_for("abcdef12-1234-4234-9234-123456789abc");
+
+        // Off: the file (and the run fingerprint hashed from it) is what it
+        // was before the option existed.
+        config.save(&path).expect("save config");
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("heading_context"));
+
+        config.chunker.options.heading_context = true;
+        config.save(&path).expect("save config");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("heading_context = true"));
+        assert_eq!(Config::load(&path).expect("load config"), config);
+    }
+
+    #[test]
     fn test_config_from_the_bm25_era_still_loads_and_drops_its_lexical_table() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("config.toml");
