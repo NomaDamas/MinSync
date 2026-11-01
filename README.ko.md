@@ -190,6 +190,36 @@ id = "cdc"
 
 Chunker를 바꾸면 chunk schema가 달라지므로 이후 `minsync sync --full`을 실행하세요.
 
+### Heading context
+
+`heading_context`를 켜면 모든 chunk가 한 줄로 시작합니다. 그 줄에는 chunk가
+나온 파일 경로와, Markdown 파일(`.md`, `.markdown`, `.mdx`)이면 chunk가 속한
+heading이 들어갑니다.
+
+```toml
+[chunker.options]
+heading_context = true
+```
+
+```text
+docs/guide.md > Install > macOS
+Homebrew로 CLI를 설치합니다 ...
+```
+
+이 줄은 chunk text의 일부입니다. 저장되는 row, dense embedder, sparse
+encoder가 모두 똑같은 text를 읽고, `minsync query`도 이 줄이 붙은 text를
+돌려줍니다. 같은 문자열이 chunk의 `heading_path`이므로, 본문만 필요하면
+`heading_path + "\n"`을 떼어 내면 됩니다. Trail은 chunk가 시작하는 위치에서
+유효한 heading입니다. Heading으로 시작하는 chunk에는 그 heading의 상위
+heading만 붙습니다. Fenced code 안의 `#` 줄과 다른 형식 파일의 `#` 줄은
+heading이 아니므로, `.py`나 `.txt` chunk에는 경로만 붙습니다.
+
+이 줄을 위해 `max_chunk_size`의 1/8을 떼어 두므로, 줄이 붙어도 chunk는 cap을
+넘지 않습니다. 자리가 모자라면 바깥쪽 heading부터 빼고, 그래도 넘으면 경로의
+끝을 자릅니다. 파일 이름을 바꾸면 그 파일의 모든 chunk text가 바뀌어 다시
+임베딩됩니다. 이 옵션은 chunk schema(`recursive+heading` 등)에 포함되므로, 켜거나
+끈 뒤에는 `minsync sync --full`을 실행하세요.
+
 ## Vector Store
 
 MinSync는 기본적으로 embedded LanceDB에 vector를 저장합니다.

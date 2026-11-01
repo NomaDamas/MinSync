@@ -1,5 +1,6 @@
 pub mod cdc;
 pub mod chonkie;
+pub(crate) mod heading;
 pub mod recursive;
 
 use crate::error::Result;

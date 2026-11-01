@@ -3459,4 +3459,52 @@ mod tests {
         assert_eq!(result.sparse_encoded, 1);
         assert_eq!(result.sparse_reused, 2);
     }
+
+    #[tokio::test]
+    async fn test_heading_context_is_the_text_both_encoders_and_the_store_read() {
+        let (dir, sync, _chunker, _embedder, mut store) = fixture();
+        std::fs::write(
+            dir.path().join("guide.md"),
+            "# Guide\n\n## Install\n\nRun the installer.\n",
+        )
+        .expect("write guide");
+        std::fs::write(dir.path().join("notes.txt"), "# not a heading\nplain\n").expect("write");
+        sync.init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init");
+        let config_path = sync.minsync_dir.join("config.toml");
+        let mut config = Config::load(&config_path).expect("load config");
+        config.chunker.options.heading_context = true;
+        config.chunker.options.max_chunk_size = 160;
+        config.save(&config_path).expect("save config");
+        let chunker = crate::chunker::create_chunker(&config).expect("chunker");
+        let embedder = RecordingEmbedder::default();
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+
+        sync.sync(chunker.as_ref(), &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+
+        let mut stored: Vec<String> = store
+            .documents()
+            .expect("documents")
+            .into_iter()
+            .map(|doc| doc.text)
+            .collect();
+        stored.sort();
+        let mut dense = embedder.calls().concat();
+        dense.sort();
+        let mut sparse = encoder.encoded_texts.lock().unwrap().clone();
+        sparse.sort();
+        // Normalization trims each file's trailing newline before chunking.
+        assert_eq!(
+            stored,
+            [
+                "guide.md\n# Guide\n\n## Install\n\nRun the installer.",
+                "notes.txt\n# not a heading\nplain",
+            ]
+        );
+        assert_eq!(dense, stored);
+        assert_eq!(sparse, stored);
+    }
 }
