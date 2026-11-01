@@ -193,6 +193,7 @@ about any file.
 | `recursive` (default) | paragraph to sentence to line splits merged to a size budget | an edit near the top of a file can shift downstream boundaries |
 | `chonkie` | delimiter/size-based chonkie-core chunking | same drift caveat as `recursive` |
 | `cdc` | content-defined chunking with FastCDC-style rolling hash | small edits usually affect only nearby chunks |
+| `line-cdc` | content-defined cuts at line ends, sized in tokens to what the embedder and the sparse encoder take whole | an edit changes only the chunks holding edited lines |
 
 The `recursive` chunker splits on paragraph breaks, sentence delimiters
 (`. `, `? `, `! `), and line breaks, then merges those pieces up to
@@ -210,6 +211,26 @@ row plus its repeated header (or the header alone) exceeds the cap, that chunk
 is split at character boundaries so no chunk ever exceeds `max_chunk_size`; the
 split pieces are no longer valid table fragments. A warning is also emitted
 when a table boundary is selected.
+
+The `line-cdc` chunker cuts only at line ends. Whether a line ends a chunk is
+decided by a hash of that line's own content, so inserting or editing lines
+changes only the chunks that hold them: the boundaries after them stay where
+they were, and their chunks are not embedded again. A cut is more likely the
+more tokens the line holds, four times as likely after a blank line, a sentence
+end, or before a heading or table, and a quarter as likely after a heading or a
+line that wraps mid-sentence. Chunks gather around half the budget.
+
+Its budget is in tokens: 90% of the dense embedder's and of the sparse
+encoder's `max_length`, less their passage prefixes, whichever is smaller
+(1840 with the defaults), and at most `max_chunk_size`, which counts tokens for
+this chunker. Tokens are counted with a cheap upper bound per char: Hangul
+syllables 1.5, ASCII letters 0.5, digits and punctuation 1, ids, URLs and
+base64 1, any other char 1 per UTF-8 byte. With a remote (`openai:`, `tei:`)
+embedder Hangul counts 2, as its context guard does, so the guard never cuts a
+chunk. Only a line that alone exceeds the budget is cut inside, at its last
+sentence end or space that fits. In a Markdown table, every chunk that
+holds rows starts them with the header and separator rows, and a chunk never
+ends between the separator and the first row.
 
 Select at init time:
 

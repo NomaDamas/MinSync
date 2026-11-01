@@ -1,6 +1,7 @@
 pub mod cdc;
 pub mod chonkie;
 pub(crate) mod heading;
+pub mod line_cdc;
 pub mod recursive;
 
 use crate::error::Result;
@@ -28,6 +29,7 @@ pub fn create_chunker(config: &Config) -> Result<Box<dyn Chunker>> {
         "cdc" => Ok(Box::new(cdc::CdcChunker::from_config(
             &config.chunker.options,
         ))),
+        "line-cdc" => Ok(Box::new(line_cdc::LineCdcChunker::from_config(config))),
         other => Err(MinSyncError::Config(format!("unknown chunker id: {other}"))),
     }
 }
