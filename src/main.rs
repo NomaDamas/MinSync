@@ -1,10 +1,11 @@
 use clap::Parser;
-use minsync::cli::Cli;
+use minsync::cli::{Cli, OutputFormat};
 use std::process;
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let json_output = matches!(cli.format, OutputFormat::Json);
 
     let level = if cli.verbose {
         "debug"
@@ -27,6 +28,11 @@ async fn main() {
     match minsync::commands::run(cli, root, minsync_dir).await {
         Ok(code) => process::exit(code),
         Err(error) => {
+            if json_output {
+                if let Some(value) = minsync::commands::json_error(&error) {
+                    println!("{value}");
+                }
+            }
             eprintln!("Error: {error}");
             process::exit(error.exit_code());
         }

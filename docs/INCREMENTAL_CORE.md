@@ -319,7 +319,8 @@ failure) goes through the same checks, refuses a symlinked parent that would
 leave the root, and tolerates a file that is already gone.
 
 Exit codes: `0` after `finish`, `3` when another run holds the lock (a
-`lock_failed` response first), `1` when stdin ends before `finish`. In that
+`lock_failed` response first, whose `error.holder` gives the holder's `pid`,
+`started_at` and `command` when the lock file names them), `1` when stdin ends before `finish`. In that
 case the run stays resumable: the next `open` reports `resumed: true` and plans
 only the items without a completion. A session that only sends
 `capabilities`, `plan` and/or `inspect` holds nothing and exits `0` when stdin
