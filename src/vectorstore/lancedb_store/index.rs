@@ -56,6 +56,15 @@ pub struct IndexingConfig {
     /// sparse-only stores, whose vectors are placeholders: an HNSW build over
     /// identical zero vectors is meaningless and can fail.
     pub build_ann_index: bool,
+    /// Answer sparse queries from an on-disk inverted index (built at the end
+    /// of a sync, `optimize`, or lazily by the first query) instead of
+    /// scanning every row. The results are the same; see
+    /// [`crate::sparse::inverted`].
+    pub sparse_inverted_index: bool,
+    /// Fewest sparse rows that get an index.
+    pub sparse_index_min_rows: usize,
+    /// Postings held in memory while the index is written (8 bytes each).
+    pub sparse_index_memory_postings: usize,
 }
 
 impl Default for IndexingConfig {
@@ -66,6 +75,9 @@ impl Default for IndexingConfig {
             compact_fragment_threshold: DEFAULT_COMPACT_FRAGMENT_THRESHOLD,
             compact_target_rows: DEFAULT_COMPACT_TARGET_ROWS,
             build_ann_index: true,
+            sparse_inverted_index: true,
+            sparse_index_min_rows: super::sparse_index::DEFAULT_MIN_ROWS,
+            sparse_index_memory_postings: super::sparse_index::DEFAULT_MEMORY_POSTINGS,
         }
     }
 }
@@ -92,6 +104,20 @@ impl IndexingConfig {
         }
         if let Some(value) = options.get("compact_target_rows") {
             config.compact_target_rows = parse_positive_usize(value, "compact_target_rows")?;
+        }
+        if let Some(value) = options.get("sparse_inverted_index") {
+            config.sparse_inverted_index = value.as_bool().ok_or_else(|| {
+                MinSyncError::Config(
+                    "vectorstore.options.sparse_inverted_index must be a boolean".into(),
+                )
+            })?;
+        }
+        if let Some(value) = options.get("sparse_index_min_rows") {
+            config.sparse_index_min_rows = parse_positive_usize(value, "sparse_index_min_rows")?;
+        }
+        if let Some(value) = options.get("sparse_index_memory_postings") {
+            config.sparse_index_memory_postings =
+                parse_positive_usize(value, "sparse_index_memory_postings")?;
         }
         Ok(config)
     }

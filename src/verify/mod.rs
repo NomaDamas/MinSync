@@ -631,10 +631,12 @@ mod tests {
         let before_repair = crate::types::IndexState {
             ann_indexed: true,
             unindexed_rows: Some(1),
+            sparse_indexed: false,
         };
         let after_repair = crate::types::IndexState {
             ann_indexed: true,
             unindexed_rows: Some(0),
+            sparse_indexed: false,
         };
         let mut tracking_store = StateTrackingStore {
             inner: store,

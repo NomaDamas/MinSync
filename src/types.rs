@@ -124,6 +124,10 @@ pub struct QueryResult {
 pub struct IndexState {
     pub ann_indexed: bool,
     pub unindexed_rows: Option<usize>,
+    /// Sparse queries are answered by an on-disk inverted index that
+    /// describes the table as it is now (not by scanning every row).
+    #[serde(default)]
+    pub sparse_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

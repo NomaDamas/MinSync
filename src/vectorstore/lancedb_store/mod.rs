@@ -6,12 +6,16 @@
 //! - [`index`]: ANN indexing config and maintenance policy
 //! - [`worker`]: command channel and the worker thread's event loop
 //! - [`inner`]: async LanceDB table operations run on the worker
+//! - [`sparse_index`]: the on-disk inverted index beside the table
 //! - this file: the synchronous public store facade
 
 mod filters;
 mod index;
 mod inner;
 mod schema;
+mod sparse_index;
+#[cfg(test)]
+mod store_index_tests;
 mod worker;
 
 pub use filters::filter_to_sql;
@@ -147,6 +151,12 @@ impl LanceDbStore {
     /// Number of data fragments in the table.
     pub fn fragment_count(&self) -> Result<usize> {
         self.request(Command::FragmentCount)
+    }
+
+    /// Whether sparse queries are answered by an inverted index that
+    /// describes the table as it is now.
+    pub fn sparse_index_ready(&self) -> Result<bool> {
+        self.request(Command::SparseIndexReady)
     }
 
     fn request<T>(&self, make: impl FnOnce(Resp<T>) -> Command) -> Result<T> {

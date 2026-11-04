@@ -225,6 +225,53 @@ pub(super) fn batch_to_hash_sparse(batch: &RecordBatch) -> Result<Vec<(String, S
     Ok(found)
 }
 
+/// Feed the rows of `batch` that hold a sparse vector to the counting scan of
+/// an index build.
+pub(super) fn count_sparse_batch(
+    batch: &RecordBatch,
+    builder: &mut crate::sparse::inverted::IndexBuilder,
+) -> Result<()> {
+    let ids = string_col(batch, "id")?;
+    let sources = string_col(batch, "source_id")?;
+    let indices = list_col(batch, SPARSE_INDICES_COLUMN)?;
+    for row in 0..batch.num_rows() {
+        if indices.is_null(row) {
+            continue;
+        }
+        let terms = indices.value(row);
+        builder.count_row(
+            ids.value(row),
+            sources.value(row),
+            terms.as_primitive::<UInt32Type>().values(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Feed the rows of `batch` that hold a sparse vector to one pass of an index
+/// build.
+pub(super) fn add_sparse_batch(
+    batch: &RecordBatch,
+    builder: &mut crate::sparse::inverted::IndexBuilder,
+) -> Result<()> {
+    let ids = string_col(batch, "id")?;
+    let indices = list_col(batch, SPARSE_INDICES_COLUMN)?;
+    let values = list_col(batch, SPARSE_VALUES_COLUMN)?;
+    for row in 0..batch.num_rows() {
+        if indices.is_null(row) || values.is_null(row) {
+            continue;
+        }
+        let terms = indices.value(row);
+        let weights = values.value(row);
+        builder.add_row(
+            ids.value(row),
+            terms.as_primitive::<UInt32Type>().values(),
+            weights.as_primitive::<Float32Type>().values(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Score every row of `batch` that holds a sparse vector against `query`,
 /// straight from the column buffers (no per-row allocation), and offer it to
 /// `top`. Rows without a vector are skipped.

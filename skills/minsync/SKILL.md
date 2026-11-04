@@ -131,6 +131,8 @@ minsync query "question" --mode hybrid   # RRF fusion of both (k=60)
 
 There is no `--language` flag on `minsync init` and no `[lexical]` config table. `minsync init --embedder none` builds a sparse-only workspace where `query` defaults to `--mode sparse`. Run `minsync sync` once after upgrading from a BM25-era index to drop the old FTS index and `lexical_text` column and encode sparse vectors for existing chunks; no `--full` is needed and dense vectors are not recomputed.
 
+Sparse search is exact. For tables of 2,000+ chunks `sync` and `optimize` leave an inverted index (`.minsync/store/sparse-index.inv`) that answers the same ranking about 50-100x faster; `index_state.sparse_indexed` in a result says whether it was used. It is a derived file: it is rebuilt whole after any change, is bypassed when stale or damaged, and `[vectorstore.options] sparse_inverted_index = false` turns it off.
+
 ## Extending Vector Stores
 
 Use this checklist when adding a vector database backend:

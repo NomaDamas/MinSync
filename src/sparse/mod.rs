@@ -2,6 +2,7 @@
 //! contract. Providers live in [`native`] (in-process candle), [`tei`]
 //! (remote `/embed_sparse`) and [`served`] (a running `minsync serve`).
 
+pub mod inverted;
 pub mod modernbert;
 pub mod native;
 pub mod served;
