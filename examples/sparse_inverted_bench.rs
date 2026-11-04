@@ -161,18 +161,34 @@ fn bench(path: &str, scale: usize, k: usize, memory_postings: usize) {
         if passes == 1 { "" } else { "es" }
     );
 
+    // What the store does with the index: score only the rows it names, from
+    // their exact vectors (here a map in memory; the store reads them back by
+    // id), with the scan's own loop.
+    let by_id: std::collections::HashMap<&str, &SparseVector> =
+        rows.iter().map(|(id, doc)| (id.as_str(), *doc)).collect();
+    let through_index = |query: &SparseVector| -> (Vec<(f32, String)>, usize) {
+        let candidates = index.candidates(query, k).expect("candidates");
+        let mut top = TopK::new(k);
+        for id in &candidates {
+            top.offer(query.dot(by_id[id.as_str()]), id);
+        }
+        (top.into_sorted(), candidates.len())
+    };
+
     // Parity first: same ids, same order, same scores, for every query.
-    let mut read_total = 0usize;
+    let (mut read_total, mut scored_total) = (0usize, 0usize);
     for (n, query) in payload.queries.iter().enumerate() {
         let mut top = TopK::new(k);
         for (id, doc) in &rows {
             top.offer(query.dot(doc), id);
         }
+        let (ranked, scored) = through_index(query);
         assert_eq!(
-            index.search(query, k).expect("search"),
+            ranked,
             top.into_sorted(),
             "query {n}: the index differs from the full scan"
         );
+        scored_total += scored;
         read_total += query
             .indices()
             .iter()
@@ -184,10 +200,11 @@ fn bench(path: &str, scale: usize, k: usize, memory_postings: usize) {
         payload.queries.len()
     );
     println!(
-        "  postings read per query (mean): {:.0} of {} ({:.1}%)",
+        "  postings read per query (mean): {:.0} of {} ({:.1}%); rows scored exactly: {:.1}",
         read_total as f64 / payload.queries.len() as f64,
         stats.postings,
-        100.0 * read_total as f64 / payload.queries.len() as f64 / stats.postings as f64
+        100.0 * read_total as f64 / payload.queries.len() as f64 / stats.postings as f64,
+        scored_total as f64 / payload.queries.len() as f64
     );
 
     // One untimed pass to warm caches, then three timed passes.
@@ -204,7 +221,7 @@ fn bench(path: &str, scale: usize, k: usize, memory_postings: usize) {
             let scan = started.elapsed().as_secs_f64() * 1e3;
 
             let started = Instant::now();
-            std::hint::black_box(index.search(query, k).expect("search"));
+            std::hint::black_box(through_index(query));
             let inverted = started.elapsed().as_secs_f64() * 1e3;
             if pass > 0 {
                 scan_ms.push(scan);

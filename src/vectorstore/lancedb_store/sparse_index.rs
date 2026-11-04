@@ -25,6 +25,13 @@ pub(super) const DEFAULT_MIN_ROWS: usize = 2_000;
 /// scans; a corpus of 100k chunks (about 75M postings) takes three.
 pub(super) const DEFAULT_MEMORY_POSTINGS: usize = 32_000_000;
 
+/// Most candidates worth reading back by id, for an index of `rows` rows:
+/// beyond it a streaming scan of the table is cheaper than the id lookups
+/// (for example `k` close to the table size), and gives the same answer.
+pub(super) fn max_candidates(rows: usize) -> usize {
+    rows / 4
+}
+
 pub(super) fn index_path(store_dir: &Path) -> PathBuf {
     store_dir.join(FILE_NAME)
 }
@@ -166,6 +173,12 @@ mod tests {
             scope(Some(&Filter::Neq("source_id".into(), "s".into())), &file),
             Scope::Unknown
         );
+    }
+
+    #[test]
+    fn candidates_are_read_back_by_id_only_while_that_beats_a_scan() {
+        assert_eq!(max_candidates(100_000), 25_000);
+        assert_eq!(max_candidates(3), 0);
     }
 
     #[test]

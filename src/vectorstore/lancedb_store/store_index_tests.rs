@@ -113,6 +113,69 @@ fn an_indexed_query_returns_exactly_what_the_scan_returns() {
     }
 }
 
+/// Sixty of 240 rows have the very same vector, so they tie at the k-th score
+/// for every `k` up to 60: which of them are in the answer is decided by id,
+/// and only an exact rescore can do that (the index stores brackets, not
+/// weights). Whether a given `k` is answered through the index or, because
+/// the candidates exceed a quarter of the table, by the scan, the ranking
+/// must be the scan's.
+#[test]
+fn rows_tied_at_the_kth_score_are_ordered_by_id() {
+    let (dir, mut store) = indexed_store();
+    let docs: Vec<_> = (0..240)
+        .map(|i| doc(&format!("d{i:05}"), &format!("f{}.txt", i % 5)))
+        .collect();
+    store.upsert(&docs).expect("rows");
+    let rows: Vec<(String, SparseVector)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, doc)| {
+            let vector = if i % 4 == 0 {
+                sv(&[(1, 2.0), (2, 1.0)])
+            } else {
+                sv(&[(1, 0.5), (3, 1.0 + (i % 11) as f32)])
+            };
+            (doc.id.clone(), vector)
+        })
+        .collect();
+    store.set_sparse("m", &rows).expect("sparse");
+    store.flush().expect("flush builds the index");
+    assert!(store.sparse_index_ready().expect("state"));
+
+    let scan = plain_scan_store(dir.path());
+    let query = sv(&[(1, 1.0), (2, 1.0)]);
+    for k in [1usize, 7, 30, 59, 60, 61, 100, 500] {
+        let via_index = store.query_sparse("m", &query, None, k).expect("indexed");
+        let via_scan = scan.query_sparse("m", &query, None, k).expect("scan");
+        assert_eq!(ranked(&via_index), ranked(&via_scan), "k {k}");
+    }
+    let top = store.query_sparse("m", &query, None, 3).expect("top");
+    let ids: Vec<_> = top.iter().map(|hit| hit.doc_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["d00000", "d00004", "d00008"],
+        "ties go to the smaller id"
+    );
+}
+
+/// A `k` as large as the table makes nearly every row a candidate; reading
+/// them back by id would cost more than the scan it is meant to replace, and
+/// the answer is the same either way.
+#[test]
+fn a_k_as_large_as_the_table_is_answered_by_the_scan_with_the_same_ranking() {
+    let (dir, mut store) = indexed_store();
+    seed(&mut store, 300);
+    store.flush().expect("flush");
+    let scan = plain_scan_store(dir.path());
+    let query = sv(&[(3, 0.5), (9, 2.0), (30, 1.0), (12, 1.0)]);
+
+    for k in [150usize, 300, 5000] {
+        let via_index = store.query_sparse("m", &query, None, k).expect("indexed");
+        let via_scan = scan.query_sparse("m", &query, None, k).expect("scan");
+        assert_eq!(ranked(&via_index), ranked(&via_scan), "k {k}");
+    }
+}
+
 #[test]
 fn a_filter_is_applied_exactly_whether_or_not_an_index_exists() {
     let (dir, mut store) = indexed_store();
