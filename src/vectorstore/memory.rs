@@ -113,10 +113,16 @@ impl VectorStore for InMemoryStore {
         hits.truncate(topk);
         Ok(hits)
     }
-    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>> {
+    fn rows_missing_sparse(
+        &self,
+        model: &str,
+        scope: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>> {
         let mut missing: Vec<&Document> = self
             .docs
             .values()
+            .filter(|doc| scope.is_none_or(|scope| matches_filter(doc, scope)))
             .filter(|doc| {
                 self.sparse
                     .get(&doc.id)
@@ -330,7 +336,7 @@ mod sparse_tests {
             .set_sparse("m1", &[("a".to_string(), sv(&[(1, 1.0)]))])
             .unwrap();
         let missing: Vec<String> = store
-            .rows_missing_sparse("m1", 10)
+            .rows_missing_sparse("m1", None, 10)
             .unwrap()
             .into_iter()
             .map(|row| row.id)
@@ -364,7 +370,7 @@ mod sparse_tests {
             .collect();
         store.upsert(&docs).unwrap();
         let ids: Vec<String> = store
-            .rows_missing_sparse("m", 2)
+            .rows_missing_sparse("m", None, 2)
             .unwrap()
             .into_iter()
             .map(|row| row.id)

@@ -319,6 +319,8 @@ Agents adding another vector store should implement the `VectorStore` trait and 
 
 A sync writes files in batches of `[sync] batch_files` (default 25). Per batch it does one id-only existence check, one embedding call, one metadata update for reused chunks, one append for new chunks and one stale-chunk sweep, so the commit count is independent of how many files are in the batch. It keeps BTree indexes on `id` and `path` so these filters stay index lookups, and every `[sync] checkpoint_every_files` files (default 50) compacts fragments (once there are at least `compact_fragment_threshold`, default 64) and prunes old versions. A running sync logs `sync progress` at each checkpoint. A crash redoes at most one batch.
 
+Every committed batch is searchable right away, including during the first sync: `minsync query` answers from the batches committed so far (files not reached yet are simply not found) while `.minsync/txn.json` marks a first sync as running or interrupted. Before any sync has started, `query` still fails with `never synced`.
+
 ```toml
 [sync]
 batch_files = 25              # files per store commit; 1 = per-file commits
@@ -418,9 +420,11 @@ there is no inference-free query mode. There is no `--language` flag on
 `minsync init` and no `[lexical]` config table: an old `config.toml` that still
 has `[lexical]` is silently ignored.
 
-`minsync sync` encodes sparse vectors in a catch-up phase at the end of the run.
-It is resumable and deduplicated by content hash, and independent of the dense
-phase. The model id is recorded in `.minsync/cursor.json` as `sparse_id` only
+`minsync sync` encodes sparse vectors batch by batch, right after each batch's
+dense commit, and finishes with a catch-up over every chunk still missing a
+vector (chunks from before sparse retrieval, a model change, an interrupted
+run). It is resumable and deduplicated by content hash, and a chunk the encoder
+rejects is tried once per run. The model id is recorded in `.minsync/cursor.json` as `sparse_id` only
 when every stored chunk holds a vector from that model. A sparse or hybrid
 query against an index whose last sync left `sparse_id` unset or set to another
 model (a changed `[sparse].id`, a sparse failure that left chunks unencoded, a
