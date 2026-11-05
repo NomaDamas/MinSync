@@ -567,6 +567,10 @@ impl MinSync {
         let mut since_checkpoint = 0usize;
         let mut systemic_streak = 0usize;
         let mut cursor_at = 0usize;
+        // Sparse vectors are built batch by batch, so every committed batch
+        // is searchable in every mode before the next one starts (a first
+        // sync answers queries from what it has committed so far).
+        let mut sparse = sparse_phase::CatchUp::default();
         while cursor_at < pending.len() {
             // Never let a batch straddle a checkpoint boundary, so the
             // checkpoint cadence stays exactly `checkpoint_every` files.
@@ -621,6 +625,25 @@ impl MinSync {
                 &result.files_failed[failed_before..],
             ))?;
 
+            if let Some(encoder) = &self.sparse {
+                let written: Vec<String> = group
+                    .iter()
+                    .filter(|(item, _)| matches!(item.kind, BatchKind::Index))
+                    .map(|(item, _)| item.path.clone())
+                    .collect();
+                if !written.is_empty() {
+                    let scope = Filter::In("path".to_string(), written);
+                    self.sparse_step(
+                        &mut sparse,
+                        store,
+                        encoder.as_ref(),
+                        Some(&scope),
+                        skip_failures,
+                    )
+                    .await?;
+                }
+            }
+
             processed_this_run += take;
             since_checkpoint += take;
             if let Some(progress) = &self.progress {
@@ -651,32 +674,17 @@ impl MinSync {
 
         store.flush()?;
 
-        // The sparse phase: encode every row that lacks a vector from the
-        // current model. A failed file keeps its dense rows (their text is
-        // fine) and is retried by the next sync like any skipped file.
+        // The rest of the sparse phase: every row still lacking a vector
+        // from the current model (rows from before sparse retrieval, a model
+        // change, an interrupted run). A failed file keeps its dense rows
+        // (their text is fine) and is retried by the next sync like any
+        // skipped file.
         let dense_failures = result.files_failed.len();
         let mut sparse_complete = true;
         if let Some(encoder) = &self.sparse {
-            let progress = self.progress.clone();
-            let skip = skip_failures;
-            let sparse = sparse_phase::catch_up(
-                store,
-                encoder.as_ref(),
-                sparse_phase::ROWS_PER_BATCH,
-                |failure| {
-                    if !skip {
-                        return Err(MinSyncError::Embedding(format!(
-                            "{}: {}",
-                            failure.path, failure.error
-                        )));
-                    }
-                    if let Some(progress) = &progress {
-                        progress.file_failed(failure);
-                    }
-                    Ok(())
-                },
-            )
-            .await?;
+            self.sparse_step(&mut sparse, store, encoder.as_ref(), None, skip_failures)
+                .await?;
+            let sparse = sparse.outcome();
             result.sparse_encoded = sparse.encoded;
             result.sparse_reused = sparse.reused;
             sparse_complete = sparse.failures.is_empty();
@@ -746,6 +754,40 @@ impl MinSync {
             progress.done(&result, changes.len());
         }
         Ok(result)
+    }
+
+    /// One step of the run's sparse phase over `scope` (the whole store when
+    /// `None`), reporting each failed file as it is found. Under
+    /// `on_file_error = "fail"` the first failure ends the sync.
+    async fn sparse_step(
+        &self,
+        phase: &mut sparse_phase::CatchUp,
+        store: &mut dyn VectorStore,
+        encoder: &dyn SparseEncoder,
+        scope: Option<&Filter>,
+        skip_failures: bool,
+    ) -> Result<()> {
+        let progress = self.progress.clone();
+        phase
+            .run(
+                store,
+                encoder,
+                scope,
+                sparse_phase::ROWS_PER_BATCH,
+                |failure| {
+                    if !skip_failures {
+                        return Err(MinSyncError::Embedding(format!(
+                            "{}: {}",
+                            failure.path, failure.error
+                        )));
+                    }
+                    if let Some(progress) = &progress {
+                        progress.file_failed(failure);
+                    }
+                    Ok(())
+                },
+            )
+            .await
     }
 }
 
@@ -1787,9 +1829,10 @@ mod tests {
         fn rows_missing_sparse(
             &self,
             model: &str,
+            scope: Option<&Filter>,
             limit: usize,
         ) -> Result<Vec<crate::vectorstore::SparseTarget>> {
-            self.inner.rows_missing_sparse(model, limit)
+            self.inner.rows_missing_sparse(model, scope, limit)
         }
         fn count_missing_sparse(&self, model: &str) -> Result<usize> {
             self.inner.count_missing_sparse(model)
@@ -3219,6 +3262,45 @@ mod tests {
         assert_eq!(result.sparse_encoded, result.chunks_added);
         assert_eq!(encoder.encoded() - before, result.chunks_added);
         assert_eq!(store.count_missing_sparse("m1").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_batches_committed_before_an_interrupted_first_sync_are_searchable() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        let encoder = CountingSparse::new("m1");
+        let sync = sync.with_sparse_encoder(encoder.clone());
+        let store = crash_initial_sync(&dir, &sync, &chunker).await;
+
+        let committed = store.all_paths();
+        assert_eq!(committed.len(), 3, "three one-file batches committed");
+        assert_eq!(
+            store.count_missing_sparse("m1").unwrap(),
+            0,
+            "every committed batch is sparse-encoded before the next one starts"
+        );
+        for mode in [
+            crate::cli::QueryMode::Vector,
+            crate::cli::QueryMode::Sparse,
+            crate::cli::QueryMode::Hybrid,
+        ] {
+            let hits = crate::query::query(
+                &sync.minsync_dir,
+                "alpha file1",
+                10,
+                &MockEmbedder,
+                Some(encoder.as_ref()),
+                &store,
+                None,
+                mode,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{mode:?} after an interrupted first sync: {error}"));
+            assert!(!hits.is_empty(), "{mode:?}");
+            assert!(
+                hits.iter().all(|hit| committed.contains(&hit.path)),
+                "{mode:?}"
+            );
+        }
     }
 
     #[tokio::test]

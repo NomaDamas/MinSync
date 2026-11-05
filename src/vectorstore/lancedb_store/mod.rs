@@ -210,9 +210,15 @@ impl VectorStore for LanceDbStore {
         })
     }
 
-    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>> {
+    fn rows_missing_sparse(
+        &self,
+        model: &str,
+        scope: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>> {
         self.request(|resp| Command::RowsMissingSparse {
             model: model.to_string(),
+            scope: scope.cloned(),
             limit,
             resp,
         })
@@ -1090,7 +1096,7 @@ mod tests {
         // Null columns, not just a different model: the SQL predicate must
         // keep NULL rows in the "missing" set.
         assert_eq!(store.count_missing_sparse("m").expect("count"), 2);
-        let rows = store.rows_missing_sparse("m", 10).expect("rows");
+        let rows = store.rows_missing_sparse("m", None, 10).expect("rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.text.starts_with("text ")));
 
@@ -1099,9 +1105,13 @@ mod tests {
             .expect("set sparse");
 
         assert_eq!(store.count_missing_sparse("m").expect("count"), 1);
-        let missing = store.rows_missing_sparse("m", 10).expect("rows");
+        let missing = store.rows_missing_sparse("m", None, 10).expect("rows");
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].id, "b");
+        let scoped = store
+            .rows_missing_sparse("m", Some(&Filter::Eq("path".into(), "a.txt".into())), 10)
+            .expect("scoped rows");
+        assert!(scoped.is_empty(), "a.txt is encoded; b.txt is out of scope");
         // Another model has encoded nothing.
         assert_eq!(store.count_missing_sparse("other").expect("count"), 2);
     }
@@ -1113,8 +1123,14 @@ mod tests {
             .map(|i| doc(&format!("d{i}"), "x.txt", "t", vec![1.0, 0.0, 0.0, 0.0]))
             .collect();
         store.upsert(&docs).expect("seed");
-        assert_eq!(store.rows_missing_sparse("m", 3).expect("rows").len(), 3);
-        assert!(store.rows_missing_sparse("m", 0).expect("rows").is_empty());
+        assert_eq!(
+            store.rows_missing_sparse("m", None, 3).expect("rows").len(),
+            3
+        );
+        assert!(store
+            .rows_missing_sparse("m", None, 0)
+            .expect("rows")
+            .is_empty());
         assert_eq!(store.count_missing_sparse("m").expect("count"), 7);
     }
 

@@ -11,7 +11,7 @@
 use crate::error::{MinSyncError, Result};
 use crate::sparse::{SparseEncoder, SparseVector};
 use crate::types::{FileFailure, FileStage};
-use crate::vectorstore::{SparseTarget, VectorStore};
+use crate::vectorstore::{Filter, SparseTarget, VectorStore};
 use std::collections::{HashMap, HashSet};
 
 /// Rows read, encoded and committed per iteration. One commit per iteration,
@@ -39,52 +39,86 @@ pub(super) struct Outcome {
     pub failures: Vec<FileFailure>,
 }
 
-/// Encode every row of `store` that lacks a vector from `encoder`'s model.
-///
-/// `on_failure` is told about each failed file as soon as it is known; an
-/// `Err` from it stops the phase (the `on_file_error = "fail"` policy).
-/// Returns `Err` when the phase cannot go on (stuck encoder, systemic
-/// failure, store error); chunk-level failures are reported in the outcome.
-pub(super) async fn catch_up(
-    store: &mut dyn VectorStore,
-    encoder: &dyn SparseEncoder,
-    rows_per_batch: usize,
-    mut on_failure: impl FnMut(&FileFailure) -> Result<()>,
-) -> Result<Outcome> {
-    let model = encoder.id().to_string();
-    let rows_per_batch = rows_per_batch.max(1);
-    let mut outcome = Outcome::default();
-    let mut failed_ids: HashSet<String> = HashSet::new();
-    let mut failed_paths: HashSet<String> = HashSet::new();
-    let mut streak = 0usize;
-    let mut batches = 0usize;
+/// The sparse phase of one sync run, run in steps: after every dense batch
+/// for the rows that batch wrote (so a committed batch is searchable before
+/// the next one starts), and once more over the whole store at the end.
+/// Steps share the run's failures, so a chunk the encoder rejected is
+/// reported once and never retried within the run.
+#[derive(Debug, Default)]
+pub(super) struct CatchUp {
+    outcome: Outcome,
+    failed_ids: HashSet<String>,
+    failed_paths: HashSet<String>,
+    streak: usize,
+    batches: usize,
+}
 
-    loop {
-        // Rows that already failed this run still look "missing"; ask for
-        // enough extra rows to get past them.
-        let wanted = rows_per_batch + failed_ids.len();
-        let rows: Vec<SparseTarget> = store
-            .rows_missing_sparse(&model, wanted)?
-            .into_iter()
-            .filter(|row| !failed_ids.contains(&row.id))
-            .take(rows_per_batch)
-            .collect();
-        if rows.is_empty() {
-            break;
+impl CatchUp {
+    /// Encode every row of `store` in `scope` (all rows when `None`) that
+    /// lacks a vector from `encoder`'s model.
+    ///
+    /// `on_failure` is told about each failed file as soon as it is known; an
+    /// `Err` from it stops the phase (the `on_file_error = "fail"` policy).
+    /// Returns `Err` when the phase cannot go on (stuck encoder, systemic
+    /// failure, store error); chunk-level failures are kept in the outcome.
+    pub(super) async fn run(
+        &mut self,
+        store: &mut dyn VectorStore,
+        encoder: &dyn SparseEncoder,
+        scope: Option<&Filter>,
+        rows_per_batch: usize,
+        mut on_failure: impl FnMut(&FileFailure) -> Result<()>,
+    ) -> Result<()> {
+        let model = encoder.id().to_string();
+        let rows_per_batch = rows_per_batch.max(1);
+        loop {
+            // Rows that already failed this run still look "missing"; ask
+            // for enough extra rows to get past them.
+            let wanted = rows_per_batch + self.failed_ids.len();
+            let rows: Vec<SparseTarget> = store
+                .rows_missing_sparse(&model, scope, wanted)?
+                .into_iter()
+                .filter(|row| !self.failed_ids.contains(&row.id))
+                .take(rows_per_batch)
+                .collect();
+            if rows.is_empty() {
+                return Ok(());
+            }
+            self.encode_rows(store, encoder, &model, &rows, &mut on_failure)
+                .await?;
         }
+    }
+
+    /// Everything the steps of this run did.
+    pub(super) fn outcome(self) -> Outcome {
+        self.outcome
+    }
+
+    async fn encode_rows(
+        &mut self,
+        store: &mut dyn VectorStore,
+        encoder: &dyn SparseEncoder,
+        model: &str,
+        rows: &[SparseTarget],
+        on_failure: &mut impl FnMut(&FileFailure) -> Result<()>,
+    ) -> Result<()> {
+        let outcome = &mut self.outcome;
+        let failed_ids = &mut self.failed_ids;
+        let failed_paths = &mut self.failed_paths;
+        let streak = &mut self.streak;
 
         // Identical text encodes identically: one vector per content hash,
         // taken from the store when another row already holds it.
         let mut unique: Vec<&SparseTarget> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        for row in &rows {
+        for row in rows {
             if seen.insert(row.content_hash.as_str()) {
                 unique.push(row);
             }
         }
         let hashes: Vec<String> = unique.iter().map(|row| row.content_hash.clone()).collect();
         let mut vectors: HashMap<String, std::result::Result<SparseVector, MinSyncError>> = store
-            .fetch_sparse_by_content_hash(&model, &hashes)?
+            .fetch_sparse_by_content_hash(model, &hashes)?
             .into_iter()
             .map(|(hash, vector)| (hash, Ok(vector)))
             .collect();
@@ -95,7 +129,7 @@ pub(super) async fn catch_up(
 
         if !to_encode.is_empty() {
             let texts: Vec<String> = to_encode.iter().map(|row| row.text.clone()).collect();
-            let encoded = encode_isolating(encoder, &texts, &mut streak).await?;
+            let encoded = encode_isolating(encoder, &texts, streak).await?;
             for (row, result) in to_encode.iter().zip(encoded) {
                 vectors.insert(row.content_hash.clone(), result);
             }
@@ -103,12 +137,13 @@ pub(super) async fn catch_up(
 
         let mut commit: Vec<(String, SparseVector)> = Vec::with_capacity(rows.len());
         let mut from_encoder: HashSet<&str> = HashSet::new();
-        for row in &rows {
+        for row in rows {
             match vectors.get(&row.content_hash) {
                 Some(Ok(vector)) => {
                     commit.push((row.id.clone(), vector.clone()));
-                    // The first row of a hash that was actually encoded counts
-                    // as encoded; its duplicates and store hits as reused.
+                    // The first row of a hash that was actually encoded
+                    // counts as encoded; its duplicates and store hits as
+                    // reused.
                     let was_encoded = to_encode
                         .iter()
                         .any(|target| target.content_hash == row.content_hash);
@@ -139,21 +174,21 @@ pub(super) async fn catch_up(
             }
         }
         if !commit.is_empty() {
-            store.set_sparse(&model, &commit)?;
+            store.set_sparse(model, &commit)?;
         }
 
-        batches += 1;
-        if batches.is_multiple_of(CHECKPOINT_EVERY_BATCHES) {
+        self.batches += 1;
+        if self.batches.is_multiple_of(CHECKPOINT_EVERY_BATCHES) {
             store.checkpoint()?;
         }
         tracing::info!(
-            encoded = outcome.encoded,
-            reused = outcome.reused,
-            failed = failed_ids.len(),
+            encoded = self.outcome.encoded,
+            reused = self.outcome.reused,
+            failed = self.failed_ids.len(),
             "sparse encoding progress"
         );
+        Ok(())
     }
-    Ok(outcome)
 }
 
 /// Encode `texts`, narrowing a failing call down to the chunks that cause it
@@ -214,6 +249,74 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// One whole-store step, as the end of a sync runs it.
+    async fn catch_up(
+        store: &mut dyn VectorStore,
+        encoder: &dyn SparseEncoder,
+        rows_per_batch: usize,
+        on_failure: impl FnMut(&FileFailure) -> Result<()>,
+    ) -> Result<Outcome> {
+        let mut phase = CatchUp::default();
+        phase
+            .run(store, encoder, None, rows_per_batch, on_failure)
+            .await?;
+        Ok(phase.outcome())
+    }
+
+    #[tokio::test]
+    async fn a_scoped_step_encodes_only_its_rows_and_a_rejected_chunk_is_tried_once_per_run() {
+        let mut store = store_with(&[
+            doc("a", "a.txt", "term-1"),
+            doc("b", "b.txt", "bad"),
+            doc("c", "c.txt", "term-3"),
+        ]);
+        let mut encoder = Fake::new("m");
+        encoder.reject = vec!["bad"];
+        let mut phase = CatchUp::default();
+        let mut reported = 0;
+
+        let batch_one = Filter::In("path".into(), vec!["a.txt".into(), "b.txt".into()]);
+        phase
+            .run(&mut store, &encoder, Some(&batch_one), 10, |_| {
+                reported += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_missing_sparse("m").unwrap(),
+            2,
+            "b failed, c out of scope"
+        );
+        let attempts_on_b = |encoder: &Fake| {
+            encoder
+                .encoded_texts()
+                .iter()
+                .filter(|text| text.as_str() == "bad")
+                .count()
+        };
+        let tried = attempts_on_b(&encoder);
+
+        phase
+            .run(&mut store, &encoder, None, 10, |_| {
+                reported += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            attempts_on_b(&encoder),
+            tried,
+            "b is not retried in the same run"
+        );
+        assert_eq!(reported, 1, "b is reported once");
+        let outcome = phase.outcome();
+        assert_eq!(outcome.encoded, 2);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(store.count_missing_sparse("m").unwrap(), 1);
+    }
 
     /// Encodes `"term-N"` as the single term N with weight 1; fails on
     /// request for the texts it is told to reject; records every call.

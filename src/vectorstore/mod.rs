@@ -96,8 +96,14 @@ pub trait VectorStore: Send + Sync {
     /// At most `limit` rows that hold no sparse vector from `model`: never
     /// encoded, or encoded by another model. Sync encodes these, so a fresh
     /// row, an old row after a model change and a row left over from an
-    /// interrupted run are all the same case.
-    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>>;
+    /// interrupted run are all the same case. `scope` narrows the search to
+    /// matching rows (the batch a sync just wrote) instead of the whole table.
+    fn rows_missing_sparse(
+        &self,
+        model: &str,
+        scope: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>>;
     /// How many rows [`VectorStore::rows_missing_sparse`] would return without a limit.
     fn count_missing_sparse(&self, model: &str) -> Result<usize>;
     /// Attach sparse vectors from `model` to existing rows by id. An id that

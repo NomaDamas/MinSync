@@ -363,19 +363,25 @@ impl LanceDbInner {
         Ok(hits)
     }
 
-    /// Rows that hold no sparse vector from `model`, at most `limit`.
+    /// Rows that hold no sparse vector from `model`, at most `limit`,
+    /// restricted to `scope` when given.
     pub(super) async fn rows_missing_sparse(
         &self,
         model: String,
+        scope: Option<Filter>,
         limit: usize,
     ) -> Result<Vec<SparseTarget>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let mut predicate = missing_sparse_filter(&model);
+        if let Some(scope) = &scope {
+            predicate = format!("({}) AND {predicate}", filter_to_sql(scope)?);
+        }
         let batches: Vec<RecordBatch> = self
             .table
             .query()
-            .only_if(missing_sparse_filter(&model))
+            .only_if(predicate)
             .select(Select::columns(&["id", "path", "content_hash", "text"]))
             .limit(limit)
             .execute()

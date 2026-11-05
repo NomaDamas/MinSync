@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use crate::sparse::SparseEncoder;
-use crate::state::Cursor;
+use crate::state::{Cursor, Transaction};
 use crate::types::QueryResult;
 use crate::vectorstore::{Filter, QueryHit, VectorStore};
 use std::path::Path;
@@ -28,16 +28,12 @@ pub async fn query(
         return Err(MinSyncError::EmptyQuery);
     }
 
-    let _config = Config::load(&minsync_dir.join("config.toml"))?;
-    let cursor_path = minsync_dir.join("cursor.json");
-    if !cursor_path.exists() {
-        return Err(MinSyncError::NeverSynced);
-    }
-    let cursor = Cursor::load(&cursor_path)?;
+    let config = Config::load(&minsync_dir.join("config.toml"))?;
+    let index = IndexedBy::load(minsync_dir, &config)?;
 
     let mut filters = vec![Filter::Eq(
         "source_id".to_string(),
-        cursor.source_id.clone(),
+        index.source_id().to_string(),
     )];
     if let Some(expr) = filter_expr {
         if !expr.trim().is_empty() {
@@ -59,7 +55,7 @@ pub async fn query(
                 .map(|(rank, hit)| (hit, Some(rank + 1), None))
                 .collect()
         }
-        QueryMode::Sparse => sparse_hits(&cursor, encoder, store, text, &filter, k)
+        QueryMode::Sparse => sparse_hits(&index, encoder, store, text, &filter, k)
             .await?
             .into_iter()
             .enumerate()
@@ -70,7 +66,7 @@ pub async fn query(
             let candidate_k = k.saturating_mul(4).max(k);
             let vector_hits = store.query(&query_vec, Some(&filter), candidate_k)?;
             let sparse_hits =
-                sparse_hits(&cursor, encoder, store, text, &filter, candidate_k).await?;
+                sparse_hits(&index, encoder, store, text, &filter, candidate_k).await?;
             reciprocal_rank_fusion(vector_hits, sparse_hits, k)
         }
     };
@@ -95,14 +91,48 @@ pub async fn query(
         .collect())
 }
 
+/// Which run the stored rows can be trusted from.
+enum IndexedBy {
+    /// A sync completed; its cursor says what every row was built with.
+    Sync(Cursor),
+    /// The first sync is running or was interrupted. Every batch it commits
+    /// (dense rows and their sparse vectors) is final, so the rows stored so
+    /// far answer queries; files not reached yet are simply not found.
+    FirstSync { source_id: String },
+}
+
+impl IndexedBy {
+    fn load(minsync_dir: &Path, config: &Config) -> Result<Self> {
+        let cursor_path = minsync_dir.join("cursor.json");
+        if cursor_path.exists() {
+            return Ok(Self::Sync(Cursor::load(&cursor_path)?));
+        }
+        let txn_path = minsync_dir.join("txn.json");
+        if txn_path.exists() && Transaction::load(&txn_path)?.source_id == config.source_id {
+            return Ok(Self::FirstSync {
+                source_id: config.source_id.clone(),
+            });
+        }
+        Err(MinSyncError::NeverSynced)
+    }
+
+    fn source_id(&self) -> &str {
+        match self {
+            Self::Sync(cursor) => &cursor.source_id,
+            Self::FirstSync { source_id } => source_id,
+        }
+    }
+}
+
 /// Top sparse hits for `text`, or why the index cannot answer a sparse query.
 ///
 /// Scores from different models are not comparable, and a row without a
 /// vector from the configured model can never be found, so a cursor whose
 /// `sparse_id` is not the encoder's model means the last sync did not leave
-/// the whole index encoded by it.
+/// the whole index encoded by it. During a first sync only rows the
+/// configured model encoded match, which are exactly the committed batches.
 async fn sparse_hits(
-    cursor: &Cursor,
+    index: &IndexedBy,
     encoder: Option<&dyn SparseEncoder>,
     store: &dyn VectorStore,
     text: &str,
@@ -112,7 +142,11 @@ async fn sparse_hits(
     let encoder = encoder.ok_or_else(|| {
         MinSyncError::Config("sparse search needs a sparse encoder, but none is configured".into())
     })?;
-    match cursor.sparse_id.as_deref() {
+    let indexed = match index {
+        IndexedBy::Sync(cursor) => cursor.sparse_id.as_deref(),
+        IndexedBy::FirstSync { .. } => Some(encoder.id()),
+    };
+    match indexed {
         Some(indexed) if indexed == encoder.id() => {}
         Some(indexed) => {
             return Err(MinSyncError::SparseNotReady(format!(
@@ -354,6 +388,101 @@ mod tests {
             err.to_string().contains("minsync sync --full"),
             "error must name the command that resolves the state, got: {err}"
         );
+    }
+
+    /// A first sync that is still running (or was interrupted): config and
+    /// transaction, no cursor yet.
+    fn write_initial_sync_state(dir: &TempDir, source_id: &str) {
+        let minsync_dir = dir.path().join(".minsync");
+        std::fs::create_dir_all(&minsync_dir).expect("create .minsync");
+        Config::default_for(source_id)
+            .save(&minsync_dir.join("config.toml"))
+            .expect("save config");
+        crate::state::Transaction::new(source_id, "token", None, "sha256:to")
+            .save(&minsync_dir.join("txn.json"))
+            .expect("save txn");
+    }
+
+    #[tokio::test]
+    async fn a_first_sync_in_progress_answers_from_its_committed_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        write_initial_sync_state(&dir, "source-1");
+        let minsync_dir = dir.path().join(".minsync");
+        let mut store = sparse_store("source-1");
+        store
+            .upsert(&[doc(
+                "foreign",
+                "other-source",
+                "x.txt",
+                vec![1.0, 0.0, 0.0, 0.0],
+            )])
+            .unwrap();
+        store
+            .set_sparse(
+                "fake/sparse",
+                &[("foreign".to_string(), term_vector("t1").unwrap())],
+            )
+            .unwrap();
+        let encoder = FakeSparse("fake/sparse");
+
+        for mode in [QueryMode::Vector, QueryMode::Sparse, QueryMode::Hybrid] {
+            let results = query(
+                &minsync_dir,
+                "t1 t2",
+                5,
+                &MockEmbedder,
+                Some(&encoder),
+                &store,
+                None,
+                mode,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{mode:?} during the first sync: {error}"));
+            assert!(!results.is_empty(), "{mode:?}");
+            assert!(
+                results.iter().all(|r| r.doc_id != "foreign"),
+                "{mode:?} leaked another source: {results:?}"
+            );
+        }
+
+        let sparse = query(
+            &minsync_dir,
+            "t1 t2",
+            5,
+            &MockEmbedder,
+            Some(&encoder),
+            &store,
+            None,
+            QueryMode::Sparse,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = sparse.iter().map(|r| r.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_of_another_source_does_not_make_the_index_queryable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_initial_sync_state(&dir, "stale-source");
+        let minsync_dir = dir.path().join(".minsync");
+        Config::default_for("source-1")
+            .save(&minsync_dir.join("config.toml"))
+            .unwrap();
+
+        let error = query(
+            &minsync_dir,
+            "search text",
+            5,
+            &MockEmbedder,
+            None,
+            &sparse_store("source-1"),
+            None,
+            QueryMode::Vector,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, MinSyncError::NeverSynced), "{error}");
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ pub(super) enum Command {
     },
     RowsMissingSparse {
         model: String,
+        scope: Option<Filter>,
         limit: usize,
         resp: Resp<Vec<SparseTarget>>,
     },
@@ -120,9 +121,15 @@ pub(super) fn run_worker(
                 topk,
                 resp,
             } => send_response(resp, rt.block_on(inner.query(vector, filter, topk))),
-            Command::RowsMissingSparse { model, limit, resp } => {
-                send_response(resp, rt.block_on(inner.rows_missing_sparse(model, limit)))
-            }
+            Command::RowsMissingSparse {
+                model,
+                scope,
+                limit,
+                resp,
+            } => send_response(
+                resp,
+                rt.block_on(inner.rows_missing_sparse(model, scope, limit)),
+            ),
             Command::CountMissingSparse(model, resp) => {
                 send_response(resp, rt.block_on(inner.count_missing_sparse(model)))
             }
