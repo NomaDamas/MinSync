@@ -251,6 +251,12 @@ async fn inputs_over_the_context_are_rejected_unless_truncation_is_requested() {
         .as_str()
         .unwrap()
         .contains("maximum context length"));
+    let (status, _) = post(
+        &format!("{}/v1/embeddings", h.url),
+        json!({"model": "Fake/Model-1", "input": [long], "truncate": true}),
+    )
+    .await;
+    assert_eq!(status, 200);
     // The prefix counts against the context: "Q: w w" is 3 words <= 4, "Q: w w w w" is 5.
     let (status, _) = post(
         &format!("{}/embed", h.url),

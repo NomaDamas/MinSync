@@ -2,7 +2,7 @@
 //!
 //! Protocols:
 //! * TEI: `POST /embed` `{ "inputs", "truncate"? }` -> `[[f32]]`
-//! * OpenAI: `POST /v1/embeddings` `{ "model", "input" }` -> `{ "data", ... }`
+//! * OpenAI: `POST /v1/embeddings` `{ "model", "input", "truncate"? }` -> `{ "data", ... }`
 //! * `GET /health`: model id, dimension, dtype, device, pid, port, `kind`.
 //!
 //! A server is `dense` (the routes above) or `sparse` (`minsync serve
@@ -687,6 +687,10 @@ struct OpenAiRequest {
     dimensions: Option<usize>,
     #[serde(default)]
     input_type: Option<InputType>,
+    /// MinSync extension, mirroring TEI: clip over-context inputs at
+    /// `max_length` instead of rejecting the request with 413.
+    #[serde(default)]
+    truncate: Option<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -1024,7 +1028,7 @@ async fn openai_embeddings(
             state,
             texts,
             request.input_type,
-            false,
+            request.truncate.unwrap_or(false),
             true,
             Protocol::OpenAi,
         )
