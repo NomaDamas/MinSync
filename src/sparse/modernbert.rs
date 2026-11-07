@@ -555,6 +555,15 @@ impl ModernBertMlm {
         self.positions
     }
 
+    /// Attention kernel this model runs for any batch longer than one token:
+    /// `"sdpa"` (fused, Metal) or `"tiled"`.
+    pub fn attention_name(&self) -> &'static str {
+        match AttentionBackend::resolve(&self.device, self.head_dim, 2) {
+            AttentionBackend::Sdpa => "sdpa",
+            AttentionBackend::Tiled => "tiled",
+        }
+    }
+
     /// Additive masks `[batch, 1, seq, seq]`: `(global, sliding)`. A key that
     /// is padding is masked in both; the sliding mask also masks keys more
     /// than `half_window` positions from the query.
@@ -1424,6 +1433,12 @@ mod tests {
             AttentionBackend::resolve(&Device::Cpu, 64, 128),
             AttentionBackend::Tiled
         );
+    }
+
+    #[test]
+    fn the_reported_attention_name_follows_the_backend_actually_used() {
+        // The tiny fixture has head_dim 8 and runs on CPU: tiled either way.
+        assert_eq!(load_model(DType::F32).0.attention_name(), "tiled");
     }
 
     #[test]

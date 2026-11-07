@@ -502,7 +502,7 @@ impl crate::serve::SparseServeEngine for NativeSparseEncoder {
             dimension: loaded.pooling.dimension(loaded.model.vocab_size()),
             dtype: dtype_name(loaded.dtype).to_string(),
             device: loaded.device.clone(),
-            attention: "tiled".to_string(),
+            attention: loaded.model.attention_name().to_string(),
             max_length: self.max_length,
         })
     }
