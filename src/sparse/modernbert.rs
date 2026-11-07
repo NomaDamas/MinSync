@@ -165,8 +165,44 @@ impl ModernBertConfig {
 
 type CResult<T> = candle_core::Result<T>;
 
-fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> CResult<LayerNorm> {
-    candle_nn::layer_norm_no_bias(size, eps, vb)
+/// LayerNorm without bias. candle's generic path is about ten small kernels
+/// per call (mean, subtract, square, sum, divide, sqrt, ...) and the model
+/// has 47 of them; on Metal the fused kernel does it in one launch, with a
+/// zero bias standing in for the absent one. Other devices keep candle's
+/// reference implementation, whose numerics the golden tests pin.
+struct Norm {
+    reference: LayerNorm,
+    fused: Option<(Tensor, f32)>,
+}
+
+impl Norm {
+    fn new(weight: Tensor, eps: f64) -> CResult<Self> {
+        let fused = if weight.device().is_metal() {
+            Some((Tensor::zeros_like(&weight)?, eps as f32))
+        } else {
+            None
+        };
+        Ok(Self {
+            reference: LayerNorm::new_no_bias(weight, eps),
+            fused,
+        })
+    }
+
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> CResult<Self> {
+        Self::new(vb.get(size, "weight")?, eps)
+    }
+
+    fn forward(&self, x: &Tensor) -> CResult<Tensor> {
+        match &self.fused {
+            Some((zero_bias, eps)) => candle_nn::ops::layer_norm(
+                &x.contiguous()?,
+                self.reference.weight(),
+                zero_bias,
+                *eps,
+            ),
+            None => self.reference.forward(x),
+        }
+    }
 }
 
 /// Query rows per attention block. Scores are materialized as
@@ -265,6 +301,7 @@ impl Attention {
         hidden: &Tensor,
         rotary: &Rotary,
         mask: &Tensor,
+        backend: AttentionBackend,
         tile: usize,
     ) -> CResult<Tensor> {
         let (batch, seq, _) = hidden.dims3()?;
@@ -276,26 +313,80 @@ impl Attention {
             qkv.i((.., .., index))?.transpose(1, 2)?.contiguous()
         };
         let (q, k, v) = (part(0)?, part(1)?, part(2)?);
-        let q = (rotary.apply(&q)? * (self.head_dim as f64).powf(-0.5))?;
-        let k_t = rotary.apply(&k)?.transpose(2, 3)?.contiguous()?;
-        let mut blocks = Vec::with_capacity(seq.div_ceil(tile));
-        let mut start = 0;
-        while start < seq {
-            let rows = tile.min(seq - start);
-            let scores = q.narrow(2, start, rows)?.matmul(&k_t)?;
-            let scores = scores.broadcast_add(&mask.narrow(2, start, rows)?)?;
-            blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?);
-            start += rows;
-        }
-        let out = if blocks.len() == 1 {
-            blocks.swap_remove(0)
-        } else {
-            Tensor::cat(&blocks, 2)?
-        };
+        let (q, k) = (rotary.apply(&q)?, rotary.apply(&k)?);
+        let scale = (self.head_dim as f32).powf(-0.5);
+        let out = attend(backend, &q, &k, &v, mask, scale, tile)?;
         self.wo.forward(
             &out.transpose(1, 2)?
                 .reshape((batch, seq, self.heads * self.head_dim))?,
         )
+    }
+}
+
+/// How attention scores are computed. Both compute the same function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionBackend {
+    /// candle's fused scaled-dot-product kernel (Metal): one launch per layer
+    /// instead of about five per query tile, and the score matrix is never
+    /// materialized.
+    Sdpa,
+    /// Matmul / mask / softmax / matmul over blocks of query rows, bounded
+    /// scratch on every device.
+    Tiled,
+}
+
+impl AttentionBackend {
+    /// Head sizes the Metal SDPA kernel is instantiated for.
+    const SDPA_HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
+
+    /// The fused kernel where `device` has one that supports `head_dim`;
+    /// otherwise tiled. A single query row takes the kernel's vector path,
+    /// which does not read a mask, so it stays tiled.
+    fn resolve(device: &Device, head_dim: usize, seq: usize) -> Self {
+        if device.is_metal() && seq > 1 && Self::SDPA_HEAD_DIMS.contains(&head_dim) {
+            Self::Sdpa
+        } else {
+            Self::Tiled
+        }
+    }
+}
+
+/// Attention over `q`, `k`, `v` (`[batch, heads, seq, head_dim]`) with the
+/// additive `mask` (`[batch, 1, seq, seq]`, model dtype); `scale` multiplies
+/// the scores before the mask.
+fn attend(
+    backend: AttentionBackend,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+    scale: f32,
+    tile: usize,
+) -> CResult<Tensor> {
+    let (batch, heads, seq, _) = q.dims4()?;
+    match backend {
+        AttentionBackend::Sdpa => {
+            let mask = mask.expand((batch, heads, seq, seq))?;
+            candle_nn::ops::sdpa(q, k, v, Some(&mask), false, scale, 1.0)
+        }
+        AttentionBackend::Tiled => {
+            let q = (q * f64::from(scale))?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            let mut blocks = Vec::with_capacity(seq.div_ceil(tile));
+            let mut start = 0;
+            while start < seq {
+                let rows = tile.min(seq - start);
+                let scores = q.narrow(2, start, rows)?.matmul(&k_t)?;
+                let scores = scores.broadcast_add(&mask.narrow(2, start, rows)?)?;
+                blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(v)?);
+                start += rows;
+            }
+            if blocks.len() == 1 {
+                Ok(blocks.swap_remove(0))
+            } else {
+                Tensor::cat(&blocks, 2)
+            }
+        }
     }
 }
 
@@ -324,27 +415,28 @@ impl Mlp {
 }
 
 struct Layer {
-    attn_norm: Option<LayerNorm>,
+    attn_norm: Option<Norm>,
     attn: Attention,
-    mlp_norm: LayerNorm,
+    mlp_norm: Norm,
     mlp: Mlp,
     global: bool,
 }
 
 pub struct ModernBertMlm {
     tok_embeddings: candle_nn::Embedding,
-    embedding_norm: LayerNorm,
+    embedding_norm: Norm,
     layers: Vec<Layer>,
-    final_norm: LayerNorm,
+    final_norm: Norm,
     head_dense: Linear,
-    head_norm: LayerNorm,
+    head_norm: Norm,
     decoder: Linear,
     global_rotary: Rotary,
     local_rotary: Rotary,
     half_window: usize,
     positions: usize,
-    /// Query rows per attention block ([`QUERY_TILE`]).
+    /// Query rows per attention block ([`QUERY_TILE`]); only the tiled backend reads it.
     tile: usize,
+    head_dim: usize,
     /// Tokens per decoder/pooling block ([`LOGIT_TOKENS`]).
     logit_tokens: usize,
     device: Device,
@@ -368,7 +460,7 @@ impl ModernBertMlm {
         let embeddings = model.pp("embeddings");
         let tok_embeddings =
             candle_nn::embedding(cfg.vocab_size, hidden, embeddings.pp("tok_embeddings"))?;
-        let embedding_norm = layer_norm(hidden, cfg.eps(), embeddings.pp("norm"))?;
+        let embedding_norm = Norm::load(hidden, cfg.eps(), embeddings.pp("norm"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for index in 0..cfg.num_hidden_layers {
             let layer = model.pp(format!("layers.{index}"));
@@ -377,18 +469,18 @@ impl ModernBertMlm {
                 attn_norm: if index == 0 {
                     None
                 } else {
-                    Some(layer_norm(hidden, cfg.eps(), layer.pp("attn_norm"))?)
+                    Some(Norm::load(hidden, cfg.eps(), layer.pp("attn_norm"))?)
                 },
                 attn: Attention::load(cfg, layer.pp("attn"))?,
-                mlp_norm: layer_norm(hidden, cfg.eps(), layer.pp("mlp_norm"))?,
+                mlp_norm: Norm::load(hidden, cfg.eps(), layer.pp("mlp_norm"))?,
                 mlp: Mlp::load(cfg, layer.pp("mlp"))?,
                 global: cfg.layer_is_global(index),
             });
         }
-        let final_norm = layer_norm(hidden, cfg.eps(), model.pp("final_norm"))?;
+        let final_norm = Norm::load(hidden, cfg.eps(), model.pp("final_norm"))?;
         let head = vb.pp("head");
         let head_dense = candle_nn::linear_no_bias(hidden, hidden, head.pp("dense"))?;
-        let head_norm = layer_norm(hidden, cfg.eps(), head.pp("norm"))?;
+        let head_norm = Norm::load(hidden, cfg.eps(), head.pp("norm"))?;
         // The decoder is tied to the token embeddings; only its bias is stored.
         let decoder_bias = if cfg.decoder_bias {
             Some(vb.get(cfg.vocab_size, "decoder.bias")?)
@@ -427,6 +519,7 @@ impl ModernBertMlm {
             half_window: cfg.local_attention / 2,
             positions,
             tile: QUERY_TILE,
+            head_dim: cfg.head_dim(),
             logit_tokens: LOGIT_TOKENS,
             vocab_size: cfg.vocab_size,
         })
@@ -460,6 +553,15 @@ impl ModernBertMlm {
 
     pub fn positions(&self) -> usize {
         self.positions
+    }
+
+    /// Attention kernel this model runs for any batch longer than one token:
+    /// `"sdpa"` (fused, Metal) or `"tiled"`.
+    pub fn attention_name(&self) -> &'static str {
+        match AttentionBackend::resolve(&self.device, self.head_dim, 2) {
+            AttentionBackend::Sdpa => "sdpa",
+            AttentionBackend::Tiled => "tiled",
+        }
     }
 
     /// Additive masks `[batch, 1, seq, seq]`: `(global, sliding)`. A key that
@@ -503,6 +605,7 @@ impl ModernBertMlm {
                 self.positions
             );
         }
+        let backend = AttentionBackend::resolve(&self.device, self.head_dim, seq);
         let (global_mask, local_mask) = self.masks(lengths, seq)?;
         let mut hidden = self
             .embedding_norm
@@ -517,7 +620,10 @@ impl ModernBertMlm {
             } else {
                 (&self.local_rotary, &local_mask)
             };
-            hidden = (&hidden + layer.attn.forward(&normed, rotary, mask, self.tile)?)?;
+            hidden = (&hidden
+                + layer
+                    .attn
+                    .forward(&normed, rotary, mask, backend, self.tile)?)?;
             hidden = (&hidden + layer.mlp.forward(&layer.mlp_norm.forward(&hidden)?)?)?;
         }
         let hidden = self.final_norm.forward(&hidden)?;
@@ -569,15 +675,10 @@ impl ModernBertMlm {
                 while start < seq {
                     let take = block_positions.min(seq - start);
                     let logits = self.decoder.forward(&block.narrow(1, start, take)?)?;
-                    pooled = pooling.accumulate(
-                        &pooled,
-                        &logits,
-                        &keep.narrow(1, start, take)?,
-                        &mask.open,
-                    )?;
+                    pooled = pooling.accumulate(&pooled, &logits, &keep.narrow(1, start, take)?)?;
                     start += take;
                 }
-                out.extend(pooling.fold(&pooled)?);
+                out.extend(pooling.fold(&pooling.finish(&pooled, &mask.open)?)?);
                 first += take_rows;
             }
             Ok(out)
@@ -592,7 +693,7 @@ impl ModernBertMlm {
 struct PoolMask {
     /// `[batch, seq, 1]`: 1 for a real, non-prefix position.
     keep: Tensor,
-    /// `[1, 1, vocab]`: 0 for a masked vocabulary entry.
+    /// `[1, vocab]`: 0 for a masked vocabulary entry.
     open: Tensor,
 }
 
@@ -618,7 +719,7 @@ impl PoolMask {
         }
         Ok(Self {
             keep: Tensor::from_vec(keep, (rows.len(), seq, 1), device)?,
-            open: Tensor::from_vec(open, (1, 1, vocab), device)?,
+            open: Tensor::from_vec(open, (1, vocab), device)?,
         })
     }
 }
@@ -701,22 +802,25 @@ impl SpladePooling {
     }
 
     /// Fold one block of `logits` (`[rows, take, vocab]`) into the running
-    /// per-term max `pooled` (`[rows, vocab]`, f32). `keep` is the block's
-    /// `[rows, take, 1]` slice of the position mask, `open` the vocabulary
-    /// mask. `max` is exact across any blocking, and every weight is >= 0, so
-    /// the accumulator starts at zero.
-    fn accumulate(
-        &self,
-        pooled: &Tensor,
-        logits: &Tensor,
-        keep: &Tensor,
-        open: &Tensor,
-    ) -> CResult<Tensor> {
+    /// per-term max `pooled` (`[rows, vocab]`, f32) of the *shifted* logit
+    /// of the positions that may speak. `keep` is the block's `[rows, take,
+    /// 1]` slice of the position mask. Only the reduction touches the
+    /// per-position tensor: `relu`, `ln(1 + x)` and the vocabulary mask `open`
+    /// (0 or 1) are monotone, so they commute with the max over positions and
+    /// run once per row in [`Self::finish`]. `max` is exact across any
+    /// blocking, and the accumulator starts at zero because a masked position
+    /// contributes zero.
+    fn accumulate(&self, pooled: &Tensor, logits: &Tensor, keep: &Tensor) -> CResult<Tensor> {
         // The reference multiplies the *shifted* logit by the mask before relu.
-        let shifted = ((logits.to_dtype(DType::F32)? - self.logit_shift)?.broadcast_mul(open)?)
-            .broadcast_mul(keep)?;
-        let weights = (shifted.relu()? + 1.0)?.log()?;
-        pooled.maximum(&weights.max(1)?)
+        let shifted = (logits.to_dtype(DType::F32)? - self.logit_shift)?.broadcast_mul(keep)?;
+        pooled.maximum(&shifted.max(1)?)
+    }
+
+    /// Turn the accumulated max of shifted logits into term weights
+    /// `ln(1 + relu(max))`, zero for a masked vocabulary entry (`open`:
+    /// `[1, vocab]`).
+    fn finish(&self, pooled: &Tensor, open: &Tensor) -> CResult<Tensor> {
+        (pooled.broadcast_mul(open)?.relu()? + 1.0)?.log()
     }
 
     /// Fold the vocabulary onto canonical terms (max per term), on the host.
@@ -752,7 +856,7 @@ impl SpladePooling {
             let (batch, seq, _) = logits.dims3()?;
             let mask = PoolMask::new(self, rows, seq, vocab_size, logits.device())?;
             let zeros = Tensor::zeros((batch, vocab_size), DType::F32, logits.device())?;
-            self.fold(&self.accumulate(&zeros, logits, &mask.keep, &mask.open)?)
+            self.fold(&self.finish(&self.accumulate(&zeros, logits, &mask.keep)?, &mask.open)?)
         };
         inner().map_err(|error| {
             MinSyncError::Embedding(format!("native sparse pooling failed: {error}"))
@@ -1235,6 +1339,140 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    fn random(shape: &[usize], next: &mut impl FnMut() -> f32, device: &Device) -> Tensor {
+        let count: usize = shape.iter().product();
+        Tensor::from_vec(
+            (0..count).map(|_| next()).collect::<Vec<_>>(),
+            shape,
+            device,
+        )
+        .unwrap()
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a.to_device(&Device::Cpu).unwrap() - b.to_device(&Device::Cpu).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn fused_attention_matches_tiled_attention_with_padding_and_a_sliding_window() {
+        // Real head count and head_dim, a sequence longer than the 256-row
+        // tile, right padding on the second row and a sliding-window mask.
+        let Ok(device) = Device::new_metal(0) else {
+            eprintln!("no Metal device: the fused kernel is not available here");
+            return;
+        };
+        let (batch, heads, seq, dim) = (2usize, 12usize, 300usize, 64usize);
+        let mut next = lcg(0x9E37_79B9_7F4A_7C15);
+        let q = random(&[batch, heads, seq, dim], &mut next, &device);
+        let k = random(&[batch, heads, seq, dim], &mut next, &device);
+        let v = random(&[batch, heads, seq, dim], &mut next, &device);
+        let mut mask = vec![0f32; batch * seq * seq];
+        for row in 0..batch {
+            let length = if row == 0 { seq } else { 211 };
+            for query in 0..seq {
+                for key in 0..seq {
+                    if key >= length || key.abs_diff(query) > 64 {
+                        mask[(row * seq + query) * seq + key] = -1e4;
+                    }
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask, (batch, 1, seq, seq), &device).unwrap();
+        let scale = (dim as f32).powf(-0.5);
+        let tiled = attend(AttentionBackend::Tiled, &q, &k, &v, &mask, scale, 256).unwrap();
+        let fused = attend(AttentionBackend::Sdpa, &q, &k, &v, &mask, scale, 256).unwrap();
+        assert_eq!(tiled.dims(), fused.dims());
+        // Rows at or beyond a row's length are padding; only real rows are read.
+        let real = |t: &Tensor| t.narrow(2, 0, 211).unwrap();
+        let diff = max_abs_diff(&real(&tiled), &real(&fused));
+        assert!(diff < 1e-4, "fused vs tiled attention differ by {diff}");
+    }
+
+    #[test]
+    fn the_fused_kernel_is_only_chosen_where_it_can_honor_the_mask() {
+        let metal = Device::new_metal(0);
+        if let Ok(metal) = &metal {
+            assert_eq!(
+                AttentionBackend::resolve(metal, 64, 128),
+                AttentionBackend::Sdpa
+            );
+            // Head sizes the kernel is not built for.
+            assert_eq!(
+                AttentionBackend::resolve(metal, 8, 128),
+                AttentionBackend::Tiled
+            );
+            // A single query row takes the kernel's vector path, which has no mask.
+            assert_eq!(
+                AttentionBackend::resolve(metal, 64, 1),
+                AttentionBackend::Tiled
+            );
+        }
+        assert_eq!(
+            AttentionBackend::resolve(&Device::Cpu, 64, 128),
+            AttentionBackend::Tiled
+        );
+    }
+
+    #[test]
+    fn the_reported_attention_name_follows_the_backend_actually_used() {
+        // The tiny fixture has head_dim 8 and runs on CPU: tiled either way.
+        assert_eq!(load_model(DType::F32).0.attention_name(), "tiled");
+    }
+
+    #[test]
+    fn layer_norm_matches_the_textbook_formula_on_every_device() {
+        let weight_values: Vec<f32> = (0..24).map(|i| 0.5 + i as f32 * 0.05).collect();
+        let mut devices = vec![Device::Cpu];
+        if let Ok(metal) = Device::new_metal(0) {
+            devices.push(metal);
+        }
+        let mut next = lcg(0xD1B5_4A32_D192_ED03);
+        let input: Vec<f32> = (0..5 * 24).map(|_| next() * 6.0 + 1.0).collect();
+        let expected: Vec<f32> = input
+            .chunks(24)
+            .flat_map(|row| {
+                let mean = row.iter().sum::<f32>() / 24.0;
+                let var = row.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / 24.0;
+                row.iter()
+                    .zip(&weight_values)
+                    .map(|(x, w)| (x - mean) / (var + 1e-5).sqrt() * w)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for device in devices {
+            let weight = Tensor::from_vec(weight_values.clone(), 24, &device).unwrap();
+            let norm = Norm::new(weight, 1e-5).unwrap();
+            let x = Tensor::from_vec(input.clone(), (1, 5, 24), &device).unwrap();
+            let got = norm.forward(&x).unwrap();
+            let want = Tensor::from_vec(expected.clone(), (1, 5, 24), &Device::Cpu).unwrap();
+            let diff = max_abs_diff(&got, &want);
+            assert!(
+                diff < 1e-4,
+                "{:?}: layer norm off by {diff}",
+                device.location()
+            );
         }
     }
 }
