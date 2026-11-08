@@ -152,7 +152,7 @@ pub enum Commands {
         #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_REQUEST_BYTES)]
         max_request_bytes: usize,
         /// Directory for the `pid`, `host`, `port` and `lock` files.
-        /// Defaults to ~/.cache/minsync/serve/<model instance>.
+        /// Defaults to ~/.cache/im-not-llm/serve/<model instance>.
         #[arg(long, value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
         /// Native embedder id to serve. Defaults to the workspace's

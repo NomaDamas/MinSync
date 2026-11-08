@@ -1,13 +1,16 @@
 //! Node-API binding for MinSync's native embedder.
 //!
-//! Inference is `minsync::embedder::session::NativeSession`, the engine behind
-//! `minsync sync` / `minsync query`: same weights and cache, same batch planner
-//! and padded-token cap, same per-batch deadline. This crate only converts
+//! Inference is `inl_text::TextSession`, the engine im-not-llm exposes and the
+//! one behind `minsync sync` / `minsync query`: same weights and cache, same
+//! batch planner and padded-token cap, same per-batch deadline. This crate only
+//! converts MinSync's `[embedder]` settings into the engine's options, maps
 //! types and maps errors. Work runs on tokio's blocking pool, never on the JS
 //! thread.
 
+use inl_core::InlError;
+use inl_text::{TextIdentity, TextSession};
 use minsync::config::{Config, DEFAULT_EMBEDDER_ID};
-use minsync::embedder::session::NativeSession;
+use minsync::embedder::native::text_options;
 use minsync::error::MinSyncError;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -64,6 +67,11 @@ fn to_napi(error: MinSyncError) -> Error {
     code.error(error)
 }
 
+/// An engine failure, classified the same way a MinSync failure is.
+fn engine_to_napi(error: InlError) -> Error {
+    to_napi(MinSyncError::from(error))
+}
+
 /// Embedder settings, named after the `[embedder]` keys of `config.toml`
 /// (camelCase). Omitted fields take the CLI's defaults.
 #[napi(object)]
@@ -90,8 +98,8 @@ pub struct EmbedderOptions {
     pub timeout_seconds: Option<u32>,
     /// Per-forward-pass deadline; overrides `timeoutSeconds` and the CPU floor.
     pub per_batch_timeout_seconds: Option<u32>,
-    /// Model cache directory. Without it `HF_HOME`, then
-    /// `FASTEMBED_CACHE_DIR`, then `~/.cache/minsync/models`, as the CLI.
+    /// Model cache directory. Without it `HF_HOME`, then `INL_CACHE_DIR`, then
+    /// `~/.cache/im-not-llm/models`, as the CLI.
     pub model_cache_dir: Option<String>,
     /// Release the model after this many idle seconds; it reloads on the next
     /// call. Default: stay resident until `unload()` / `dispose()`.
@@ -139,10 +147,10 @@ impl AbortHandle {
 
 async fn abortable<T>(
     abort: Option<&AbortHandle>,
-    work: impl Future<Output = minsync::error::Result<T>>,
+    work: impl Future<Output = std::result::Result<T, InlError>>,
 ) -> Result<T> {
     let Some(abort) = abort else {
-        return work.await.map_err(to_napi);
+        return work.await.map_err(engine_to_napi);
     };
     let mut aborted = abort.tx.subscribe();
     let aborted_error = || ErrorCode::Aborted.error("embedding call was aborted");
@@ -152,7 +160,7 @@ async fn abortable<T>(
     tokio::select! {
         biased;
         _ = aborted.wait_for(|aborted| *aborted) => Err(aborted_error()),
-        result = work => result.map_err(to_napi),
+        result = work => result.map_err(engine_to_napi),
     }
 }
 
@@ -160,7 +168,9 @@ fn seconds(value: u32) -> u64 {
     u64::from(value)
 }
 
-fn build_session(options: EmbedderOptions) -> minsync::error::Result<NativeSession> {
+/// Build a session from the JS options, going through the same `[embedder]`
+/// settings and the same config→options mapping the CLI uses.
+fn build_session(options: EmbedderOptions) -> std::result::Result<TextSession, MinSyncError> {
     let mut settings = Config::default_for("node").embedder;
     settings.id = options
         .id
@@ -183,14 +193,15 @@ fn build_session(options: EmbedderOptions) -> minsync::error::Result<NativeSessi
     let idle = options
         .idle_unload_seconds
         .map(|value| Duration::from_secs(seconds(value)));
-    NativeSession::new(&settings, idle)
+    let options = text_options(&settings)?;
+    TextSession::new(options, idle).map_err(MinSyncError::from)
 }
 
 /// In-process native embedder. The model loads on first use and stays
 /// resident until `unload()`, `dispose()` or the idle timeout.
 #[napi]
 pub struct NativeEmbedder {
-    session: Arc<NativeSession>,
+    session: Arc<TextSession>,
 }
 
 #[napi]
@@ -222,9 +233,9 @@ impl NativeEmbedder {
     /// resident, since those are only known once it is.
     #[napi]
     pub async fn identity(&self) -> Result<EmbedderIdentity> {
-        let identity = self.session.identity().await.map_err(to_napi)?;
+        let identity: TextIdentity = self.session.identity().await.map_err(engine_to_napi)?;
         Ok(EmbedderIdentity {
-            id: identity.id,
+            id: format!("native:{}", identity.id),
             dimension: identity.dimension as u32,
             dtype: identity.dtype.to_string(),
             device: identity.device.to_string(),

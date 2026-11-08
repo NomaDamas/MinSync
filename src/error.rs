@@ -69,6 +69,24 @@ pub enum MinSyncError {
     Stage { code: &'static str, message: String },
 }
 
+/// An im-not-llm engine failure, classified into MinSync's error vocabulary so
+/// exit codes and messages stay stable across the crate boundary: a timeout
+/// keeps [`MinSyncError::exit_code`] 7, a bad setting stays a config error, and
+/// a failed load or forward pass is an embedding error.
+impl From<inl_core::InlError> for MinSyncError {
+    fn from(error: inl_core::InlError) -> Self {
+        match error {
+            inl_core::InlError::Config(message) => Self::Config(message),
+            inl_core::InlError::Inference(message) => Self::Embedding(message),
+            inl_core::InlError::Timeout(message) => Self::Timeout(message),
+            inl_core::InlError::InvalidInput(message) => Self::Config(message),
+            inl_core::InlError::Io(error) => Self::Io(error),
+            inl_core::InlError::Json(error) => Self::Json(error),
+            inl_core::InlError::Other(message) => Self::Other(message),
+        }
+    }
+}
+
 impl MinSyncError {
     pub fn stage(code: &'static str, message: impl Into<String>) -> Self {
         Self::Stage {
@@ -107,5 +125,33 @@ mod tests {
         ] {
             assert_ne!(other, 7);
         }
+    }
+
+    #[test]
+    fn engine_errors_map_to_their_min_sync_class_and_exit_code() {
+        let cases = [
+            (inl_core::InlError::Timeout("stuck".into()), 7, "stuck"),
+            (inl_core::InlError::Config("bad".into()), 1, "bad"),
+            (inl_core::InlError::Inference("failed".into()), 5, "failed"),
+            (inl_core::InlError::InvalidInput("bad".into()), 1, "bad"),
+            (inl_core::InlError::Other("other".into()), 1, "other"),
+        ];
+        for (engine, code, payload) in cases {
+            let mapped: MinSyncError = engine.into();
+            assert_eq!(mapped.exit_code(), code, "{mapped}");
+            assert!(mapped.to_string().contains(payload), "{mapped}");
+        }
+        assert!(matches!(
+            MinSyncError::from(inl_core::InlError::Timeout("stuck".into())),
+            MinSyncError::Timeout(_)
+        ));
+        assert!(matches!(
+            MinSyncError::from(inl_core::InlError::Inference("failed".into())),
+            MinSyncError::Embedding(_)
+        ));
+        assert!(matches!(
+            MinSyncError::from(inl_core::InlError::Config("bad".into())),
+            MinSyncError::Config(_)
+        ));
     }
 }

@@ -22,7 +22,7 @@ fn minsync(root: &Path, cache: &Path) -> Command {
         .env("MINSYNC_SERVER", "off")
         .env("HF_HOME", cache)
         .env("HF_HUB_OFFLINE", "1")
-        .env("FASTEMBED_CACHE_DIR", cache);
+        .env("INL_CACHE_DIR", cache);
     command
 }
 

@@ -308,6 +308,8 @@ mod tests {
             "max_inputs": max_inputs, "instance": instance, "pid": 1,
             "host": addr.ip().to_string(), "port": addr.port(),
             "url": format!("http://{addr}"), "version": "test",
+            "uptime_seconds": 1, "requests_total": 0, "loaded": true,
+            "build": { "version": "test", "features": [] },
         })
     }
 
@@ -469,6 +471,8 @@ mod tests {
             "device": "cpu", "attention": "eager", "max_length": 2048, "max_inputs": 512,
             "instance": INSTANCE, "pid": 1, "host": addr.ip().to_string(),
             "port": addr.port(), "url": format!("http://{addr}"), "version": "test",
+            "uptime_seconds": 1, "requests_total": 0, "loaded": true,
+            "build": { "version": "test", "features": [] },
         }))
         .unwrap();
         // Answers `/health`; reads `/embed` and closes without a response.

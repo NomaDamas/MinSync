@@ -25,6 +25,19 @@ exclude = [
 [workspace]
 members = [".", "bindings/node"]
 
+[features]
+default = []
+# Forwarded to the im-not-llm engine crates; see their manifests for what each
+# one enables (NVIDIA GPUs, Apple Accelerate, Intel MKL).
+cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-server/cuda"]
+accelerate = [
+    "inl-core/accelerate",
+    "inl-text/accelerate",
+    "inl-sparse/accelerate",
+    "inl-server/accelerate",
+]
+mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-server/mkl"]
+
 [dependencies]
 chunk = "0.10"
 clap = { version = "4", features = ["derive"] }
@@ -51,20 +64,14 @@ arrow-schema = "58.3.0"
 futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 libc = "0.2"
-hf-hub = { version = "0.5.0", default-features = false, features = [
-    "ureq",
-    "rustls-tls",
-] }
-tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
 parking_lot = "0.12"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "0.22"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11.0", features = ["metal"] }
-candle-nn = { version = "0.11.0", features = ["metal"] }
+# Model runtimes (candle text/sparse engines and the loopback daemon) live in
+# im-not-llm; MinSync is the text-only indexer that drives them.
+inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
+inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
+inl-sparse = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
+inl-server = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
 
 # candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
 # float16x8_t which now requires the unstable stdarch_neon_f16 feature.

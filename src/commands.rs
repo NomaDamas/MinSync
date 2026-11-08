@@ -787,20 +787,20 @@ async fn serve(
     let started = if args.sparse {
         let settings = serve_sparse_settings(minsync_dir, args.embedder)?;
         let engine = crate::sparse::native::NativeSparseEncoder::from_config(&settings)?;
-        crate::serve::start_sparse(std::sync::Arc::new(engine), options).await?
+        crate::serve::Daemon::spawn(crate::serve::Engine::sparse(engine.engine()), options).await?
     } else {
         let settings = serve_settings(minsync_dir, args.embedder)?;
         let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
-        crate::serve::start(std::sync::Arc::new(engine), options).await?
+        crate::serve::Daemon::spawn(crate::serve::Engine::dense(engine.engine()), options).await?
     };
     let server = match started {
-        crate::serve::Started::Adopted(health) => {
+        crate::serve::Daemon::Adopted { health, .. } => {
             print("adopted", &health)?;
             return Ok(0);
         }
-        crate::serve::Started::Serving(server) => server,
+        crate::serve::Daemon::Serving(server) => server,
     };
-    print("serving", server.health())?;
+    print("serving", &server.health())?;
     let reason = server.run_until(shutdown_signal()).await?;
     tracing::info!(reason = reason.as_str(), "minsync serve stopped");
     Ok(reason.exit_code())

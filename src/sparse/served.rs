@@ -341,6 +341,8 @@ mod tests {
             "max_inputs": max_inputs, "instance": instance, "pid": 1,
             "host": addr.ip().to_string(), "port": addr.port(),
             "url": format!("http://{addr}"), "version": "test",
+            "uptime_seconds": 1, "requests_total": 0, "loaded": true,
+            "build": { "version": "test", "features": [] },
         })
     }
 
