@@ -582,11 +582,21 @@ minsync sync
 minsync query "검색어" --k 5
 ```
 
-Existing indexes built with a 768-d TEI model must not mix 1024-d vectors. Switch embedders, then rebuild:
+### Changing the embedder of an existing index
+
+An index holds the vectors of one dense embedder. `minsync sync` records which one (model, dimension and passage prefix) in `cursor.json` and compares it with `[embedder]` on every run, so a switch can never mix two models' vectors. Edit `[embedder]` (and `[vectorstore.options] dimension`) to the new model, then:
 
 ```bash
-minsync sync --full
+minsync sync --reembed
 ```
+
+`--reembed` rebuilds every dense vector with the configured embedder from the chunk text already in the store: no file is re-read or re-chunked, and the sparse (SPLADE) vectors are carried over, so it costs one embedding pass and no SPLADE encoding. The new vectors are written to a staging store next to the live one (`store.reembed`), which replaces it in one rename when the last row is across; the live index keeps serving sparse queries until then. It is safe to interrupt: the next `sync --reembed` continues after the last committed page of 256 chunks. Files that changed in the meantime are picked up by the sync that follows the rebuild. `--reembed` cannot be combined with `--full` or `--dry-run`, and prints `reembedded` in its JSON result.
+
+Until the rebuild finishes, anything that would mix the two models stops with exit code `8`: `minsync sync`, `query --mode vector|hybrid`, `check`, `verify`, `optimize` and `watch` name the old and new model and point at `--reembed`. `query --mode sparse` is never refused. Only settings that change the stored vector count as a switch: the model, the dimension and `passage_prefix`. `dtype`, `device`, `batch_size`, timeouts and `query_prefix` do not.
+
+An index written by an earlier version has no recorded dimension or prefix, so only a change of model is noticed for it until its next sync records them.
+
+`minsync init --force --embedder <id>` still works but discards the index and re-reads every file; prefer `--reembed`.
 
 ### EmbeddingGemma 2
 

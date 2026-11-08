@@ -41,6 +41,10 @@ pub struct SyncResult {
     /// content hash, same model) instead of being encoded again.
     #[serde(default)]
     pub sparse_reused: usize,
+    /// Chunks whose dense vector `sync --reembed` rebuilt with the
+    /// configured embedder in this run.
+    #[serde(default)]
+    pub reembedded: usize,
     pub estimated_tokens: usize,
     pub files_checked: usize,
     pub freshness_check_only: bool,

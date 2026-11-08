@@ -17,6 +17,7 @@ pub const EXIT_PARTIAL_SYNC: i32 = 6;
 pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
     if let Commands::Sync {
         full,
+        reembed,
         dry_run,
         wait,
         batch_size,
@@ -35,6 +36,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
             root,
             &minsync_dir,
             full,
+            reembed,
             dry_run,
             wait,
             batch_size,
@@ -222,6 +224,7 @@ async fn sync(
     root: PathBuf,
     minsync_dir: &std::path::Path,
     full: bool,
+    reembed: bool,
     dry_run: bool,
     wait: bool,
     batch_size: Option<usize>,
@@ -242,17 +245,28 @@ async fn sync(
     let ms = ms.with_sparse_encoder(sparse_encoder(&config)?);
     let chunker = crate::chunker::create_chunker(&config)?;
     let embedder = crate::embedder::create_embedder(&config)?;
-    let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
-    let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
-    let result = ms
-        .sync_locked(
+    let result = if reembed {
+        // The rebuild opens its own stores: the live one at the dimension the
+        // index holds, a staging one at the configured dimension.
+        ms.reembed_locked(chunker.as_ref(), embedder.as_ref())
+            .await?
+    } else {
+        // Before the store is opened: it would object to another dimension
+        // with its own error, not the cause.
+        if !dry_run {
+            crate::query::ensure_dense_matches(minsync_dir, &config)?;
+        }
+        let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
+        let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
+        ms.sync_locked(
             chunker.as_ref(),
             embedder.as_ref(),
             store.as_mut(),
             full,
             dry_run,
         )
-        .await?;
+        .await?
+    };
 
     // stdout carries the event stream when `--progress jsonl` is on, so the
     // human summary moves to stderr and the final JSON result becomes the
@@ -350,8 +364,14 @@ async fn query(
     } else {
         QueryMode::Vector
     });
+    if matches!(mode, QueryMode::Vector | QueryMode::Hybrid) {
+        crate::query::ensure_dense_matches(minsync_dir, &config)?;
+    }
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
-    let store = crate::vectorstore::create_vectorstore_readonly(&config, &store_path)?;
+    // Dense modes were just checked against the cursor, so the configured and
+    // the stored width agree; a sparse query must not care that they do not.
+    let store_config = crate::embedder_identity::config_at_stored_dimension(minsync_dir, &config);
+    let store = crate::vectorstore::create_vectorstore_readonly(&store_config, &store_path)?;
     // Each side is built only for the modes that use it: a sparse query never
     // constructs the dense embedder (so it needs none of its credentials), a
     // vector query never loads SPLADE.
@@ -433,6 +453,7 @@ fn optimize(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> 
     require_initialized(minsync_dir)?;
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
+    crate::query::ensure_dense_matches(minsync_dir, &config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
     let started = std::time::Instant::now();
@@ -464,6 +485,7 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let embedder = crate::embedder::create_embedder(&config)?;
     let encoder = sparse_encoder(&config)?;
+    crate::query::ensure_dense_matches(minsync_dir, &config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 
@@ -528,6 +550,7 @@ async fn verify(
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let chunker = crate::chunker::create_chunker(&config)?;
+    crate::query::ensure_dense_matches(minsync_dir, &config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
     let sample_count = if all { None } else { Some(sample) };
@@ -592,6 +615,7 @@ async fn watch(
     } else {
         crate::embedder::create_embedder(&config)?
     };
+    crate::query::ensure_dense_matches(minsync_dir, &config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
 

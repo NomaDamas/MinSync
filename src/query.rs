@@ -8,6 +8,48 @@ use crate::types::QueryResult;
 use crate::vectorstore::{Filter, QueryHit, VectorStore};
 use std::path::Path;
 
+/// Refuse a dense search against vectors another embedder built.
+///
+/// The stored vectors and the query vector must come from the same model;
+/// otherwise every score is meaningless (and, at another width, the store
+/// would answer with its own dimension error instead of the cause). Sparse
+/// search does not use dense vectors and is never refused here. Callers that
+/// open the store themselves run this first, before it can object.
+pub fn ensure_dense_matches(minsync_dir: &Path, config: &Config) -> Result<()> {
+    if config.is_sparse_only() {
+        return Ok(());
+    }
+    let wanted = crate::embedder_identity::EmbedderIdentity::from_config(config)?;
+    refuse_if_changed(minsync_dir, &wanted)
+}
+
+/// The same check against the embedder that will embed the query.
+fn ensure_dense_matches_embedder(
+    minsync_dir: &Path,
+    config: &Config,
+    embedder: &dyn Embedder,
+) -> Result<()> {
+    if config.is_sparse_only() {
+        return Ok(());
+    }
+    let wanted = crate::embedder_identity::EmbedderIdentity::of(config, embedder)?;
+    refuse_if_changed(minsync_dir, &wanted)
+}
+
+fn refuse_if_changed(
+    minsync_dir: &Path,
+    wanted: &crate::embedder_identity::EmbedderIdentity,
+) -> Result<()> {
+    let cursor_path = minsync_dir.join("cursor.json");
+    if !cursor_path.exists() {
+        return Ok(());
+    }
+    match Cursor::load(&cursor_path)?.embedder_difference(wanted) {
+        Some(why) => Err(MinSyncError::EmbedderChanged { why }),
+        None => Ok(()),
+    }
+}
+
 /// Search the index.
 ///
 /// `vector` needs the dense `embedder`; `sparse` needs the sparse `encoder`;
@@ -30,6 +72,9 @@ pub async fn query(
 
     let config = Config::load(&minsync_dir.join("config.toml"))?;
     let index = IndexedBy::load(minsync_dir, &config)?;
+    if matches!(mode, QueryMode::Vector | QueryMode::Hybrid) {
+        ensure_dense_matches_embedder(minsync_dir, &config, embedder)?;
+    }
 
     let mut filters = vec![Filter::Eq(
         "source_id".to_string(),
@@ -259,18 +304,29 @@ mod tests {
     }
 
     fn write_query_state(dir: &TempDir, source_id: &str) {
+        write_query_state_for(dir, source_id, "mock");
+    }
+
+    /// A finished index whose dense vectors `model` built (the id the
+    /// embedder passed to `query` reports).
+    fn write_query_state_for(dir: &TempDir, source_id: &str, model: &str) {
         let minsync_dir = dir.path().join(".minsync");
         std::fs::create_dir_all(&minsync_dir).expect("create .minsync");
 
-        Config::default_for(source_id)
+        let config = Config::default_for(source_id);
+        config
             .save(&minsync_dir.join("config.toml"))
             .expect("save config");
+        let mut identity =
+            crate::embedder_identity::EmbedderIdentity::from_config(&config).expect("identity");
+        identity.model = model.to_string();
         Cursor {
             source_id: source_id.to_string(),
             last_synced_at: "2026-05-28T00:00:00Z".to_string(),
             manifest_hash: "sha256:abc".to_string(),
             chunk_schema_id: "schema-1".to_string(),
-            embedder_id: "mock".to_string(),
+            embedder_id: identity.model.clone(),
+            embedder: Some(identity),
             collection_path: "store".to_string(),
             sparse_id: Some("fake/sparse".to_string()),
         }
@@ -518,7 +574,7 @@ mod tests {
         let mut store = InMemoryStore::new();
         let embedder = SentinelEmbedder;
         let source_id = "source-1";
-        write_query_state(&dir, source_id);
+        write_query_state_for(&dir, source_id, "sentinel");
 
         store
             .upsert(&[
@@ -775,6 +831,67 @@ mod tests {
         .unwrap_err();
         assert!(matches!(none, MinSyncError::SparseNotReady(_)), "{none}");
         assert!(none.to_string().contains("minsync sync"));
+    }
+
+    #[tokio::test]
+    async fn dense_search_is_refused_when_the_embedder_changed_but_sparse_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write_query_state_for(&dir, "source-1", "built-by-other");
+        let minsync_dir = dir.path().join(".minsync");
+        let store = sparse_store("source-1");
+
+        for mode in [QueryMode::Vector, QueryMode::Hybrid] {
+            let error = query(
+                &minsync_dir,
+                "t1",
+                3,
+                &MockEmbedder,
+                Some(&FakeSparse("fake/sparse")),
+                &store,
+                None,
+                mode,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, MinSyncError::EmbedderChanged { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("built-by-other"), "{error}");
+        }
+        let sparse = query(
+            &minsync_dir,
+            "t1",
+            3,
+            &MockEmbedder,
+            Some(&FakeSparse("fake/sparse")),
+            &store,
+            None,
+            QueryMode::Sparse,
+        )
+        .await;
+        assert!(sparse.is_ok(), "{sparse:?}");
+    }
+
+    #[test]
+    fn a_cursor_from_before_identities_is_judged_by_its_model_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        write_query_state_for(&dir, "source-1", "Qwen/Qwen3-Embedding-0.6B");
+        let minsync_dir = dir.path().join(".minsync");
+        let config = Config::load(&minsync_dir.join("config.toml")).unwrap();
+        let mut cursor = Cursor::load(&minsync_dir.join("cursor.json")).unwrap();
+        cursor.embedder = None;
+        // Written by an older minsync, with the provider prefix kept.
+        cursor.embedder_id = format!("native:{}", cursor.embedder_id);
+        cursor.save(&minsync_dir.join("cursor.json")).unwrap();
+        ensure_dense_matches(&minsync_dir, &config).expect("same model, prefix ignored");
+
+        cursor.embedder_id = "other/model".to_string();
+        cursor.save(&minsync_dir.join("cursor.json")).unwrap();
+        assert!(matches!(
+            ensure_dense_matches(&minsync_dir, &config),
+            Err(MinSyncError::EmbedderChanged { .. })
+        ));
     }
 
     #[tokio::test]

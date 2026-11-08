@@ -44,6 +44,7 @@ async fn synced_workspace() -> tempfile::TempDir {
         manifest_hash: "sha256:lock".to_string(),
         chunk_schema_id: "recursive".to_string(),
         embedder_id: config.embedder.id.clone(),
+        embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: Some(model.clone()),
     }

@@ -206,6 +206,13 @@ mod tests {
     }
 
     impl VectorStore for StateTrackingStore {
+        fn scan_chunks(
+            &self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<crate::vectorstore::StoredChunk>> {
+            self.inner.scan_chunks(after, limit)
+        }
         fn upsert(&mut self, docs: &[Document]) -> Result<()> {
             self.inner.upsert(docs)
         }

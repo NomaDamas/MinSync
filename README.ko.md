@@ -488,11 +488,21 @@ minsync sync
 minsync query "검색어" --k 5
 ```
 
-768차원 TEI 인덱스는 1024차원 벡터와 섞으면 안 됩니다. embedder를 바꾼 뒤에는 전체를 다시 임베딩하세요.
+### 기존 index의 embedder 바꾸기
+
+index에는 dense embedder 하나의 벡터만 들어 있습니다. `minsync sync`는 어떤 embedder(모델, 차원, passage prefix)로 만들었는지 `cursor.json`에 기록하고 매번 `[embedder]`와 비교하므로, 모델을 바꿔도 두 모델의 벡터가 섞일 수 없습니다. `[embedder]`(와 `[vectorstore.options] dimension`)를 새 모델로 고친 뒤 실행하세요.
 
 ```bash
-minsync sync --full
+minsync sync --reembed
 ```
+
+`--reembed`는 store에 이미 있는 chunk 텍스트로 모든 dense 벡터를 설정된 embedder로 다시 만듭니다. 파일을 다시 읽거나 다시 chunking하지 않고 sparse(SPLADE) 벡터는 그대로 옮기므로, 임베딩 한 번 분량만 들고 SPLADE 인코딩은 필요 없습니다. 새 벡터는 live store 옆의 staging store(`store.reembed`)에 쓰고, 마지막 행까지 옮기면 rename 한 번으로 교체합니다. 그때까지 live index는 sparse 질의를 계속 받습니다. 중간에 끊어도 안전하며, 다음 `sync --reembed`가 마지막으로 commit한 256개 chunk 페이지 다음부터 이어갑니다. 그동안 바뀐 파일은 재구축 뒤에 이어지는 sync가 반영합니다. `--reembed`는 `--full`, `--dry-run`과 함께 쓸 수 없고 JSON 결과에 `reembedded`를 출력합니다.
+
+재구축이 끝나기 전에는 두 모델을 섞게 될 동작이 종료 코드 `8`로 멈춥니다. `minsync sync`, `query --mode vector|hybrid`, `check`, `verify`, `optimize`, `watch`는 이전 모델과 새 모델을 알려 주고 `--reembed`를 안내합니다. `query --mode sparse`는 막지 않습니다. 저장된 벡터를 바꾸는 설정만 교체로 취급합니다. 모델, 차원, `passage_prefix`입니다. `dtype`, `device`, `batch_size`, timeout, `query_prefix`는 해당하지 않습니다.
+
+이전 버전이 만든 index에는 차원과 prefix가 기록되어 있지 않으므로, 다음 sync가 기록하기 전까지는 모델 변경만 감지합니다.
+
+`minsync init --force --embedder <id>`도 여전히 되지만 index를 버리고 모든 파일을 다시 읽으므로 `--reembed`를 권장합니다.
 
 ### EmbeddingGemma 2
 

@@ -20,7 +20,9 @@ pub use index::IndexingConfig;
 use crate::error::{MinSyncError, Result};
 use crate::sparse::SparseVector;
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, VectorStore};
+use crate::vectorstore::{
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, VectorStore,
+};
 use lancedb::DistanceType;
 use std::path::Path;
 use std::sync::mpsc;
@@ -195,6 +197,10 @@ impl VectorStore for LanceDbStore {
 
     fn documents(&self) -> Result<Vec<Document>> {
         self.request(Command::Documents)
+    }
+
+    fn scan_chunks(&self, after: Option<&str>, limit: usize) -> Result<Vec<StoredChunk>> {
+        self.request(|resp| Command::ScanChunks(after.map(str::to_string), limit, resp))
     }
 
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
