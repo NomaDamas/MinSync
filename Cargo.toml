@@ -68,10 +68,10 @@ parking_lot = "0.12"
 
 # Model runtimes (candle text/sparse engines and the loopback daemon) live in
 # im-not-llm; MinSync is the text-only indexer that drives them.
-inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
-inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
-inl-sparse = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
-inl-server = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
+inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "55acc36" }
+inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "55acc36" }
+inl-sparse = { git = "https://github.com/NomaDamas/im-not-llm", rev = "55acc36" }
+inl-server = { git = "https://github.com/NomaDamas/im-not-llm", rev = "55acc36", default-features = false }
 
 # candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
 # float16x8_t which now requires the unstable stdarch_neon_f16 feature.

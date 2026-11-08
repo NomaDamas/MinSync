@@ -13,8 +13,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 minsync = { path = "../.." }
-inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
-inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "6b4346b" }
+inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "55acc36" }
+inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "55acc36" }
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }

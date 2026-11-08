@@ -3553,7 +3553,7 @@ dependencies = [
 [[package]]
 name = "inl-core"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=6b4346b#6b4346b96f51d206c752dc8120441a341c4e030e"
+source = "git+https://github.com/NomaDamas/im-not-llm?rev=55acc36#55acc366fa9f1de6ad6042a6899fdb2213d72e62"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3571,12 +3571,11 @@ dependencies = [
 [[package]]
 name = "inl-server"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=6b4346b#6b4346b96f51d206c752dc8120441a341c4e030e"
+source = "git+https://github.com/NomaDamas/im-not-llm?rev=55acc36#55acc366fa9f1de6ad6042a6899fdb2213d72e62"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "clap",
  "fs2",
  "inl-core",
  "inl-sparse",
@@ -3593,7 +3592,7 @@ dependencies = [
 [[package]]
 name = "inl-sparse"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=6b4346b#6b4346b96f51d206c752dc8120441a341c4e030e"
+source = "git+https://github.com/NomaDamas/im-not-llm?rev=55acc36#55acc366fa9f1de6ad6042a6899fdb2213d72e62"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3609,7 +3608,7 @@ dependencies = [
 [[package]]
 name = "inl-text"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=6b4346b#6b4346b96f51d206c752dc8120441a341c4e030e"
+source = "git+https://github.com/NomaDamas/im-not-llm?rev=55acc36#55acc366fa9f1de6ad6042a6899fdb2213d72e62"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3627,7 +3626,7 @@ dependencies = [
 [[package]]
 name = "inl-vision"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=6b4346b#6b4346b96f51d206c752dc8120441a341c4e030e"
+source = "git+https://github.com/NomaDamas/im-not-llm?rev=55acc36#55acc366fa9f1de6ad6042a6899fdb2213d72e62"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5872,7 +5871,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -5891,7 +5890,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
