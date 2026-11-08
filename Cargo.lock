@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "minsync"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4688,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "minsync-node"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "minsync",
  "napi",
