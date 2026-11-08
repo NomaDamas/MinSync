@@ -67,8 +67,10 @@ pub enum Commands {
         /// chunk text already stored (no file is re-read, sparse vectors are
         /// kept), then sync as usual. Use it after changing `[embedder]` to
         /// another model, dimension or passage prefix. Safe to interrupt:
-        /// the next run continues where it stopped.
-        #[arg(long, conflicts_with_all = ["full", "dry_run"])]
+        /// the next run continues where it stopped. With `--dry-run` it only
+        /// probes the embedder (one short text) and reports what it would
+        /// rebuild, changing nothing.
+        #[arg(long, conflicts_with = "full")]
         reembed: bool,
         #[arg(long)]
         dry_run: bool,

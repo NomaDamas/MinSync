@@ -189,6 +189,32 @@ pub fn create_vectorstore_readonly(
     create_vectorstore_with_mode(config, store_path, true)
 }
 
+/// Read-only store opened at `dimension` instead of the configured one: the
+/// width the stored vector column actually has. A sparse query, or the old
+/// side of an embedder rebuild, reads an index whose dense width the current
+/// `[embedder]` no longer describes.
+pub fn create_vectorstore_readonly_with_dimension(
+    config: &Config,
+    store_path: &Path,
+    dimension: usize,
+) -> Result<Box<dyn VectorStore>> {
+    match config.vectorstore.id.as_str() {
+        "lancedb" => {
+            let mut indexing =
+                lancedb_store::IndexingConfig::from_options(Some(&config.vectorstore.options))?;
+            if dimension == crate::config::SPARSE_ONLY_DIMENSION {
+                indexing.build_ann_index = false;
+            }
+            Ok(Box::new(lancedb_store::LanceDbStore::open_readonly(
+                store_path, dimension, indexing,
+            )?))
+        }
+        other => Err(MinSyncError::Config(format!(
+            "unknown vectorstore id: {other}"
+        ))),
+    }
+}
+
 fn create_vectorstore_with_mode(
     config: &Config,
     store_path: &Path,

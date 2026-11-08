@@ -16,9 +16,6 @@ use std::path::Path;
 /// search does not use dense vectors and is never refused here. Callers that
 /// open the store themselves run this first, before it can object.
 pub fn ensure_dense_matches(minsync_dir: &Path, config: &Config) -> Result<()> {
-    if config.is_sparse_only() {
-        return Ok(());
-    }
     let wanted = crate::embedder_identity::EmbedderIdentity::from_config(config)?;
     refuse_if_changed(minsync_dir, &wanted)
 }
@@ -29,9 +26,6 @@ fn ensure_dense_matches_embedder(
     config: &Config,
     embedder: &dyn Embedder,
 ) -> Result<()> {
-    if config.is_sparse_only() {
-        return Ok(());
-    }
     let wanted = crate::embedder_identity::EmbedderIdentity::of(config, embedder)?;
     refuse_if_changed(minsync_dir, &wanted)
 }

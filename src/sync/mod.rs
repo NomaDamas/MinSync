@@ -165,21 +165,24 @@ impl MinSync {
     /// picked up. Takes the writer lock like `sync`.
     ///
     /// The rebuild reads the stored chunks, so it also covers a store whose
-    /// files are gone; the follow-up sync is what notices them.
+    /// files are gone; the follow-up sync is what notices them. With
+    /// `dry_run` it only probes the embedder and reports the plan.
     pub async fn reembed(
         &self,
         chunker: &dyn Chunker,
         embedder: &dyn Embedder,
+        dry_run: bool,
         wait_lock: bool,
     ) -> Result<SyncResult> {
         let _lock = FileLock::acquire(&self.minsync_dir.join("lock"), wait_lock)?;
-        self.reembed_locked(chunker, embedder).await
+        self.reembed_locked(chunker, embedder, dry_run).await
     }
 
     pub(crate) async fn reembed_locked(
         &self,
         chunker: &dyn Chunker,
         embedder: &dyn Embedder,
+        dry_run: bool,
     ) -> Result<SyncResult> {
         let config = Config::load(&self.minsync_dir.join("config.toml"))?;
         let cursor_path = self.minsync_dir.join("cursor.json");
@@ -190,6 +193,7 @@ impl MinSync {
         };
         let live = collection_store_path(&self.minsync_dir, &config.collection.path)?;
         let mut rebuilt: Option<reembed::Reembedded> = None;
+        let mut probed: Option<EmbedderIdentity> = None;
         // Nothing to rebuild on a workspace that was never synced (the next
         // sync builds it with this embedder) or when the vectors already
         // come from it and no rebuild was left half done.
@@ -200,19 +204,53 @@ impl MinSync {
         let swapped = marker
             .as_ref()
             .is_some_and(|marker| !self.minsync_dir.join(&marker.staging).exists());
+        let needs_rebuild = cursor.is_some() && (differs || marker.is_some()) && !swapped;
+
+        if dry_run {
+            let mut result = empty_sync_result(true, false);
+            result.dry_run = true;
+            let mut would = 0;
+            let mut resuming = false;
+            if needs_rebuild {
+                let target = reembed::probe(&config, embedder).await?;
+                let total = crate::vectorstore::create_vectorstore_readonly_with_dimension(
+                    &config,
+                    &live,
+                    crate::embedder_identity::stored_dimension(&self.minsync_dir, &config)?,
+                )?
+                .doc_count();
+                let open =
+                    |path: &Path| crate::vectorstore::create_vectorstore_readonly(&config, path);
+                let staged = reembed::staged_rows(&self.minsync_dir, &target, &open)?;
+                resuming = staged.is_some();
+                would = total.saturating_sub(staged.unwrap_or(0));
+                probed = Some(target);
+            }
+            result.would_reembed = Some(would);
+            result.probe = probed;
+            result.resuming = resuming;
+            result.already_up_to_date = !needs_rebuild && !swapped;
+            return Ok(result);
+        }
+
         if let (Some(old), Some(marker), true) = (&cursor, &marker, swapped) {
             let mut cursor = old.clone();
             cursor.embedder_id = marker.target.model.clone();
             cursor.embedder = Some(marker.target.clone());
             cursor.save(&cursor_path)?;
             reembed::finish(&self.minsync_dir);
-        } else if cursor.is_some() && (differs || marker.is_some()) {
+        } else if needs_rebuild {
+            // One short embedding before any staging store exists: a wrong
+            // `dimension`, an unloadable model or an unreachable endpoint
+            // stops here instead of after the first page.
+            probed = Some(reembed::probe(&config, embedder).await?);
             let make_store = |path: &Path| crate::vectorstore::create_vectorstore(&config, path);
             // The old vectors' store is read at the width it holds, not the
             // configured (new) one.
-            let live_store = crate::vectorstore::create_vectorstore_readonly(
-                &crate::embedder_identity::config_at_stored_dimension(&self.minsync_dir, &config),
+            let live_store = crate::vectorstore::create_vectorstore_readonly_with_dimension(
+                &config,
                 &live,
+                crate::embedder_identity::stored_dimension(&self.minsync_dir, &config)?,
             )?;
             let (outcome, target) = reembed::rebuild(
                 &self.minsync_dir,
@@ -245,6 +283,7 @@ impl MinSync {
             result.reembedded = rebuilt.embedded;
             result.embedded_texts += rebuilt.texts;
             result.embedding_api_calls += rebuilt.api_calls;
+            result.probe = probed;
         }
         Ok(result)
     }

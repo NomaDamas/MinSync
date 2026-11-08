@@ -70,6 +70,56 @@ fn save_marker(minsync_dir: &Path, marker: &Marker) -> Result<()> {
     Ok(())
 }
 
+/// Text the probe embeds: short, and ordinary enough for any model.
+const PROBE_TEXT: &str = "minsync embedder probe";
+
+/// Embed one short text with the configured embedder and check that what comes
+/// back is what the rest of the rebuild will assume: finite numbers, and the
+/// width `[vectorstore.options] dimension` promises. Run before a staging
+/// store exists, so a wrong dimension, an unloadable model or an unreachable
+/// endpoint costs one request instead of the first page of a rebuild.
+///
+/// A sparse-only target stores a placeholder and has no model to probe.
+pub(crate) async fn probe(config: &Config, embedder: &dyn Embedder) -> Result<EmbedderIdentity> {
+    let identity = EmbedderIdentity::of(config, embedder)?;
+    if config.is_sparse_only() {
+        return Ok(identity);
+    }
+    let mut answer =
+        embedder
+            .embed(&[PROBE_TEXT.to_string()])
+            .await
+            .map_err(|error| match error {
+                MinSyncError::Timeout(message) => {
+                    MinSyncError::Timeout(format!("embedder probe timed out: {message}"))
+                }
+                other => MinSyncError::Embedding(format!(
+                    "the embedder probe failed, nothing was rebuilt: {other}"
+                )),
+            })?;
+    let bad = |what: String| MinSyncError::Embedding(format!("the embedder probe {what}"));
+    if answer.len() != 1 {
+        return Err(bad(format!("returned {} vectors for 1 text", answer.len())));
+    }
+    let vector = answer.remove(0);
+    if vector.is_empty() {
+        return Err(bad("returned an empty vector".to_string()));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(bad("returned NaN or infinite numbers".to_string()));
+    }
+    if vector.len() != identity.dimension {
+        return Err(MinSyncError::Config(format!(
+            "the embedder produces {}-dimensional vectors but [vectorstore.options] dimension \
+             is {}: set `dimension = {}` and run `minsync sync --reembed` again",
+            vector.len(),
+            identity.dimension,
+            vector.len()
+        )));
+    }
+    Ok(identity)
+}
+
 /// Rebuild the live store at `live` with `embedder`.
 ///
 /// `make_store` opens a store at a path with the *target* dimension.
@@ -167,6 +217,23 @@ fn relative_name(minsync_dir: &Path, live: &Path) -> Result<String> {
         .map_err(|_| MinSyncError::Other("store is outside .minsync/".to_string()))
 }
 
+/// Rows the staging store of an interrupted rebuild toward `target` already
+/// holds, or `None` when there is no such rebuild to continue.
+pub(crate) fn staged_rows(
+    minsync_dir: &Path,
+    target: &EmbedderIdentity,
+    open: &dyn Fn(&Path) -> Result<Box<dyn VectorStore>>,
+) -> Result<Option<usize>> {
+    let Some(marker) = load_marker(minsync_dir) else {
+        return Ok(None);
+    };
+    let staging = minsync_dir.join(&marker.staging);
+    if &marker.target != target || !staging.exists() {
+        return Ok(None);
+    }
+    Ok(Some(open(&staging)?.doc_count()))
+}
+
 fn last_id(store: &dyn VectorStore) -> Result<Option<String>> {
     // Walk the staging store with the same keyset paging the source uses.
     let mut last = None;
@@ -185,6 +252,13 @@ async fn embed_page(
     page: &[StoredChunk],
     outcome: &mut Reembedded,
 ) -> Result<Vec<Vec<f32>>> {
+    if embedder.is_sparse_only() {
+        // The vector column is a required placeholder, as the indexer writes it.
+        return Ok(page
+            .iter()
+            .map(|_| vec![0.0; crate::config::SPARSE_ONLY_DIMENSION])
+            .collect());
+    }
     let mut index_of: HashMap<&str, usize> = HashMap::new();
     let mut texts: Vec<String> = Vec::new();
     let slots: Vec<usize> = page
@@ -579,6 +653,185 @@ mod tests {
         assert_eq!(outcome.resumed, 0);
         assert_eq!(healthy.embedded().len(), 5);
         drop(map);
+    }
+
+    /// Answers with a fixed vector, or fails, or returns what it is told.
+    struct Probed {
+        answer: std::sync::Mutex<Result<Vec<Vec<f32>>>>,
+        calls: AtomicUsize,
+        texts: Mutex<Vec<String>>,
+    }
+
+    impl Probed {
+        fn answering(vectors: Vec<Vec<f32>>) -> Self {
+            Self {
+                answer: Mutex::new(Ok(vectors)),
+                calls: AtomicUsize::new(0),
+                texts: Mutex::new(Vec::new()),
+            }
+        }
+        fn failing(message: &str) -> Self {
+            Self {
+                answer: Mutex::new(Err(MinSyncError::Embedding(message.to_string()))),
+                calls: AtomicUsize::new(0),
+                texts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for Probed {
+        fn id(&self) -> &str {
+            "probed"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.texts.lock().unwrap().extend(texts.iter().cloned());
+            match &*self.answer.lock().unwrap() {
+                Ok(vectors) => Ok(vectors.clone()),
+                Err(error) => Err(MinSyncError::Embedding(error.to_string())),
+            }
+        }
+    }
+
+    /// The sparse-only embedder refuses `embed` and says so.
+    struct SparseOnly;
+
+    #[async_trait]
+    impl Embedder for SparseOnly {
+        fn id(&self) -> &str {
+            crate::config::NONE_EMBEDDER_ID
+        }
+        fn is_sparse_only(&self) -> bool {
+            true
+        }
+        async fn embed(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
+            Err(MinSyncError::Embedding("no dense embedder".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sparse_only_target_writes_placeholders_and_never_calls_the_embedder() {
+        let (dir, live_path) = workspace();
+        let source = live(4);
+        let (map, open) = stores();
+        let mut none = config(1);
+        none.embedder.id = crate::config::NONE_EMBEDDER_ID.to_string();
+
+        let (outcome, target) = rebuild(
+            dir.path(),
+            &none,
+            &SparseOnly,
+            &live_path,
+            &source,
+            &open,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.embedded, 4);
+        assert_eq!(outcome.api_calls, 0);
+        assert_eq!(target.dimension, crate::config::SPARSE_ONLY_DIMENSION);
+        let staging = map.lock().unwrap()[&dir.path().join("store.reembed")].clone();
+        for doc in staging.lock().unwrap().documents().unwrap() {
+            assert_eq!(
+                doc.embedding,
+                vec![0.0; crate::config::SPARSE_ONLY_DIMENSION]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_reports_the_width_the_model_really_produces() {
+        let embedder = Probed::answering(vec![vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5]]);
+        let identity = probe(&config(6), &embedder).await.unwrap();
+        assert_eq!(identity.dimension, 6);
+        assert_eq!(identity.model, "probed");
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(embedder.texts.lock().unwrap().len(), 1, "one short text");
+    }
+
+    #[tokio::test]
+    async fn a_configured_width_the_model_does_not_produce_names_both_and_the_setting() {
+        let embedder = Probed::answering(vec![vec![1.0; 6]]);
+        let error = probe(&config(5), &embedder).await.unwrap_err().to_string();
+        assert!(error.contains('6') && error.contains('5'), "{error}");
+        assert!(error.contains("vectorstore.options"), "{error}");
+        assert!(error.contains("dimension"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_embedder_is_reported_as_the_probe_failing() {
+        let embedder = Probed::failing("model not loaded");
+        let error = probe(&config(4), &embedder).await.unwrap_err();
+        assert!(matches!(error, MinSyncError::Embedding(_)), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("probe") && message.contains("model not loaded"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_wrong_count_and_non_finite_answers_are_refused() {
+        for answer in [
+            vec![],
+            vec![vec![1.0; 4], vec![1.0; 4]],
+            vec![vec![]],
+            vec![vec![1.0, f32::NAN, 1.0, 1.0]],
+            vec![vec![1.0, f32::INFINITY, 1.0, 1.0]],
+        ] {
+            let embedder = Probed::answering(answer.clone());
+            assert!(
+                probe(&config(4), &embedder).await.is_err(),
+                "{answer:?} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sparse_only_target_needs_no_probe() {
+        let mut none = config(1);
+        none.embedder.id = crate::config::NONE_EMBEDDER_ID.to_string();
+        let embedder = Probed::failing("must not be called");
+        let identity = probe(&none, &embedder).await.unwrap();
+        assert_eq!(identity.dimension, crate::config::SPARSE_ONLY_DIMENSION);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn staged_rows_counts_what_an_interrupted_rebuild_already_moved() {
+        let (dir, live_path) = workspace();
+        let source = live(PAGE * 2 + 10);
+        let (_map, open) = stores();
+        let target_config = config(2);
+
+        // No rebuild yet.
+        let target = EmbedderIdentity::from_config(&target_config).unwrap();
+        assert_eq!(staged_rows(dir.path(), &target, &open).unwrap(), None);
+
+        let mut failing = Fake::new(3.0);
+        failing.fail_after_calls = Some(1);
+        let _ = rebuild(
+            dir.path(),
+            &target_config,
+            &failing,
+            &live_path,
+            &source,
+            &open,
+            |_| {},
+        )
+        .await;
+        assert_eq!(
+            staged_rows(dir.path(), &target, &open).unwrap(),
+            Some(PAGE),
+            "one committed page"
+        );
+
+        // A rebuild toward another embedder is not this one's progress.
+        let other = EmbedderIdentity::from_config(&config(3)).unwrap();
+        assert_eq!(staged_rows(dir.path(), &other, &open).unwrap(), None);
     }
 
     #[test]

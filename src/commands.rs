@@ -248,7 +248,7 @@ async fn sync(
     let result = if reembed {
         // The rebuild opens its own stores: the live one at the dimension the
         // index holds, a staging one at the configured dimension.
-        ms.reembed_locked(chunker.as_ref(), embedder.as_ref())
+        ms.reembed_locked(chunker.as_ref(), embedder.as_ref(), dry_run)
             .await?
     } else {
         // Before the store is opened: it would object to another dimension
@@ -279,7 +279,31 @@ async fn sync(
     };
     match format {
         OutputFormat::Text => {
-            if result.already_up_to_date {
+            if let (true, Some(would)) = (result.dry_run, result.would_reembed) {
+                if let Some(probe) = &result.probe {
+                    writeln!(
+                        out,
+                        "Embedder probe OK: {} produces {}-dimensional vectors.",
+                        probe.model, probe.dimension
+                    )?;
+                }
+                if would == 0 {
+                    writeln!(
+                        out,
+                        "Nothing to rebuild: the index already matches [embedder]."
+                    )?;
+                } else if result.resuming {
+                    writeln!(
+                        out,
+                        "Dry run: an interrupted rebuild would continue; {would} chunks in the index would be re-embedded."
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "Dry run: {would} chunks would be re-embedded. Nothing was changed."
+                    )?;
+                }
+            } else if result.already_up_to_date {
                 writeln!(out, "Already up to date.")?;
             } else if result.dry_run {
                 writeln!(
@@ -370,8 +394,11 @@ async fn query(
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     // Dense modes were just checked against the cursor, so the configured and
     // the stored width agree; a sparse query must not care that they do not.
-    let store_config = crate::embedder_identity::config_at_stored_dimension(minsync_dir, &config);
-    let store = crate::vectorstore::create_vectorstore_readonly(&store_config, &store_path)?;
+    let store = crate::vectorstore::create_vectorstore_readonly_with_dimension(
+        &config,
+        &store_path,
+        crate::embedder_identity::stored_dimension(minsync_dir, &config)?,
+    )?;
     // Each side is built only for the modes that use it: a sparse query never
     // constructs the dense embedder (so it needs none of its credentials), a
     // vector query never loads SPLADE.

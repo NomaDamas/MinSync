@@ -90,25 +90,18 @@ pub fn configured_dimension(config: &Config) -> Result<usize> {
     ))
 }
 
-/// `config` with the vector width the index actually holds, for opening the
-/// store without touching its dense column: a sparse query, or the old side
-/// of a rebuild. Falls back to the configured width for an index whose cursor
-/// predates recorded identities.
-pub fn config_at_stored_dimension(minsync_dir: &std::path::Path, config: &Config) -> Config {
-    let mut pinned = config.clone();
-    let stored = crate::state::Cursor::load(&minsync_dir.join("cursor.json"))
+/// Width of the dense vector column the index actually holds: what its
+/// cursor recorded, else what the configuration says (an index written
+/// before identities were recorded).
+pub fn stored_dimension(minsync_dir: &std::path::Path, config: &Config) -> Result<usize> {
+    let recorded = crate::state::Cursor::load(&minsync_dir.join("cursor.json"))
         .ok()
         .and_then(|cursor| cursor.embedder)
         .map(|identity| identity.dimension);
-    if let (Some(dimension), false) = (stored, config.is_sparse_only()) {
-        if let Some(table) = pinned.vectorstore.options.as_table_mut() {
-            table.insert(
-                "dimension".to_string(),
-                toml::Value::Integer(dimension as i64),
-            );
-        }
+    match recorded {
+        Some(dimension) => Ok(dimension),
+        None => configured_dimension(config),
     }
-    pinned
 }
 
 #[cfg(test)]

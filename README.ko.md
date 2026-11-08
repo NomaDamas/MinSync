@@ -496,11 +496,15 @@ index에는 dense embedder 하나의 벡터만 들어 있습니다. `minsync syn
 minsync sync --reembed
 ```
 
-`--reembed`는 store에 이미 있는 chunk 텍스트로 모든 dense 벡터를 설정된 embedder로 다시 만듭니다. 파일을 다시 읽거나 다시 chunking하지 않고 sparse(SPLADE) 벡터는 그대로 옮기므로, 임베딩 한 번 분량만 들고 SPLADE 인코딩은 필요 없습니다. 새 벡터는 live store 옆의 staging store(`store.reembed`)에 쓰고, 마지막 행까지 옮기면 rename 한 번으로 교체합니다. 그때까지 live index는 sparse 질의를 계속 받습니다. 중간에 끊어도 안전하며, 다음 `sync --reembed`가 마지막으로 commit한 256개 chunk 페이지 다음부터 이어갑니다. 그동안 바뀐 파일은 재구축 뒤에 이어지는 sync가 반영합니다. `--reembed`는 `--full`, `--dry-run`과 함께 쓸 수 없고 JSON 결과에 `reembedded`를 출력합니다.
+`--reembed`는 store에 이미 있는 chunk 텍스트로 모든 dense 벡터를 설정된 embedder로 다시 만듭니다. 파일을 다시 읽거나 다시 chunking하지 않고 sparse(SPLADE) 벡터는 그대로 옮기므로, 임베딩 한 번 분량만 들고 SPLADE 인코딩은 필요 없습니다. 새 벡터는 live store 옆의 staging store(`store.reembed`)에 쓰고, 마지막 행까지 옮기면 rename 한 번으로 교체합니다. 그때까지 live index는 sparse 질의를 계속 받습니다. 중간에 끊어도 안전하며, 다음 `sync --reembed`가 마지막으로 commit한 256개 chunk 페이지 다음부터 이어갑니다. 그동안 바뀐 파일은 재구축 뒤에 이어지는 sync가 반영합니다. `--reembed`는 `--full`과 함께 쓸 수 없고 JSON 결과에 `reembedded`를 출력합니다.
+
+**재구축 전에 새 embedder 점검하기.** `minsync sync --reembed --dry-run`은 설정된 embedder로 짧은 텍스트 하나를 임베딩해 본 결과(`probe`: 모델과 실제 벡터 차원)와 재구축하면 다시 임베딩할 chunk 수(`would_reembed`, 중단된 재구축을 이어받게 되면 `resuming`이 true)를 보여 줍니다. staging store도 마커도 만들지 않고 cursor도 건드리지 않습니다. 실제 `--reembed`도 같은 점검을 먼저 하므로, 로드되지 않는 모델, 닿지 않는 endpoint, NaN 출력, 모델 차원과 다른 `[vectorstore.options] dimension`은 요청 한 번 뒤에, chunk를 하나도 건드리기 전에 두 숫자와 고칠 설정을 알려 주며 멈춥니다. 첫 페이지에서 실패하지 않습니다. (`--dry-run`은 점검만 하며 새 모델이 더 잘 검색하는지는 알려 주지 못합니다. 그건 별도 workspace 등으로 직접 질의를 비교하세요.)
 
 재구축이 끝나기 전에는 두 모델을 섞게 될 동작이 종료 코드 `8`로 멈춥니다. `minsync sync`, `query --mode vector|hybrid`, `check`, `verify`, `optimize`, `watch`는 이전 모델과 새 모델을 알려 주고 `--reembed`를 안내합니다. `query --mode sparse`는 막지 않습니다. 저장된 벡터를 바꾸는 설정만 교체로 취급합니다. 모델, 차원, `passage_prefix`입니다. `dtype`, `device`, `batch_size`, timeout, `query_prefix`는 해당하지 않습니다.
 
 이전 버전이 만든 index에는 차원과 prefix가 기록되어 있지 않으므로, 다음 sync가 기록하기 전까지는 모델 변경만 감지합니다.
+
+`--embedder none`으로 바꿨다가 되돌리는 것도 같은 방식입니다. `--reembed`가 1차원 placeholder 벡터를 쓰거나(모델 호출 없음) 모든 chunk를 다시 임베딩합니다.
 
 `minsync init --force --embedder <id>`도 여전히 되지만 index를 버리고 모든 파일을 다시 읽으므로 `--reembed`를 권장합니다.
 

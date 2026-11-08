@@ -261,9 +261,9 @@ async fn reembed_rebuilds_every_vector_from_stored_text_and_the_new_model_answer
     let result = stdout_json(&reembed);
     assert!(result["reembedded"].as_u64().unwrap() >= 3, "{result}");
     assert_eq!(
-        result["embedded_texts"].as_u64().unwrap() as usize,
+        result["embedded_texts"].as_u64().unwrap() as usize + 1,
         embedded_b.load(Ordering::SeqCst),
-        "the result counts the texts the rebuild sent to the embedder: {result}"
+        "the result counts the texts the rebuild sent, the server also saw the one probe text: {result}"
     );
     assert!(
         result["embedding_api_calls"].as_u64().unwrap() >= 1,
@@ -422,7 +422,7 @@ async fn an_interrupted_reembed_resumes_without_redoing_finished_rows() {
             salt: 9.0,
             embedded: embedded_b.clone(),
         })
-        .up_to_n_times(1)
+        .up_to_n_times(2) // the probe, then one batch
         .mount(&server_b)
         .await;
     Mock::given(method("POST"))
@@ -442,7 +442,7 @@ async fn an_interrupted_reembed_resumes_without_redoing_finished_rows() {
         !first.status.success(),
         "the rebuild must report the failure"
     );
-    let done_first = embedded_b.load(Ordering::SeqCst);
+    let done_first = embedded_b.load(Ordering::SeqCst) - 1; // minus the probe text
     assert!(done_first >= 1, "one batch got through");
     // Not finished, so the old identity is still what the cursor says: dense
     // queries stay refused rather than answering from a half-rebuilt index.
@@ -459,7 +459,7 @@ async fn an_interrupted_reembed_resumes_without_redoing_finished_rows() {
     assert!(second.status.success(), "{}", stderr(&second));
     let total_chunks = stdout_json(&second)["reembedded"].as_u64().unwrap() as usize;
     assert!(
-        embedded_c.load(Ordering::SeqCst) < done_first + total_chunks,
+        embedded_c.load(Ordering::SeqCst) - 1 < done_first + total_chunks,
         "resume must not redo the rows the first run finished"
     );
     let ok = run(dir.path(), &["query", "refund", "--mode", "vector"]).await;
@@ -506,4 +506,257 @@ async fn a_rebuild_killed_between_the_swap_and_the_cursor_is_finished_by_the_nex
     assert!(!dir.path().join(".minsync/reembed.json").exists());
     let query = run(dir.path(), &["query", "refund", "--mode", "vector"]).await;
     assert!(query.status.success(), "{}", stderr(&query));
+}
+
+/// Files and directories under `.minsync/`, to prove a refused run left nothing behind.
+fn state_listing(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".minsync"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "lock")
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reembed_dry_run_probes_the_new_embedder_and_changes_nothing() {
+    let (server_a, _) = serve(4, 0.0).await;
+    let (server_b, embedded_b) = serve(6, 3.0).await;
+    let dir = workspace(&server_a.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+    let cursor_before = std::fs::read(dir.path().join(".minsync/cursor.json")).unwrap();
+    let listing_before = state_listing(dir.path());
+
+    configure(dir.path(), "model-b", &server_b.uri(), 6);
+    let plan = run(
+        dir.path(),
+        &["sync", "--reembed", "--dry-run", "--format", "json"],
+    )
+    .await;
+    assert!(plan.status.success(), "{}", stderr(&plan));
+    let plan = stdout_json(&plan);
+    assert_eq!(plan["dry_run"], true, "{plan}");
+    assert!(plan["would_reembed"].as_u64().unwrap() >= 3, "{plan}");
+    assert_eq!(plan["probe"]["dimension"], 6, "{plan}");
+    assert_eq!(plan["probe"]["model"], "model-b", "{plan}");
+
+    assert_eq!(
+        embedded_b.load(Ordering::SeqCst),
+        1,
+        "exactly one probe text was embedded, no chunk"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".minsync/cursor.json")).unwrap(),
+        cursor_before,
+        "the cursor is untouched"
+    );
+    assert_eq!(
+        state_listing(dir.path()),
+        listing_before,
+        "no staging store, no marker"
+    );
+
+    // The index is still refused until the real rebuild, and the real rebuild works.
+    assert!(!run(dir.path(), &["query", "refund", "--mode", "vector"])
+        .await
+        .status
+        .success());
+    assert!(run(dir.path(), &["sync", "--reembed"])
+        .await
+        .status
+        .success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_dimension_that_the_model_does_not_produce_is_caught_before_any_chunk() {
+    let (server_a, _) = serve(4, 0.0).await;
+    // The model answers 6 numbers, the config says 5.
+    let (server_b, embedded_b) = serve(6, 0.0).await;
+    let dir = workspace(&server_a.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+    let listing_before = state_listing(dir.path());
+
+    configure(dir.path(), "model-b", &server_b.uri(), 5);
+    for args in [
+        &["sync", "--reembed"][..],
+        &["sync", "--reembed", "--dry-run"][..],
+    ] {
+        let output = run(dir.path(), args).await;
+        assert!(!output.status.success(), "{args:?}");
+        let message = stderr(&output);
+        assert!(
+            message.contains("6") && message.contains("5") && message.contains("dimension"),
+            "names both widths: {message}"
+        );
+        assert!(
+            message.contains("vectorstore.options") || message.contains("[vectorstore"),
+            "says which setting to fix: {message}"
+        );
+    }
+    assert_eq!(
+        embedded_b.load(Ordering::SeqCst),
+        2,
+        "one probe per attempt and not a single chunk"
+    );
+    assert_eq!(
+        state_listing(dir.path()),
+        listing_before,
+        "no staging store left behind"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_new_embedder_is_reported_by_the_probe_and_leaves_no_staging_store() {
+    let (server_a, _) = serve(4, 0.0).await;
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("model not loaded"))
+        .mount(&dead)
+        .await;
+    let dir = workspace(&server_a.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+    let listing_before = state_listing(dir.path());
+
+    configure(dir.path(), "model-b", &dead.uri(), 4);
+    let output = run(dir.path(), &["sync", "--reembed"]).await;
+    assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
+    assert!(stderr(&output).contains("probe"), "{}", stderr(&output));
+    assert_eq!(state_listing(dir.path()), listing_before);
+    // Still a working index under the old settings.
+    configure(dir.path(), "model-a", &server_a.uri(), 4);
+    assert!(run(dir.path(), &["query", "refund", "--mode", "vector"])
+        .await
+        .status
+        .success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_answering_non_finite_numbers_is_refused() {
+    let (server_a, _) = serve(4, 0.0).await;
+    let bad = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[[1.0, null, 0.0, 0.0]]"))
+        .mount(&bad)
+        .await;
+    let dir = workspace(&server_a.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+    configure(dir.path(), "model-b", &bad.uri(), 4);
+    let output = run(dir.path(), &["sync", "--reembed"]).await;
+    assert!(!output.status.success());
+    assert!(!dir.path().join(".minsync/store.reembed").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_rebuild_is_probed_too_and_dry_run_reports_the_resume() {
+    let (server_a, _) = serve(4, 0.0).await;
+    let dir = workspace(&server_a.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+
+    // A rebuild toward model-b that died after one batch.
+    let server_b = MockServer::start().await;
+    let embedded_b = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(Model {
+            dimension: 4,
+            salt: 9.0,
+            embedded: embedded_b.clone(),
+        })
+        .up_to_n_times(2) // the probe and one batch
+        .mount(&server_b)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server_b)
+        .await;
+    configure(dir.path(), "model-b", &server_b.uri(), 4);
+    let config_path = dir.path().join(".minsync/config.toml");
+    let mut config = Config::load(&config_path).unwrap();
+    config.embedder.batch_size = 1;
+    config.save(&config_path).unwrap();
+    assert!(!run(dir.path(), &["sync", "--reembed"])
+        .await
+        .status
+        .success());
+    assert!(dir.path().join(".minsync/reembed.json").exists());
+
+    let (server_c, _) = serve(4, 9.0).await;
+    configure(dir.path(), "model-b", &server_c.uri(), 4);
+    let mut config = Config::load(&config_path).unwrap();
+    config.embedder.batch_size = 1;
+    config.save(&config_path).unwrap();
+    let plan = run(
+        dir.path(),
+        &["sync", "--reembed", "--dry-run", "--format", "json"],
+    )
+    .await;
+    assert!(plan.status.success(), "{}", stderr(&plan));
+    let plan = stdout_json(&plan);
+    assert_eq!(plan["resuming"], true, "{plan}");
+    // The first run's page held all three chunks but never committed, so
+    // nothing is across yet: the plan still counts every chunk.
+    assert_eq!(plan["would_reembed"], 3, "{plan}");
+    assert!(
+        dir.path().join(".minsync/reembed.json").exists(),
+        "dry run keeps the marker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_on_an_index_that_already_matches_says_there_is_nothing_to_do() {
+    let (server, embedded) = serve(4, 0.0).await;
+    let dir = workspace(&server.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+    let before = embedded.load(Ordering::SeqCst);
+    let plan = run(
+        dir.path(),
+        &["sync", "--reembed", "--dry-run", "--format", "json"],
+    )
+    .await;
+    assert!(plan.status.success(), "{}", stderr(&plan));
+    let plan = stdout_json(&plan);
+    assert_eq!(plan["would_reembed"], 0, "{plan}");
+    assert_eq!(
+        plan["resuming"], false,
+        "the field is always present: {plan}"
+    );
+    assert_eq!(
+        embedded.load(Ordering::SeqCst),
+        before,
+        "no probe needed when nothing changes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reembed_from_a_dense_embedder_to_none_and_back() {
+    let (server, _) = serve(4, 0.0).await;
+    let dir = workspace(&server.uri(), "model-a", 4);
+    assert!(run(dir.path(), &["sync"]).await.status.success());
+
+    let config_path = dir.path().join(".minsync/config.toml");
+    let mut config = Config::load(&config_path).unwrap();
+    config.embedder.id = minsync::config::NONE_EMBEDDER_ID.to_string();
+    let mut options = toml::value::Table::new();
+    options.insert("dimension".into(), toml::Value::Integer(1));
+    config.vectorstore.options = toml::Value::Table(options);
+    config.save(&config_path).unwrap();
+
+    let refused = run(dir.path(), &["sync"]).await;
+    assert_eq!(refused.status.code(), Some(8), "{}", stderr(&refused));
+    let to_none = run(dir.path(), &["sync", "--reembed", "--format", "json"]).await;
+    assert!(to_none.status.success(), "{}", stderr(&to_none));
+    assert_eq!(cursor(dir.path())["embedder"]["model"], "none");
+    let sparse = run(dir.path(), &["query", "refund", "--mode", "sparse"]).await;
+    assert!(sparse.status.success(), "{}", stderr(&sparse));
+
+    configure(dir.path(), "model-a", &server.uri(), 4);
+    let back = run(dir.path(), &["sync", "--reembed", "--format", "json"]).await;
+    assert!(back.status.success(), "{}", stderr(&back));
+    assert_eq!(cursor(dir.path())["embedder"]["model"], "model-a");
+    let vector = run(dir.path(), &["query", "refund", "--mode", "vector"]).await;
+    assert!(vector.status.success(), "{}", stderr(&vector));
 }
