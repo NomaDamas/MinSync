@@ -3,6 +3,7 @@
 //! result accounting helpers live in [`result`].
 
 mod indexer;
+pub(crate) mod reembed;
 mod reporter;
 mod result;
 mod sparse_phase;
@@ -10,6 +11,7 @@ mod sparse_phase;
 use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
+use crate::embedder_identity::EmbedderIdentity;
 use crate::error::{MinSyncError, Result};
 use crate::incremental::journal::{Journal, Record, RunHeader, Status, JOURNAL_FILE};
 use crate::manifest::{FileChange, Manifest, ScanErrorKind};
@@ -157,6 +159,134 @@ impl MinSync {
         }
         Ok(staging)
     }
+
+    /// Rebuild every dense vector with `embedder` and make it the index's
+    /// embedder, then run a normal sync so files that changed meanwhile are
+    /// picked up. Takes the writer lock like `sync`.
+    ///
+    /// The rebuild reads the stored chunks, so it also covers a store whose
+    /// files are gone; the follow-up sync is what notices them. With
+    /// `dry_run` it only probes the embedder and reports the plan.
+    pub async fn reembed(
+        &self,
+        chunker: &dyn Chunker,
+        embedder: &dyn Embedder,
+        dry_run: bool,
+        wait_lock: bool,
+    ) -> Result<SyncResult> {
+        let _lock = FileLock::acquire(&self.minsync_dir.join("lock"), wait_lock)?;
+        self.reembed_locked(chunker, embedder, dry_run).await
+    }
+
+    pub(crate) async fn reembed_locked(
+        &self,
+        chunker: &dyn Chunker,
+        embedder: &dyn Embedder,
+        dry_run: bool,
+    ) -> Result<SyncResult> {
+        let config = Config::load(&self.minsync_dir.join("config.toml"))?;
+        let cursor_path = self.minsync_dir.join("cursor.json");
+        let cursor = if cursor_path.exists() {
+            Some(Cursor::load(&cursor_path)?)
+        } else {
+            None
+        };
+        let live = collection_store_path(&self.minsync_dir, &config.collection.path)?;
+        let mut rebuilt: Option<reembed::Reembedded> = None;
+        let mut probed: Option<EmbedderIdentity> = None;
+        // Nothing to rebuild on a workspace that was never synced (the next
+        // sync builds it with this embedder) or when the vectors already
+        // come from it and no rebuild was left half done.
+        let marker = reembed::load_marker(&self.minsync_dir);
+        let differs = embedder_change(&config, embedder, &cursor)?.is_some();
+        // A run killed after the swap but before the cursor said so: the live
+        // store already holds the new vectors and the staging store is gone.
+        let swapped = marker
+            .as_ref()
+            .is_some_and(|marker| !self.minsync_dir.join(&marker.staging).exists());
+        let needs_rebuild = cursor.is_some() && (differs || marker.is_some()) && !swapped;
+
+        if dry_run {
+            let mut result = empty_sync_result(true, false);
+            result.dry_run = true;
+            let mut would = 0;
+            let mut resuming = false;
+            if needs_rebuild {
+                let target = reembed::probe(&config, embedder).await?;
+                let total = crate::vectorstore::create_vectorstore_readonly_with_dimension(
+                    &config,
+                    &live,
+                    crate::embedder_identity::stored_dimension(&self.minsync_dir, &config)?,
+                )?
+                .doc_count();
+                let open =
+                    |path: &Path| crate::vectorstore::create_vectorstore_readonly(&config, path);
+                let staged = reembed::staged_rows(&self.minsync_dir, &target, &open)?;
+                resuming = staged.is_some();
+                would = total.saturating_sub(staged.unwrap_or(0));
+                probed = Some(target);
+            }
+            result.would_reembed = Some(would);
+            result.probe = probed;
+            result.resuming = resuming;
+            result.already_up_to_date = !needs_rebuild && !swapped;
+            return Ok(result);
+        }
+
+        if let (Some(old), Some(marker), true) = (&cursor, &marker, swapped) {
+            let mut cursor = old.clone();
+            cursor.embedder_id = marker.target.model.clone();
+            cursor.embedder = Some(marker.target.clone());
+            cursor.save(&cursor_path)?;
+            reembed::finish(&self.minsync_dir);
+        } else if needs_rebuild {
+            // One short embedding before any staging store exists: a wrong
+            // `dimension`, an unloadable model or an unreachable endpoint
+            // stops here instead of after the first page.
+            probed = Some(reembed::probe(&config, embedder).await?);
+            let make_store = |path: &Path| crate::vectorstore::create_vectorstore(&config, path);
+            // The old vectors' store is read at the width it holds, not the
+            // configured (new) one.
+            let live_store = crate::vectorstore::create_vectorstore_readonly_with_dimension(
+                &config,
+                &live,
+                crate::embedder_identity::stored_dimension(&self.minsync_dir, &config)?,
+            )?;
+            let (outcome, target) = reembed::rebuild(
+                &self.minsync_dir,
+                &config,
+                embedder,
+                &live,
+                live_store.as_ref(),
+                &make_store,
+                |_| {},
+            )
+            .await?;
+            drop(live_store);
+            // Swap, then record the new embedder, then forget the rebuild. A
+            // run killed in between finds the marker still there and redoes
+            // only the steps that are left (each is a no-op once done).
+            reembed::swap_in(&self.minsync_dir, &live)?;
+            if let Some(mut cursor) = cursor {
+                cursor.embedder_id = target.model.clone();
+                cursor.embedder = Some(target);
+                cursor.save(&cursor_path)?;
+            }
+            reembed::finish(&self.minsync_dir);
+            rebuilt = Some(outcome);
+        }
+        let mut store = crate::vectorstore::create_vectorstore(&config, &live)?;
+        let mut result = self
+            .sync_locked(chunker, embedder, store.as_mut(), false, false)
+            .await?;
+        if let Some(rebuilt) = rebuilt {
+            result.reembedded = rebuilt.embedded;
+            result.embedded_texts += rebuilt.texts;
+            result.embedding_api_calls += rebuilt.api_calls;
+            result.probe = probed;
+        }
+        Ok(result)
+    }
 }
 
 /// Fingerprint of everything that changes what a processed file writes to
@@ -179,6 +309,24 @@ fn config_fingerprint(config: &Config, chunker: &dyn Chunker, embedder: &dyn Emb
         "sha256:{}",
         hex::encode(Sha256::digest(material.to_string()))
     )
+}
+
+/// Why the index cannot be written to (or read densely) with `embedder`, or
+/// `None` when it can. An interrupted rebuild leaves the live store with its
+/// old vectors, which the cursor still describes, so the comparison is the
+/// same: only a finished rebuild changes what the cursor says. A switch
+/// between a dense embedder and `none` is a change too (the vector column is
+/// a different width).
+pub(crate) fn embedder_change(
+    config: &Config,
+    embedder: &dyn Embedder,
+    cursor: &Option<Cursor>,
+) -> Result<Option<String>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let wanted = EmbedderIdentity::of(config, embedder)?;
+    Ok(cursor.embedder_difference(&wanted))
 }
 
 pub(crate) fn collection_store_path(minsync_dir: &Path, configured_path: &str) -> Result<PathBuf> {
@@ -291,6 +439,15 @@ impl MinSync {
         } else {
             None
         };
+        // The stored vectors must have been built by the embedder this run
+        // writes with. An index built by another one would end up with two
+        // models' vectors in one column (same dimension) or a store error
+        // (different one); name the cause and the remedy instead.
+        if !dry_run {
+            if let Some(why) = embedder_change(&config, embedder, &stored_cursor)? {
+                return Err(MinSyncError::EmbedderChanged { why });
+            }
+        }
         // A baseline manifest from `init` is not evidence that the index was
         // populated. Trust the pair only when the cursor describes the exact
         // manifest on disk; a crash between writing either file forces a safe
@@ -728,6 +885,7 @@ impl MinSync {
             manifest_hash: saved_manifest.manifest_hash(),
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
+            embedder: Some(EmbedderIdentity::of(&config, embedder)?),
             collection_path: config.collection.path.clone(),
             // Only a complete sparse phase proves every row is searchable by
             // this model; a partial one leaves the cursor as it was, so a
@@ -1777,6 +1935,13 @@ mod tests {
     }
 
     impl VectorStore for SpyStore {
+        fn scan_chunks(
+            &self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<crate::vectorstore::StoredChunk>> {
+            self.inner.scan_chunks(after, limit)
+        }
         fn upsert(&mut self, docs: &[Document]) -> Result<()> {
             if self
                 .fail_upserts_after
@@ -2002,6 +2167,7 @@ mod tests {
             manifest_hash: partial_manifest.manifest_hash(),
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: "mock".to_string(),
+            embedder: None,
             collection_path: config.collection.path.clone(),
             sparse_id: None,
         }

@@ -8,18 +8,18 @@ use super::index::{
 };
 use super::schema::{
     batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse, batch_to_query_hits,
-    batch_to_scored_hits, batch_to_sparse_targets, dedupe_documents, docs_to_batch, schema,
-    score_sparse_batch, sparse_fields, sparse_rows_to_batch, string_col, updates_to_batch,
-    validate_schema, validate_vector,
+    batch_to_scored_hits, batch_to_sparse_targets, batch_to_stored_chunks, dedupe_documents,
+    docs_to_batch, schema, score_sparse_batch, sparse_fields, sparse_rows_to_batch, string_col,
+    updates_to_batch, validate_schema, validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, SPARSE_INDICES_COLUMN,
-    SPARSE_VALUES_COLUMN, TABLE_NAME, VECTOR_COLUMN,
+    SPARSE_MODEL_COLUMN, SPARSE_VALUES_COLUMN, TABLE_NAME, VECTOR_COLUMN,
 };
 use crate::error::{MinSyncError, Result};
 use crate::sparse::{SparseVector, TopK};
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget};
+use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use futures::TryStreamExt;
@@ -251,6 +251,63 @@ impl LanceDbInner {
 
     pub(super) async fn documents(&self) -> Result<Vec<Document>> {
         self.scan_documents(None).await
+    }
+
+    /// The next page of rows after `after`, in id order, read without the
+    /// vector column (the rebuild replaces it) so a page costs text and
+    /// sparse bytes only.
+    pub(super) async fn scan_chunks(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<StoredChunk>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut columns: Vec<String> = [
+            "id",
+            "text",
+            "source_id",
+            "path",
+            "chunk_schema_id",
+            "chunk_type",
+            "heading_path",
+            "content_hash",
+            "seen_token",
+            SPARSE_MODEL_COLUMN,
+            SPARSE_INDICES_COLUMN,
+            SPARSE_VALUES_COLUMN,
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        columns.dedup();
+        let mut query = self
+            .table
+            .query()
+            .select(Select::Columns(columns))
+            .order_by(Some(vec![lancedb::query::ColumnOrdering::asc_nulls_last(
+                "id".to_string(),
+            )]))
+            .limit(limit);
+        if let Some(after) = after {
+            query = query.only_if(format!(
+                "id > '{}'",
+                super::filters::escape_sql_literal(&after)
+            ));
+        }
+        let batches: Vec<RecordBatch> = query
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut chunks = Vec::new();
+        for batch in batches {
+            chunks.extend(batch_to_stored_chunks(&batch)?);
+        }
+        Ok(chunks)
     }
 
     /// Existence check that projects only `id`: no vectors or text are read.

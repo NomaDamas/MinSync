@@ -1,7 +1,9 @@
 use crate::error::Result;
 use crate::sparse::{dot_terms, SparseVector, TopK};
 use crate::vectorstore::similarity::{cosine_similarity, matches_filter};
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, VectorStore};
+use crate::vectorstore::{
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, VectorStore,
+};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -77,6 +79,26 @@ impl VectorStore for InMemoryStore {
         let mut docs: Vec<_> = self.docs.values().cloned().collect();
         docs.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(docs)
+    }
+
+    fn scan_chunks(&self, after: Option<&str>, limit: usize) -> Result<Vec<StoredChunk>> {
+        let mut ids: Vec<&String> = self
+            .docs
+            .keys()
+            .filter(|id| after.is_none_or(|after| id.as_str() > after))
+            .collect();
+        ids.sort();
+        Ok(ids
+            .into_iter()
+            .take(limit)
+            .map(|id| StoredChunk {
+                doc: Document {
+                    embedding: Vec::new(),
+                    ..self.docs[id].clone()
+                },
+                sparse: self.sparse.get(id).cloned(),
+            })
+            .collect())
     }
 
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {

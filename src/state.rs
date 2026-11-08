@@ -1,3 +1,4 @@
+use crate::embedder_identity::EmbedderIdentity;
 use crate::error::{MinSyncError, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,14 @@ pub struct Cursor {
     pub last_synced_at: String,
     pub manifest_hash: String,
     pub chunk_schema_id: String,
+    /// The model that built the stored dense vectors (`embedder.model`), kept
+    /// for readers of older cursors.
     pub embedder_id: String,
+    /// Everything the stored dense vectors depend on. Absent in a cursor
+    /// written before identities were recorded; such an index is read as
+    /// built by `embedder_id`, at the dimension the store holds.
+    #[serde(default)]
+    pub embedder: Option<EmbedderIdentity>,
     pub collection_path: String,
     /// The sparse model every stored row was encoded with at the end of the
     /// last sync. Absent before sparse retrieval existed, or while the
@@ -45,6 +53,23 @@ impl Cursor {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         atomic_write_json(self, path)
+    }
+
+    /// Why the stored dense vectors cannot serve `wanted`, or `None`. A
+    /// cursor written before identities were recorded can only vouch for the
+    /// model, so for it a change of dimension or passage prefix goes unseen
+    /// until the next sync records them.
+    pub fn embedder_difference(&self, wanted: &EmbedderIdentity) -> Option<String> {
+        match &self.embedder {
+            Some(stored) => stored.difference(wanted),
+            None => {
+                let stored = ["native:", "tei:", "openai:"]
+                    .iter()
+                    .find_map(|provider| self.embedder_id.strip_prefix(provider))
+                    .unwrap_or(&self.embedder_id);
+                (stored != wanted.model).then(|| format!("model {stored} -> {}", wanted.model))
+            }
+        }
     }
 }
 
@@ -153,6 +178,7 @@ mod tests {
             manifest_hash: "sha256:abc".to_string(),
             chunk_schema_id: "schema-1".to_string(),
             embedder_id: "embedder-1".to_string(),
+            embedder: None,
             collection_path: ".minsync/collection".to_string(),
             sparse_id: Some("nlpai-lab/KURE-Sparse-nano".to_string()),
         }

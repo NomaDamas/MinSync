@@ -41,6 +41,23 @@ pub struct SyncResult {
     /// content hash, same model) instead of being encoded again.
     #[serde(default)]
     pub sparse_reused: usize,
+    /// Chunks whose dense vector `sync --reembed` rebuilt with the
+    /// configured embedder in this run.
+    #[serde(default)]
+    pub reembedded: usize,
+    /// `sync --reembed --dry-run`: chunks a rebuild would still re-embed
+    /// (zero when the index already matches the configured embedder; the
+    /// rows an interrupted rebuild already moved are not counted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would_reembed: Option<usize>,
+    /// `sync --reembed --dry-run` (and a real rebuild): the embedder as the
+    /// probe saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<crate::embedder_identity::EmbedderIdentity>,
+    /// `sync --reembed --dry-run`: an earlier rebuild toward this embedder was
+    /// interrupted and would be continued.
+    #[serde(default)]
+    pub resuming: bool,
     pub estimated_tokens: usize,
     pub files_checked: usize,
     pub freshness_check_only: bool,
