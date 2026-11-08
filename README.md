@@ -472,9 +472,9 @@ Measured on the corpora above (Apple Silicon, KURE-Sparse-nano):
 - **Corpus size.** `--mode sparse` scores every stored chunk; there is no index
   over the sparse columns. A query (CLI, in-process) takes 206 ms at 21k chunks
   and 508 ms at 106k, growing linearly.
-- **Indexing speed.** Every chunk goes through the model: about 16-25
-  chunks/s on Metal and 3-5 on CPU. SciFact's 5,183 files took BM25 6 s and
-  SPLADE 313 s on Metal.
+- **Indexing speed.** Every chunk goes through the model: about 25-30
+  chunks/s on Metal and 3-5 on CPU. A sparse-only sync of 1,118 markdown
+  chunks (Korean and English) took 35 s on an M4 Max.
 - **Disk.** An encoded chunk takes about 5 KB. Lance keeps replaced files for
   10 minutes so that a concurrent query never loses its files, so right after a
   long sync the store can be several times larger than its data until the next
