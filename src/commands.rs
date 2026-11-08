@@ -436,7 +436,7 @@ fn optimize(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<()> 
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let mut store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
     let started = std::time::Instant::now();
-    store.flush()?;
+    store.optimize()?;
     let elapsed = started.elapsed().as_secs_f64();
     match format {
         OutputFormat::Text => println!("Optimized store in {elapsed:.2}s."),

@@ -53,6 +53,7 @@ pub(super) enum Command {
         resp: Resp<Vec<QueryHit>>,
     },
     Flush(Resp<()>),
+    Optimize(Resp<()>),
     Checkpoint(Resp<()>),
     FragmentCount(Resp<usize>),
     DocCount(Resp<usize>),
@@ -155,6 +156,7 @@ pub(super) fn run_worker(
                 rt.block_on(inner.query_sparse(model, vector, filter, topk)),
             ),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
+            Command::Optimize(resp) => send_response(resp, rt.block_on(inner.optimize())),
             Command::Checkpoint(resp) => send_response(resp, rt.block_on(inner.checkpoint())),
             Command::FragmentCount(resp) => {
                 send_response(resp, rt.block_on(inner.fragment_count()));

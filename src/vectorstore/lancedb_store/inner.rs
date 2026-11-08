@@ -536,7 +536,28 @@ impl LanceDbInner {
             .collect())
     }
 
+    /// End-of-sync maintenance. Folds new rows into the search indexes and
+    /// prunes old versions, and compacts only once fragments pile up. A sync
+    /// that adds a few files therefore appends fragments instead of rewriting
+    /// the whole table: every rewrite leaves the previous copy on disk until
+    /// the prune window passes, so callers that sync often would otherwise
+    /// hold many table-sized copies at once. [`Self::optimize`] compacts
+    /// unconditionally.
     pub(super) async fn flush(&self) -> Result<()> {
+        compact_if_fragmented(
+            &self.table,
+            self.indexing.compact_fragment_threshold,
+            self.indexing.compact_target_rows,
+        )
+        .await?;
+        maintain_scalar_indexes(&self.table).await?;
+        maintain_index(&self.table, &self.indexing).await?;
+        self.prune().await
+    }
+
+    /// Full maintenance for `minsync optimize`: compact every fragment under
+    /// the target size, then refresh the search indexes and prune.
+    pub(super) async fn optimize(&self) -> Result<()> {
         self.table
             .optimize(OptimizeAction::Compact {
                 options: compaction_options(self.indexing.compact_target_rows),

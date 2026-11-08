@@ -127,7 +127,16 @@ pub trait VectorStore: Send + Sync {
         filter: Option<&Filter>,
         topk: usize,
     ) -> Result<Vec<QueryHit>>;
+    /// End-of-sync maintenance: fold new rows into the search indexes and
+    /// prune old versions. It compacts only once fragments pile up, so a
+    /// sync that adds a few files stays an append.
     fn flush(&mut self) -> Result<()>;
+    /// Full maintenance for `minsync optimize`: compact every fragment under
+    /// the target size, refresh search indexes, and prune. Stores with
+    /// nothing more to do than [`VectorStore::flush`] keep the default.
+    fn optimize(&mut self) -> Result<()> {
+        self.flush()
+    }
     /// Cheap mid-sync maintenance so a long run that is killed leaves a
     /// store that is still fast to reopen: compact once fragments pile up
     /// and prune old versions. Unlike [`VectorStore::flush`] it never
