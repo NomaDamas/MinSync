@@ -268,6 +268,10 @@ impl VectorStore for LanceDbStore {
         self.request(Command::Flush)
     }
 
+    fn optimize(&mut self) -> Result<()> {
+        self.request(Command::Optimize)
+    }
+
     fn checkpoint(&mut self) -> Result<()> {
         self.request(Command::Checkpoint)
     }
@@ -401,6 +405,89 @@ mod tests {
         assert_eq!(fetched[0].seen_token, "token-2");
         assert_eq!(fetched[1].path, "new-b-2.txt");
         assert_eq!(fetched[1].seen_token, "token-2");
+    }
+
+    /// Data files on disk: one per commit, plus a full copy for every rewrite.
+    fn data_file_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join(format!("{TABLE_NAME}.lance")).join("data"))
+            .expect("read data directory")
+            .count()
+    }
+
+    #[test]
+    fn test_flush_after_small_syncs_appends_instead_of_rewriting_the_table() {
+        // A sync that adds a few files must not copy the whole table: each copy
+        // stays on disk until the prune window passes, so frequent syncs would
+        // hold many table-sized copies at once.
+        let (dir, mut store) = store();
+        for i in 0..10 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+            store.flush().expect("flush");
+        }
+        assert_eq!(store.doc_count(), 10);
+        assert_eq!(store.fragment_count().expect("fragments"), 10);
+        assert_eq!(
+            data_file_count(dir.path()),
+            10,
+            "flush must leave no rewritten copy of the table"
+        );
+    }
+
+    #[test]
+    fn test_flush_compacts_once_fragments_pile_up() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = LanceDbStore::open_with_indexing(
+            dir.path(),
+            4,
+            IndexingConfig {
+                compact_fragment_threshold: 4,
+                ..IndexingConfig::default()
+            },
+        )
+        .expect("create store");
+        for i in 0..6 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+            store.flush().expect("flush");
+        }
+        assert_eq!(store.doc_count(), 6);
+        assert!(
+            store.fragment_count().expect("fragments") < 4,
+            "flush must compact once the fragment threshold is reached"
+        );
+    }
+
+    #[test]
+    fn test_optimize_compacts_below_the_fragment_threshold() {
+        let (_dir, mut store) = store();
+        for i in 0..3 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+        }
+        store.flush().expect("flush");
+        assert_eq!(store.fragment_count().expect("fragments"), 3);
+        store.optimize().expect("optimize");
+        assert_eq!(store.fragment_count().expect("fragments"), 1);
+        assert_eq!(store.doc_count(), 3);
     }
 
     #[test]
