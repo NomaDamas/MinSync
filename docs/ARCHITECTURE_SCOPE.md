@@ -20,6 +20,17 @@ Its core responsibility is to:
 
 MinSync will not become a general-purpose incremental dataflow framework.
 
+MinSync is the text-only indexer. The model runtimes it drives — the candle
+dense text engine (Qwen3, EmbeddingGemma 2), the learned-sparse encoder
+(KURE-Sparse-nano) and the loopback `serve` daemon — live in
+[im-not-llm](https://github.com/NomaDamas/im-not-llm). MinSync links those
+crates (`inl-core`, `inl-text`, `inl-sparse`, `inl-server`) as git dependencies
+and drives them through thin adapters (`src/embedder/native.rs`,
+`src/sparse/native.rs`, `src/serve/mod.rs`) that map its config and errors onto
+them. Model code, device/dtype selection, batching, the per-pass deadline and
+the server protocol belong to im-not-llm; MinSync owns scanning, chunking,
+incremental reuse, index mutation and crash-safe state.
+
 ## Context
 
 MinSync was compared with

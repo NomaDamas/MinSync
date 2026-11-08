@@ -1,6 +1,6 @@
 // Runs the real model. Opt in with MINSYNC_LIVE=1; the weights come from the
-// same cache the CLI uses (HF_HOME, FASTEMBED_CACHE_DIR or
-// ~/.cache/minsync/models) and are downloaded on first use.
+// same cache the CLI uses (HF_HOME, INL_CACHE_DIR or
+// ~/.cache/im-not-llm/models) and are downloaded on first use.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createRequire } from 'node:module'

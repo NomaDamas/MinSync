@@ -76,7 +76,7 @@ In-process Qwen3 (default, no API key, no TEI server):
 minsync init
 ```
 
-The default config uses `native:Qwen/Qwen3-Embedding-0.6B` with `dimension = 1024` and empty prefixes. The first embedding call downloads the model into `~/.cache/minsync/models`.
+The default config uses `native:Qwen/Qwen3-Embedding-0.6B` with `dimension = 1024` and empty prefixes. The first embedding call downloads the model into `~/.cache/im-not-llm/models`.
 
 Local TEI EmbeddingGemma:
 
@@ -117,7 +117,7 @@ dimension = 384
 
 MinSync also supports learned-sparse (SPLADE) retrieval, independent of the dense embedder, configured under `[sparse]` in `.minsync/config.toml` (default model `native:nlpai-lab/KURE-Sparse-nano`, Apache-2.0). Providers:
 
-- `native:` runs the ModernBERT + SPLADE model in-process on candle (no Python, no ONNX runtime); the weights (299 MB) download from Hugging Face on first use and are held in memory as f32 (about 600 MB).
+- `native:` runs the ModernBERT + SPLADE model in-process through im-not-llm's sparse engine (candle; no Python, no ONNX runtime); the weights (299 MB) download from Hugging Face on first use and are held in memory as f32 (about 600 MB).
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse` at `base_url`.
 - A running `minsync serve --sparse` is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
@@ -157,7 +157,7 @@ Use this checklist when adding an embedding provider or model family:
 6. Document the model dimension and tell agents to update `[vectorstore.options].dimension`, then run `minsync sync --full`.
 7. Add tests for prefix stripping, batching, retryable errors, fatal errors, timeout retry, and query/document prefix behavior.
 
-The default embedder is `native:Qwen/Qwen3-Embedding-0.6B` with dimension `1024`, loaded in-process on candle (Metal on Apple Silicon, CPU elsewhere). OpenAI is supported with ids like `openai:text-embedding-3-small`. TEI models use ids like `tei:google/embeddinggemma-300m`, `tei:intfloat/multilingual-e5-small`, and `tei:BAAI/bge-m3`.
+The default embedder is `native:Qwen/Qwen3-Embedding-0.6B` with dimension `1024`, loaded in-process through im-not-llm's text engine (candle; Metal on Apple Silicon, CPU elsewhere). OpenAI is supported with ids like `openai:text-embedding-3-small`. TEI models use ids like `tei:google/embeddinggemma-300m`, `tei:intfloat/multilingual-e5-small`, and `tei:BAAI/bge-m3`.
 
 For a longer implementation checklist, read `docs/EXTENDING.md` in the MinSync repository.
 

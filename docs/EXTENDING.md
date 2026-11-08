@@ -31,7 +31,7 @@ If the backend has asynchronous APIs, hide that behind a synchronous `VectorStor
 
 Current provider prefixes:
 
-- `native:` for in-process candle embeddings (Qwen3, `src/embedder/qwen3/`).
+- `native:` for in-process candle embeddings (Qwen3, EmbeddingGemma 2, KURE-Sparse-nano), driven by im-not-llm's engines (`inl-text`, `inl-sparse`); MinSync's `src/embedder/native.rs` and `src/sparse/native.rs` are thin adapters over them.
 - `openai:` for OpenAI-compatible embeddings.
 - `tei:` for Hugging Face Text Embeddings Inference.
 

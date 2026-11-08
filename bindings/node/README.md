@@ -1,6 +1,6 @@
 # @nomadamas/minsync-native
 
-MinSync's native embedder (Qwen3 on [candle](https://github.com/huggingface/candle), Metal on macOS) as an in-process
+MinSync's native embedder (Qwen3 on [candle](https://github.com/huggingface/candle) via im-not-llm, Metal on macOS) as an in-process
 [Node-API](https://nodejs.org/api/n-api.html) addon. Same engine, weights, cache and batch limits as the `minsync` CLI's
 `native:` embedder, without a second process, a port, or a cold model load per call.
 
@@ -83,7 +83,7 @@ Inference runs on a native thread pool; the JS event loop is never blocked.
 ### Cache and environment
 
 The weights are resolved exactly as the CLI does, so both share one copy and can run side by side:
-`modelCacheDir`, else `HF_HOME`, else `FASTEMBED_CACHE_DIR`, else `~/.cache/minsync/models` (`%LOCALAPPDATA%\minsync\models`
+`modelCacheDir`, else `HF_HOME`, else `INL_CACHE_DIR`, else `~/.cache/im-not-llm/models` (`%LOCALAPPDATA%\im-not-llm\models`
 on Windows). `HF_ENDPOINT` and `HF_TOKEN` are honoured. They are read from the process environment when a load starts,
 so set them (`process.env`) before the first call.
 

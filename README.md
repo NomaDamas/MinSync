@@ -394,20 +394,22 @@ max_length = 2048
 # Optional, unset by default:
 # per_batch_timeout_seconds = 120      # native only; defaults to timeout_seconds (at least 900 on CPU)
 # max_batch_tokens = 1024             # native only; padded tokens (inputs x longest) per forward pass
-# model_cache_dir = "~/.cache/minsync/models"
+# model_cache_dir = "~/.cache/im-not-llm/models"
 # base_url = "http://localhost:8081"  # tei: only
 ```
 
 Providers:
 
-- `native:` runs the model in-process on [candle](https://github.com/huggingface/candle) (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
+- `native:` runs the model in-process through im-not-llm's sparse engine ([candle](https://github.com/huggingface/candle); a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
 - `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
 Model download: nothing to install by hand. The first sync (or query, or
-`minsync serve --sparse`) fetches the model into `~/.cache/minsync/models`
-(`%LOCALAPPDATA%\minsync\models` on Windows, or `$HF_HOME` when set) and says so
-in the log, even when stderr is not a terminal. The weights are checked
+`minsync serve --sparse`) fetches the model into `~/.cache/im-not-llm/models`
+(`%LOCALAPPDATA%\im-not-llm\models` on Windows, or `$HF_HOME` when set) and says so
+in the log, even when stderr is not a terminal. `model_cache_dir` in
+`config.toml` and `$INL_CACHE_DIR` override the directory; `$HF_HOME` still wins
+inside the Hub client. The weights are checked
 against the sha256 the Hub names the file after; a damaged download (an
 interrupted one that resumed on bad bytes, say) is discarded and fetched once
 more. Once cached, no later run touches the network. `HF_ENDPOINT` selects a
@@ -572,9 +574,9 @@ max_batch_tokens = 4096           # optional, native only
 
 ## Local Embeddings
 
-The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process on [candle](https://github.com/huggingface/candle) (the model code is ported from [fastembed-rs](https://github.com/Anush008/fastembed-rs); see `THIRD_PARTY_NOTICES.md`). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
+The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process through im-not-llm's text engine ([candle](https://github.com/huggingface/candle); the model code is ported from [fastembed-rs](https://github.com/Anush008/fastembed-rs) — see `THIRD_PARTY_NOTICES.md`). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
 
-The first embedding call downloads the Apache-2.0 model via Hugging Face Hub into `~/.cache/minsync/models` (override with `model_cache_dir` in `config.toml`, `FASTEMBED_CACHE_DIR`, or `HF_HOME`). Later runs load from cache.
+The first embedding call downloads the Apache-2.0 model via Hugging Face Hub into `~/.cache/im-not-llm/models` (override with `model_cache_dir` in `config.toml`, `INL_CACHE_DIR`, or `HF_HOME`). Later runs load from cache.
 
 ```bash
 minsync init
@@ -604,7 +606,7 @@ Switching to `--embedder none` and back works the same way: `--reembed` writes t
 
 ### EmbeddingGemma 2
 
-`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process on candle, text only: the checkpoint's vision and audio towers are never loaded.
+`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process through im-not-llm's text engine (candle), text only: the checkpoint's vision and audio towers are never loaded.
 
 ```bash
 minsync init --embedder native:google/embeddinggemma-2
@@ -687,7 +689,7 @@ dimension = 384
 
 ### Embedding server
 
-`minsync serve` loads the native embedder once and serves it on loopback, so other tools (and repeated CLI calls) share one model instead of each loading its own copy:
+`minsync serve` loads the native embedder once and serves it on loopback, so other tools (and repeated CLI calls) share one model instead of each loading its own copy. The server itself is im-not-llm's daemon (`inl_server`, the one `inl serve` runs), driven with MinSync's `[embedder]` / `[sparse]` settings; `minsync serve` and `inl serve` of the same model share one instance.
 
 ```bash
 minsync serve                    # workspace config if present, else the default model
@@ -698,13 +700,13 @@ minsync serve --port 8089 --idle-timeout 600
 |---|---|---|
 | `POST /embed` (TEI) | `{"inputs": [...], "truncate"?: bool}` | `[[f32, ...], ...]` |
 | `POST /v1/embeddings` (OpenAI) | `{"model", "input": [...], "encoding_format"?: "float" \| "base64"}` | `{"object": "list", "data": [{"index", "embedding"}], "model", "usage"}` |
-| `GET /health` | | model id, dimension, dtype, device, pid, port |
+| `GET /health` | | status, kind, model id, dimension, dtype, device, attention, `max_length`, `max_inputs`, instance, pid, host, port, url, version, uptime, request count, build features |
 
 - Vectors are the same as in-process `native:` for the same text, device and dtype: requests run through the same batch planner, padded-token cap and per-pass deadline as `sync`.
 - Prefixes are the caller's job. Both endpoints also accept `"input_type": "query" | "passage"`, which applies the configured `query_prefix` / `passage_prefix`.
 - Inputs over the model context return `413` unless `truncate: true` (TEI). More than `--max-inputs` inputs (default 512) or a body over `--max-request-bytes` (default 32 MiB) also return `413`; malformed JSON returns `400`/`422`. A forward pass that exceeds its deadline returns `503` and the server exits with code 7, since the stuck thread holds the model.
 - It binds `127.0.0.1` (or `::1`) only; other `--host` values are refused because there is no authentication. `--port 0` (default) picks a free port.
-- `pid`, `host` and `port` files live in `~/.cache/minsync/serve/<model instance>/` (override with `--state-dir`). A second `minsync serve` for the same model, device, dtype, attention and `max_length` finds the running server, prints it (`"event": "adopted"` with `--format json`) and exits without loading the model.
+- `pid`, `host` and `port` files live in `~/.cache/im-not-llm/serve/<model instance>/` (override with `--state-dir`). This moved from MinSync's own `~/.cache/minsync/serve` when the daemon moved to im-not-llm, and the instance key is now the daemon's (it includes the engine kind, so a dense and a sparse server of the same model never share a directory). A second `minsync serve` for the same model, device, dtype, attention and `max_length` finds the running server, prints it (`"event": "adopted"` with `--format json`) and exits without loading the model.
 - After `--idle-timeout` seconds (default 300; `0` disables) without an embedding request the server exits and frees the model. `SIGTERM`/Ctrl-C stop it cleanly; both remove the discovery files.
 
 `native:` workspaces use a running server automatically: `sync`, `query`, `check`, `verify` and `watch` look for the discovery files of the same model instance on their first embedding call and send the text there (with the workspace's prefixes, truncated at `max_length` like the in-process engine). With no server, or once it stops answering, they embed in-process as before. A warm server takes `query` from ~2.3 s / 2.4 GB to ~0.22 s / 59 MB on an M-series Mac. `MINSYNC_SERVER=off` always embeds in-process. The server must use the default `--state-dir` to be discovered.

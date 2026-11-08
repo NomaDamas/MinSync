@@ -5,6 +5,7 @@ Manifest-based incremental vector DB indexing CLI tool written in Rust. No git r
 ## Core Principles
 
 - **Git-free**: manifest (mtime + size + content_hash) based change detection. Zero git dependency.
+- **Text-only indexer**: MinSync scans, chunks and indexes UTF-8 text. The model runtimes — the candle text/sparse engines and the loopback `serve` daemon — live in [im-not-llm](https://github.com/NomaDamas/im-not-llm) (`inl-core`, `inl-text`, `inl-sparse`, `inl-server`), linked as git dependencies. `native:` embedders (`src/embedder/native.rs`, `src/sparse/native.rs`) and `minsync serve` (`src/serve/mod.rs`) are thin adapters that map MinSync's config and errors onto those crates.
 - **Rust native**: Pure Rust, no C++ dependencies. chonkie-core (chunk crate) built-in.
 - **State directory**: `.minsync/` (config.toml, manifest.json, cursor.json, txn.json, lock)
 - **Indexing target**: All files in directory. Exclude via `.minsyncignore` (`.gitignore` syntax).

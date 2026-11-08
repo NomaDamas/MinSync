@@ -325,20 +325,21 @@ max_length = 2048
 # 선택 사항이며 기본값은 설정되지 않음:
 # per_batch_timeout_seconds = 120      # native 전용; 기본은 timeout_seconds(CPU에서는 최소 900)
 # max_batch_tokens = 1024             # native 전용; forward pass당 padded token 수(입력 수 x 가장 긴 입력)
-# model_cache_dir = "~/.cache/minsync/models"
+# model_cache_dir = "~/.cache/im-not-llm/models"
 # base_url = "http://localhost:8081"  # tei: 전용
 ```
 
 Provider:
 
-- `native:`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(299 MB)를 model cache로 받으며, 모델은 f32로 메모리에 올라가 약 600 MB를 차지합니다.
+- `native:`는 im-not-llm의 sparse 엔진([candle](https://github.com/huggingface/candle); ModernBERT masked-LM + ShiftedTopK SPLADE pooling)으로 프로세스 안에서 모델을 실행합니다. Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(299 MB)를 model cache로 받으며, 모델은 f32로 메모리에 올라가 약 600 MB를 차지합니다.
 - `tei:`는 Text Embeddings Inference 서버의 `POST /embed_sparse`를 호출하며 `base_url`이 그 서버를 가리킵니다.
 - `native:`는 실행 중인 `minsync serve --sparse`를 자동으로 채택합니다(discovery 규칙은 dense embedder와 같으며 `MINSYNC_SERVER=off`로 끕니다). `minsync serve --sparse`는 TEI 호환 `POST /embed_sparse`와 `GET /health`(kind `sparse`)를 제공합니다.
 
 모델 다운로드: 따로 설치할 것이 없습니다. 첫 sync(또는 query, `minsync serve
---sparse`)가 모델을 `~/.cache/minsync/models`(Windows는
-`%LOCALAPPDATA%\minsync\models`, `$HF_HOME`이 있으면 그 경로)에 받고, stderr가
-터미널이 아니어도 log에 그렇게 알립니다. 가중치는 Hub가 파일 이름으로 쓰는
+--sparse`)가 모델을 `~/.cache/im-not-llm/models`(Windows는
+`%LOCALAPPDATA%\im-not-llm\models`, `$HF_HOME`이 있으면 그 경로)에 받고, stderr가
+터미널이 아니어도 log에 그렇게 알립니다. `config.toml`의 `model_cache_dir`와
+`$INL_CACHE_DIR`로 경로를 바꿀 수 있고, `$HF_HOME`이 Hub client 안에서 우선합니다. 가중치는 Hub가 파일 이름으로 쓰는
 sha256과 대조하며, 손상된 다운로드(중단됐다가 잘못된 바이트로 이어받은 경우
 등)는 버리고 한 번 다시 받습니다. 한 번 받은 뒤에는 이후 실행이 네트워크를 쓰지
 않습니다. `HF_ENDPOINT`로 mirror를 지정할 수 있습니다. Hub에 접속할 수 없는
@@ -478,9 +479,9 @@ max_concurrent = 1
 
 ## 로컬 Embedding
 
-기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 실행됩니다(모델 코드는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)에서 가져왔으며 `THIRD_PARTY_NOTICES.md`에 표기했습니다). `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
+기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 im-not-llm의 text 엔진([candle](https://github.com/huggingface/candle); 모델 코드는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)에서 가져왔으며 `THIRD_PARTY_NOTICES.md`에 표기했습니다)으로 프로세스 안에서 실행됩니다. `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
 
-첫 embedding 호출이 Apache-2.0 모델을 Hugging Face Hub에서 `~/.cache/minsync/models`로 받습니다. `config.toml`의 `model_cache_dir`, `FASTEMBED_CACHE_DIR`, `HF_HOME`으로 경로를 바꿀 수 있습니다. 이후 실행은 캐시에서 로드합니다.
+첫 embedding 호출이 Apache-2.0 모델을 Hugging Face Hub에서 `~/.cache/im-not-llm/models`로 받습니다. `config.toml`의 `model_cache_dir`, `INL_CACHE_DIR`, `HF_HOME`으로 경로를 바꿀 수 있습니다. 이후 실행은 캐시에서 로드합니다.
 
 ```bash
 minsync init
@@ -510,7 +511,7 @@ minsync sync --reembed
 
 ### EmbeddingGemma 2
 
-`native:google/embeddinggemma-2`는 Google의 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)(Apache-2.0, 텍스트 타워 2.7억 파라미터, 768차원, 8K context)를 candle로 프로세스 안에서 실행합니다. 텍스트만 쓰며 체크포인트의 vision/audio 타워는 읽지 않습니다.
+`native:google/embeddinggemma-2`는 Google의 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)(Apache-2.0, 텍스트 타워 2.7억 파라미터, 768차원, 8K context)를 im-not-llm의 text 엔진(candle)으로 프로세스 안에서 실행합니다. 텍스트만 쓰며 체크포인트의 vision/audio 타워는 읽지 않습니다.
 
 ```bash
 minsync init --embedder native:google/embeddinggemma-2
@@ -593,7 +594,7 @@ dimension = 384
 
 ### Embedding 서버
 
-`minsync serve`는 native embedder를 한 번만 로드해 loopback으로 제공합니다. 다른 도구와 반복되는 CLI 호출이 모델을 각자 로드하지 않고 하나를 공유합니다.
+`minsync serve`는 native embedder를 한 번만 로드해 loopback으로 제공합니다. 다른 도구와 반복되는 CLI 호출이 모델을 각자 로드하지 않고 하나를 공유합니다. 서버 자체는 im-not-llm의 daemon(`inl_server`; `inl serve`가 실행하는 그것)이며 MinSync의 `[embedder]` / `[sparse]` 설정으로 구동됩니다. 같은 모델의 `minsync serve`와 `inl serve`는 하나의 instance를 공유합니다.
 
 ```bash
 minsync serve                    # workspace config가 있으면 그 설정, 없으면 기본 모델
@@ -610,7 +611,7 @@ minsync serve --port 8089 --idle-timeout 600
 - Prefix는 호출자가 붙입니다. 두 endpoint 모두 `"input_type": "query" | "passage"`를 받으면 설정된 `query_prefix` / `passage_prefix`를 붙입니다.
 - 모델 context를 넘는 입력은 `truncate: true`(TEI)가 아니면 `413`입니다. `--max-inputs`(기본 512)개 초과 입력이나 `--max-request-bytes`(기본 32 MiB) 초과 body도 `413`, 잘못된 JSON은 `400`/`422`입니다. forward pass가 deadline을 넘기면 `503`을 돌려주고 서버는 exit code 7로 종료합니다(멈춘 thread가 모델을 잡고 있기 때문).
 - 인증이 없으므로 `127.0.0.1`(또는 `::1`)에만 bind하고 다른 `--host`는 거부합니다. `--port 0`(기본)은 빈 port를 고릅니다.
-- `pid`, `host`, `port` 파일은 `~/.cache/minsync/serve/<model instance>/`에 있습니다(`--state-dir`로 변경). 같은 model·device·dtype·attention·`max_length`로 두 번째 `minsync serve`를 실행하면 모델을 로드하지 않고 실행 중인 서버를 출력(`--format json`이면 `"event": "adopted"`)한 뒤 종료합니다.
+- `pid`, `host`, `port` 파일은 `~/.cache/im-not-llm/serve/<model instance>/`에 있습니다(`--state-dir`로 변경). daemon이 im-not-llm으로 옮기면서 MinSync 자체의 `~/.cache/minsync/serve`에서 이동했고, instance key도 daemon의 것이 되어 engine kind를 포함합니다(같은 모델의 dense 서버와 sparse 서버가 directory를 공유하지 않습니다). 같은 model·device·dtype·attention·`max_length`로 두 번째 `minsync serve`를 실행하면 모델을 로드하지 않고 실행 중인 서버를 출력(`--format json`이면 `"event": "adopted"`)한 뒤 종료합니다.
 - `--idle-timeout`초(기본 300, `0`은 비활성) 동안 embedding 요청이 없으면 종료하고 모델을 해제합니다. `SIGTERM`/Ctrl-C도 정상 종료하며, 두 경우 모두 discovery 파일을 지웁니다.
 
 `native:` workspace는 실행 중인 서버를 자동으로 사용합니다. `sync`, `query`, `check`, `verify`, `watch`는 첫 embedding 호출 때 같은 model instance의 discovery 파일을 찾아 텍스트를 서버로 보냅니다(workspace prefix 적용, in-process 엔진처럼 `max_length`에서 truncate). 서버가 없거나 응답을 멈추면 이전처럼 in-process로 embedding합니다. M 시리즈 Mac에서 warm 서버는 `query`를 약 2.3 s / 2.4 GB에서 약 0.22 s / 59 MB로 줄입니다. `MINSYNC_SERVER=off`면 항상 in-process로 embedding합니다. 서버가 발견되려면 기본 `--state-dir`을 써야 합니다.
