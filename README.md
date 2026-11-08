@@ -306,6 +306,7 @@ index_optimize_delta_threshold = 10000
 | Embedder | Dimension |
 |---|---:|
 | `native:Qwen/Qwen3-Embedding-0.6B` (default) | 1024 |
+| `native:google/embeddinggemma-2` | 768 |
 | `tei:google/embeddinggemma-300m` | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
@@ -587,6 +588,21 @@ Existing indexes built with a 768-d TEI model must not mix 1024-d vectors. Switc
 minsync sync --full
 ```
 
+### EmbeddingGemma 2
+
+`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process on candle, text only: the checkpoint's vision and audio towers are never loaded.
+
+```bash
+minsync init --embedder native:google/embeddinggemma-2
+```
+
+`init` writes `dimension = 768` and the retrieval prompts the model is trained with (`task: search result | query: ` for queries, `title: none | text: ` for passages). The first use downloads the 1.5 GB checkpoint (it carries every modality) into the model cache.
+
+- It runs in `f32` on every device by default. The model overflows `float16`, so `dtype = "f16"` is rejected; `bf16` is accepted on Metal only, because the CPU has no bf16 matmul. On Metal, `dtype = "bf16"` cut the peak footprint of embedding 297 real ~1000-character chunks from 3.1 GB to 1.9 GB at the same speed, and its vectors stay within 0.9998 cosine similarity of the `f32` ones.
+- `attention` accepts `auto` or `eager`; the model's attention is small (4 heads) and runs eagerly.
+- Vectors keep all 768 dimensions; Matryoshka truncation is not exposed.
+- The encoder is bidirectional. Five of every six layers attend within a 512-token radius; the sixth sees the whole chunk.
+
 ### Native runtime
 
 Two optional `[embedder]` settings tune the native runtime; the defaults are what most setups want.
@@ -597,7 +613,7 @@ dtype = "auto"      # auto | f32 | f16 | bf16
 attention = "auto"  # auto | eager | tiled | fused
 ```
 
-- `dtype`: `auto` is `f16` on Metal and `f32` elsewhere. Half precision shrinks the model's footprint by a third; the vector stays within 0.0001 cosine similarity of its `f32` counterpart, which did not change retrieval results in our tests. Set `dtype = "f32"` for full precision. Existing indexes stay valid.
+- `dtype`: `auto` is `f16` on Metal and `f32` elsewhere, except for EmbeddingGemma 2, which is `f32` everywhere. Half precision shrinks the Qwen3 model's footprint by a third; the vector stays within 0.0001 cosine similarity of its `f32` counterpart, which did not change retrieval results in our tests. Set `dtype = "f32"` for full precision. Existing indexes stay valid.
 - `attention`: `auto` uses the device's fused kernel (Metal scaled-dot-product attention, CPU flash attention) and tiles the score matrix on other devices (CUDA builds), so peak memory no longer grows with the square of the chunk length. `eager` is the reference implementation that materializes the whole score matrix (several GiB for long chunks); `tiled` computes it block by block on any device; `fused` fails if the device has no fused kernel.
 
 Median of three `minsync sync` runs at the default chunk size on an Apple M4 Max (macOS, Metal), compared with the previous release (f32, eager attention):

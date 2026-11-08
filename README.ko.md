@@ -266,6 +266,7 @@ index_optimize_delta_threshold = 10000
 | Embedder | Dimension |
 |---|---:|
 | `native:Qwen/Qwen3-Embedding-0.6B` (기본값) | 1024 |
+| `native:google/embeddinggemma-2` | 768 |
 | `tei:google/embeddinggemma-300m` | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
@@ -492,6 +493,21 @@ minsync query "검색어" --k 5
 ```bash
 minsync sync --full
 ```
+
+### EmbeddingGemma 2
+
+`native:google/embeddinggemma-2`는 Google의 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)(Apache-2.0, 텍스트 타워 2.7억 파라미터, 768차원, 8K context)를 candle로 프로세스 안에서 실행합니다. 텍스트만 쓰며 체크포인트의 vision/audio 타워는 읽지 않습니다.
+
+```bash
+minsync init --embedder native:google/embeddinggemma-2
+```
+
+`init`은 `dimension = 768`과 모델이 학습된 검색 프롬프트(질의 `task: search result | query: `, passage `title: none | text: `)를 씁니다. 처음 사용할 때 1.5 GB 체크포인트(모든 modality 포함)를 모델 cache에 받습니다.
+
+- 기본값은 모든 device에서 `f32`입니다. 이 모델은 `float16`에서 overflow하므로 `dtype = "f16"`은 거부하며, `bf16`은 Metal에서만 됩니다(CPU matmul에 bf16 커널이 없습니다). Metal에서 `dtype = "bf16"`을 쓰면 실제 chunk(약 1000자) 297개를 임베딩할 때 peak footprint가 3.1 GB에서 1.9 GB로 줄고 속도는 같으며, 벡터는 `f32`와 코사인 유사도 0.9998 이내입니다.
+- `attention`은 `auto` 또는 `eager`만 받습니다. attention이 작아서(head 4개) eager로 실행합니다.
+- 벡터는 768차원 전체를 유지하며 Matryoshka 절단은 지원하지 않습니다.
+- encoder는 양방향입니다. 6개 layer 중 5개는 512 토큰 반경 안만 보고, 나머지 하나는 chunk 전체를 봅니다.
 
 ### Native 런타임
 

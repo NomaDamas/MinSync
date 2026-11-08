@@ -99,7 +99,7 @@ impl MinSync {
         let mut config = Config::default_for(&source_id);
         config.embedder.id = embedder_id.to_string();
         config.chunker.id = chunker_id.to_string();
-        if embedder_id == crate::config::EMBEDDINGGEMMA_ID {
+        if crate::config::uses_embeddinggemma_prompts(embedder_id) {
             config.embedder.query_prefix =
                 Some(crate::config::EMBEDDINGGEMMA_QUERY_PREFIX.to_string());
             config.embedder.passage_prefix =

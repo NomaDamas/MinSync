@@ -1,9 +1,11 @@
-//! In-process native embedder (Qwen3 on candle). The model lives in
-//! [`super::qwen3`]; this module owns device/dtype selection, batching and the
-//! per-batch deadline.
+//! In-process native embedder (Qwen3 and EmbeddingGemma 2 on candle). The
+//! models live in [`super::qwen3`] and [`super::gemma2`]; this module owns
+//! device/dtype selection, batching and the per-batch deadline.
 
 use crate::config::EmbedderConfig;
 use crate::embedder::deadline::BatchDeadline;
+use crate::embedder::gemma2::{self, Gemma2Embedder};
+use crate::embedder::hub::ModelSource;
 use crate::embedder::qwen3::{AttentionBackend, AttentionRequest, LoadOptions, Qwen3Embedder};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
@@ -70,9 +72,78 @@ pub(crate) enum NativeDtype {
     Bf16,
 }
 
+/// The model family behind a native model id, read from its `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Architecture {
+    Qwen3,
+    Gemma2,
+}
+
+impl Architecture {
+    /// `model` is a Hugging Face repo id or a local model directory. Anything
+    /// that is not an EmbeddingGemma 2 checkpoint loads as Qwen3, as before.
+    fn detect(model: &str, cache_dir: PathBuf) -> Result<Self> {
+        let path = ModelSource::resolve(model, cache_dir)?.fetch("config.json")?;
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
+                MinSyncError::Embedding(format!("native model config.json is invalid: {error}"))
+            })?;
+        Ok(if config["model_type"] == gemma2::MODEL_TYPE {
+            Self::Gemma2
+        } else {
+            Self::Qwen3
+        })
+    }
+}
+
+/// A loaded native embedding model.
+enum NativeModel {
+    Qwen3(Box<Qwen3Embedder>),
+    Gemma2(Box<Gemma2Embedder>),
+}
+
+impl NativeModel {
+    fn load(architecture: Architecture, options: &LoadOptions<'_>) -> Result<Self> {
+        Ok(match architecture {
+            Architecture::Qwen3 => Self::Qwen3(Box::new(Qwen3Embedder::from_hf(options)?)),
+            Architecture::Gemma2 => Self::Gemma2(Box::new(Gemma2Embedder::from_hf(options)?)),
+        })
+    }
+
+    /// Unit-length embeddings, one per input.
+    fn embed(&self, texts: &[String]) -> candle_core::Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Qwen3(model) => model.embed(texts),
+            Self::Gemma2(model) => model.embed(texts),
+        }
+    }
+
+    fn attention_heads(&self) -> usize {
+        match self {
+            Self::Qwen3(model) => model.config().num_attention_heads,
+            Self::Gemma2(model) => model.config().num_attention_heads(),
+        }
+    }
+
+    /// Output vector length.
+    fn dimension(&self) -> usize {
+        match self {
+            Self::Qwen3(model) => model.config().hidden_size,
+            Self::Gemma2(model) => model.config().embedding_dim(),
+        }
+    }
+
+    fn backend(&self) -> AttentionBackend {
+        match self {
+            Self::Qwen3(model) => model.backend(),
+            Self::Gemma2(model) => model.backend(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LoadedModel {
-    model: Arc<Mutex<Qwen3Embedder>>,
+    model: Arc<Mutex<NativeModel>>,
     /// Serializes forward passes ahead of the deadline; see [`embed_in_batches`].
     gate: Arc<tokio::sync::Mutex<()>>,
     attention_heads: usize,
@@ -279,16 +350,23 @@ impl NativeEmbedder {
                 tokio::task::spawn_blocking(move || {
                     apply_cache_dir(cache_dir.as_deref());
                     let device = resolve_device(device)?;
-                    let dtype =
-                        dtype.map_or_else(|| default_dtype(&device), NativeDtype::to_candle);
-                    let model = Qwen3Embedder::from_hf(&LoadOptions {
-                        repo_id: &repo,
-                        default_cache_dir: PathBuf::from(model_cache_dir()),
-                        device: &device,
-                        dtype,
-                        max_length,
-                        attention,
-                    })?;
+                    let cache = PathBuf::from(model_cache_dir());
+                    let architecture = Architecture::detect(&repo, cache.clone())?;
+                    let dtype = dtype.map_or_else(
+                        || default_dtype(&device, architecture),
+                        NativeDtype::to_candle,
+                    );
+                    let model = NativeModel::load(
+                        architecture,
+                        &LoadOptions {
+                            repo_id: &repo,
+                            default_cache_dir: cache,
+                            device: &device,
+                            dtype,
+                            max_length,
+                            attention,
+                        },
+                    )?;
                     let batch_timeout = effective_batch_timeout(
                         batch_timeout,
                         batch_timeout_explicit,
@@ -302,8 +380,8 @@ impl NativeEmbedder {
                         "native embedder ready"
                     );
                     Ok(LoadedModel {
-                        attention_heads: model.config().num_attention_heads.max(1),
-                        dimension: model.config().hidden_size,
+                        attention_heads: model.attention_heads().max(1),
+                        dimension: model.dimension(),
                         device: device_label(&device),
                         dtype,
                         backend: model.backend(),
@@ -671,11 +749,12 @@ pub(crate) fn parse_dtype(value: Option<&str>) -> Result<Option<NativeDtype>> {
 }
 
 /// Weight/activation precision when the config does not name one: half
-/// precision on Metal, where it cuts the model's footprint by a third at no
-/// measurable retrieval cost; f32 elsewhere, where half-precision kernels are
-/// either slow (CPU, pre-Volta CUDA) or not worth the precision.
-pub(crate) fn default_dtype(device: &Device) -> DType {
-    if device.is_metal() {
+/// precision on Metal for Qwen3, where it cuts the model's footprint by a
+/// third at no measurable retrieval cost; f32 elsewhere, where half-precision
+/// kernels are either slow (CPU, pre-Volta CUDA) or not worth the precision.
+/// EmbeddingGemma 2 overflows float16, so it runs in f32 everywhere.
+pub(crate) fn default_dtype(device: &Device, architecture: Architecture) -> DType {
+    if device.is_metal() && architecture == Architecture::Qwen3 {
         DType::F16
     } else {
         DType::F32
@@ -1028,12 +1107,31 @@ mod tests {
     }
 
     #[test]
-    fn default_dtype_is_f32_unless_the_device_is_metal() {
-        assert_eq!(default_dtype(&Device::Cpu), DType::F32);
+    fn default_dtype_is_f32_unless_a_qwen3_runs_on_metal() {
+        for architecture in [Architecture::Qwen3, Architecture::Gemma2] {
+            assert_eq!(default_dtype(&Device::Cpu, architecture), DType::F32);
+        }
         #[cfg(target_os = "macos")]
         if let Ok(metal) = Device::new_metal(0) {
-            assert_eq!(default_dtype(&metal), DType::F16);
+            assert_eq!(default_dtype(&metal, Architecture::Qwen3), DType::F16);
+            assert_eq!(default_dtype(&metal, Architecture::Gemma2), DType::F32);
         }
+    }
+
+    #[test]
+    fn architecture_follows_the_model_type_of_the_config() {
+        let dir = std::env::temp_dir().join("minsync-arch-detect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let detect = |config: &str| {
+            std::fs::write(dir.join("config.json"), config).unwrap();
+            Architecture::detect(dir.to_str().unwrap(), dir.clone()).unwrap()
+        };
+        assert_eq!(
+            detect(r#"{"model_type":"embedding_gemma2"}"#),
+            Architecture::Gemma2
+        );
+        assert_eq!(detect(r#"{"model_type":"qwen3"}"#), Architecture::Qwen3);
+        assert_eq!(detect("{}"), Architecture::Qwen3);
     }
 }
 

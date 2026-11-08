@@ -32,6 +32,20 @@ reference; the golden test reproduces its output.
   (<http://www.apache.org/licenses/LICENSE-2.0> or
   <https://opensource.org/licenses/MIT>)
 
+## google/embeddinggemma-2: EmbeddingGemma 2 text tower
+
+`src/embedder/gemma2.rs` implements the text tower of EmbeddingGemma 2 on
+candle, written against the Hugging Face `transformers` reference
+(`EmbeddingGemma2TextModel`) and the checkpoint's Sentence-Transformers
+pipeline; the golden tests reproduce their output. The weights are **not** part
+of MinSync: the `native:` embedder downloads them from Hugging Face on first
+use.
+
+- Reference: `transformers` (<https://github.com/huggingface/transformers>),
+  Apache License, Version 2.0 (<http://www.apache.org/licenses/LICENSE-2.0>)
+- Model: `google/embeddinggemma-2` (270M-parameter text tower), Apache
+  License, Version 2.0
+
 ## nlpai-lab/KURE-Sparse-nano: learned sparse (SPLADE) model
 
 Sparse retrieval uses the
