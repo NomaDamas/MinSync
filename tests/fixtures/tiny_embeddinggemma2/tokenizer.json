@@ -1,0 +1,140 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": {
+    "type": "Lowercase"
+  },
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "<bos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "<bos>": {
+        "id": "<bos>",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "<bos>"
+        ]
+      },
+      "<eos>": {
+        "id": "<eos>",
+        "ids": [
+          1
+        ],
+        "tokens": [
+          "<eos>"
+        ]
+      }
+    }
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<pad>": 0,
+      "<eos>": 1,
+      "<bos>": 2,
+      "<unk>": 3,
+      "w0": 4,
+      "w1": 5,
+      "w2": 6,
+      "w3": 7,
+      "w4": 8,
+      "w5": 9,
+      "w6": 10,
+      "w7": 11,
+      "w8": 12,
+      "w9": 13,
+      "w10": 14,
+      "w11": 15,
+      "w12": 16,
+      "w13": 17,
+      "w14": 18,
+      "w15": 19,
+      "w16": 20,
+      "w17": 21,
+      "w18": 22,
+      "w19": 23,
+      "w20": 24,
+      "w21": 25,
+      "w22": 26,
+      "w23": 27,
+      "w24": 28,
+      "w25": 29,
+      "w26": 30,
+      "w27": 31,
+      "w28": 32,
+      "w29": 33,
+      "w30": 34,
+      "w31": 35,
+      "w32": 36,
+      "w33": 37,
+      "w34": 38,
+      "w35": 39,
+      "w36": 40,
+      "w37": 41,
+      "w38": 42,
+      "w39": 43,
+      "w40": 44,
+      "w41": 45,
+      "w42": 46,
+      "w43": 47,
+      "w44": 48,
+      "w45": 49,
+      "w46": 50,
+      "w47": 51,
+      "w48": 52,
+      "w49": 53,
+      "w50": 54,
+      "w51": 55,
+      "w52": 56,
+      "w53": 57,
+      "w54": 58,
+      "w55": 59,
+      "w56": 60,
+      "w57": 61,
+      "w58": 62,
+      "w59": 63
+    },
+    "unk_token": "<unk>"
+  }
+}
