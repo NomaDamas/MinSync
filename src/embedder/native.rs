@@ -1287,30 +1287,74 @@ mod deadline_tests {
         let deadline = Arc::new(BatchDeadline::new());
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let model = Arc::new(Mutex::new(()));
-        let run = |name: &'static str| {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+
+        // First caller holds the model longer than the waiters' per-pass
+        // deadline, under its own generous budget so thread-spawn and timer
+        // jitter on a loaded 3-vCPU CI runner cannot trip the holder itself.
+        let holder = {
             let deadline = Arc::clone(&deadline);
             let gate = Arc::clone(&gate);
             let model = Arc::clone(&model);
+            let entered_tx = Mutex::new(Some(entered_tx));
+            let queued_rx = Mutex::new(queued_rx);
             tokio::spawn(async move {
                 embed_in_batches(
                     &deadline,
                     &gate,
-                    Duration::from_millis(400),
-                    vec![name.to_string()],
+                    Duration::from_secs(15),
+                    vec!["a".to_string()],
                     vec![0..1],
                     move |chunk: &[String]| {
                         let _model = model.lock().unwrap();
-                        std::thread::sleep(Duration::from_millis(250));
+                        entered_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                        queued_rx.lock().unwrap().recv().unwrap();
+                        std::thread::sleep(Duration::from_millis(2400));
                         Ok(chunk.iter().map(|_| vec![1.0]).collect())
                     },
                 )
                 .await
             })
         };
-        let handles: Vec<_> = ["a", "b", "c"].into_iter().map(run).collect();
-        for handle in handles {
-            let outcome = handle.await.unwrap();
-            assert!(outcome.is_ok(), "{outcome:?}");
+
+        entered_rx.await.unwrap();
+
+        // Waiters queue behind the holder for 2.4s — exceeding their 2.0s
+        // per-pass budget — then run a no-sleep pass on the already-warm
+        // blocking thread with 2.0s of headroom.
+        let mut waiters = Vec::new();
+        for name in ["b", "c"] {
+            let deadline = Arc::clone(&deadline);
+            let gate = Arc::clone(&gate);
+            let model = Arc::clone(&model);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            waiters.push(tokio::spawn(async move {
+                let _ = started_tx.send(());
+                embed_in_batches(
+                    &deadline,
+                    &gate,
+                    Duration::from_secs(2),
+                    vec![name.to_string()],
+                    vec![0..1],
+                    move |chunk: &[String]| {
+                        let _model = model.lock().unwrap();
+                        Ok(chunk.iter().map(|_| vec![1.0]).collect())
+                    },
+                )
+                .await
+            }));
+            started_rx.await.unwrap();
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        queued_tx.send(()).unwrap();
+
+        assert_eq!(holder.await.unwrap().unwrap(), vec![vec![1.0]]);
+        for waiter in waiters {
+            let outcome = waiter.await.unwrap();
+            assert_eq!(outcome.unwrap(), vec![vec![1.0]]);
         }
     }
 }
