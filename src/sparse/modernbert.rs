@@ -16,7 +16,7 @@
 //! of padded keys, and has no MLM-logit chunking.
 
 use crate::error::{MinSyncError, Result};
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 
@@ -210,29 +210,15 @@ impl Norm {
 /// input costs ~100 MB of scratch instead of ~3 GB.
 const QUERY_TILE: usize = 256;
 
-/// Tokens (rows x positions) the decoder projection and the pooling handle at
-/// once. The projection is `tokens x vocab` f32, 200 KB per token for this
-/// vocabulary, and pooling holds several temporaries of that size, so this
-/// number alone sets the scratch memory of the encoder, whatever the batch.
+/// Packed speaking positions the MLM head, the decoder projection and the
+/// pooling handle at once. The projection is `tokens x vocab`, 200 KB per
+/// token in f32 for this vocabulary, so this number alone sets the scratch
+/// memory of the encoder, whatever the batch.
 ///
 /// Measured on KURE-Sparse-nano with a full sync: 128 tokens encode as fast as
 /// 1024 (SciFact 15.6 vs 15.2-15.7 chunks/s, Korean 31.7-35.7 vs 32.8) and cut
 /// the Metal peak from 2.2 GB to 1.56 GB and the CPU peak from 3.4 GB to 1.0 GB.
 const LOGIT_TOKENS: usize = 128;
-
-/// Rows and positions of one decoder/pooling block: at most `chunk` positions
-/// (the pooling module's `chunk_size`, the whole sequence when unset) and at
-/// most `cap` tokens (rows x positions) in total; never below 1 x 1.
-pub(crate) fn logit_shape(seq: usize, chunk: Option<usize>, cap: usize) -> (usize, usize) {
-    let cap = cap.max(1);
-    let positions = chunk
-        .filter(|&size| size > 0)
-        .unwrap_or(seq)
-        .min(seq)
-        .min(cap)
-        .max(1);
-    (cap / positions, positions)
-}
 
 struct Rotary {
     cos: Tensor,
@@ -270,17 +256,33 @@ impl Rotary {
         })
     }
 
-    /// Rotate `x: [batch, heads, seq, head_dim]` (half-split pairing, as HF).
+    /// Rotate `x: [batch, seq, heads, head_dim]` (half-split pairing, as HF),
+    /// the layout the projections produce, so no transpose copy precedes it.
     fn apply(&self, x: &Tensor) -> CResult<Tensor> {
-        let seq = x.dim(2)?;
+        let seq = x.dim(1)?;
         let cos = self.cos.narrow(0, 0, seq)?;
         let sin = self.sin.narrow(0, 0, seq)?;
-        candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        candle_nn::rotary_emb::rope_thd(&x.contiguous()?, &cos, &sin)
     }
 }
 
+/// Rows `[first, first + count)` of a weight `[out, in]` as a bias-free
+/// projection with its own contiguous storage.
+fn rows_of(weight: &Tensor, first: usize, count: usize) -> CResult<Linear> {
+    Ok(Linear::new(
+        weight.narrow(0, first, count)?.contiguous()?,
+        None,
+    ))
+}
+
+/// The checkpoint's fused `Wqkv` is split into three projections at load:
+/// each output is already `[batch, seq, heads, head_dim]`, so rope runs on it
+/// directly and the fused kernel reads the transposed views, where slicing a
+/// fused output costs three strided copies per layer.
 struct Attention {
-    wqkv: Linear,
+    wq: Linear,
+    wk: Linear,
+    wv: Linear,
     wo: Linear,
     heads: usize,
     head_dim: usize,
@@ -288,9 +290,13 @@ struct Attention {
 
 impl Attention {
     fn load(cfg: &ModernBertConfig, vb: VarBuilder) -> CResult<Self> {
+        let hidden = cfg.hidden_size;
+        let wqkv = vb.pp("Wqkv").get((3 * hidden, hidden), "weight")?;
         Ok(Self {
-            wqkv: candle_nn::linear_no_bias(cfg.hidden_size, 3 * cfg.hidden_size, vb.pp("Wqkv"))?,
-            wo: candle_nn::linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("Wo"))?,
+            wq: rows_of(&wqkv, 0, hidden)?,
+            wk: rows_of(&wqkv, hidden, hidden)?,
+            wv: rows_of(&wqkv, 2 * hidden, hidden)?,
+            wo: candle_nn::linear_no_bias(hidden, hidden, vb.pp("Wo"))?,
             heads: cfg.num_attention_heads,
             head_dim: cfg.head_dim(),
         })
@@ -305,15 +311,15 @@ impl Attention {
         tile: usize,
     ) -> CResult<Tensor> {
         let (batch, seq, _) = hidden.dims3()?;
-        let qkv = self
-            .wqkv
-            .forward(hidden)?
-            .reshape((batch, seq, 3, self.heads, self.head_dim))?;
-        let part = |index: usize| -> CResult<Tensor> {
-            qkv.i((.., .., index))?.transpose(1, 2)?.contiguous()
+        let project = |weight: &Linear| -> CResult<Tensor> {
+            weight
+                .forward(hidden)?
+                .reshape((batch, seq, self.heads, self.head_dim))
         };
-        let (q, k, v) = (part(0)?, part(1)?, part(2)?);
-        let (q, k) = (rotary.apply(&q)?, rotary.apply(&k)?);
+        // [batch, heads, seq, head_dim] views of [batch, seq, heads, head_dim].
+        let q = rotary.apply(&project(&self.wq)?)?.transpose(1, 2)?;
+        let k = rotary.apply(&project(&self.wk)?)?.transpose(1, 2)?;
+        let v = project(&self.wv)?.transpose(1, 2)?;
         let scale = (self.head_dim as f32).powf(-0.5);
         let out = attend(backend, &q, &k, &v, mask, scale, tile)?;
         self.wo.forward(
@@ -351,9 +357,9 @@ impl AttentionBackend {
     }
 }
 
-/// Attention over `q`, `k`, `v` (`[batch, heads, seq, head_dim]`) with the
-/// additive `mask` (`[batch, 1, seq, seq]`, model dtype); `scale` multiplies
-/// the scores before the mask.
+/// Attention over `q`, `k`, `v` (`[batch, heads, seq, head_dim]`, possibly
+/// strided views) with the additive `mask` (`[batch, 1, seq, seq]`, model
+/// dtype); `scale` multiplies the scores before the mask.
 fn attend(
     backend: AttentionBackend,
     q: &Tensor,
@@ -372,13 +378,14 @@ fn attend(
         AttentionBackend::Tiled => {
             let q = (q * f64::from(scale))?;
             let k_t = k.transpose(2, 3)?.contiguous()?;
+            let v = v.contiguous()?;
             let mut blocks = Vec::with_capacity(seq.div_ceil(tile));
             let mut start = 0;
             while start < seq {
                 let rows = tile.min(seq - start);
                 let scores = q.narrow(2, start, rows)?.matmul(&k_t)?;
                 let scores = scores.broadcast_add(&mask.narrow(2, start, rows)?)?;
-                blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(v)?);
+                blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?);
                 start += rows;
             }
             if blocks.len() == 1 {
@@ -390,27 +397,32 @@ fn attend(
     }
 }
 
+/// GeGLU MLP. The checkpoint's fused `Wi` is split into its two halves at
+/// load, so `gelu` and the gate product read contiguous tensors instead of
+/// strided halves of one output (about 2.5x slower on Metal).
 struct Mlp {
-    wi: Linear,
+    wi_input: Linear,
+    wi_gate: Linear,
     wo: Linear,
-    intermediate: usize,
 }
 
 impl Mlp {
     fn load(cfg: &ModernBertConfig, vb: VarBuilder) -> CResult<Self> {
+        let intermediate = cfg.intermediate_size;
+        let wi = vb
+            .pp("Wi")
+            .get((2 * intermediate, cfg.hidden_size), "weight")?;
         Ok(Self {
-            wi: candle_nn::linear_no_bias(cfg.hidden_size, 2 * cfg.intermediate_size, vb.pp("Wi"))?,
-            wo: candle_nn::linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("Wo"))?,
-            intermediate: cfg.intermediate_size,
+            wi_input: rows_of(&wi, 0, intermediate)?,
+            wi_gate: rows_of(&wi, intermediate, intermediate)?,
+            wo: candle_nn::linear_no_bias(intermediate, cfg.hidden_size, vb.pp("Wo"))?,
         })
     }
 
-    /// GeGLU: `gelu(first half) * second half`.
+    /// `gelu(first half) * second half`.
     fn forward(&self, hidden: &Tensor) -> CResult<Tensor> {
-        let projected = self.wi.forward(hidden)?;
-        let input = projected.narrow(D::Minus1, 0, self.intermediate)?;
-        let gate = projected.narrow(D::Minus1, self.intermediate, self.intermediate)?;
-        self.wo.forward(&(input.gelu_erf()? * gate)?)
+        let input = self.wi_input.forward(hidden)?.gelu_erf()?;
+        self.wo.forward(&(input * self.wi_gate.forward(hidden)?)?)
     }
 }
 
@@ -429,7 +441,11 @@ pub struct ModernBertMlm {
     final_norm: Norm,
     head_dense: Linear,
     head_norm: Norm,
+    /// Tied to the token embeddings, without its bias: see `decoder_bias`.
     decoder: Linear,
+    /// `[1, vocab]` f32. Added once per row after the max over positions
+    /// ([`SpladePooling::pool_states`]), not to every position's logits.
+    decoder_bias: Option<Tensor>,
     global_rotary: Rotary,
     local_rotary: Rotary,
     half_window: usize,
@@ -483,11 +499,15 @@ impl ModernBertMlm {
         let head_norm = Norm::load(hidden, cfg.eps(), head.pp("norm"))?;
         // The decoder is tied to the token embeddings; only its bias is stored.
         let decoder_bias = if cfg.decoder_bias {
-            Some(vb.get(cfg.vocab_size, "decoder.bias")?)
+            Some(
+                vb.get(cfg.vocab_size, "decoder.bias")?
+                    .to_dtype(DType::F32)?
+                    .reshape((1, cfg.vocab_size))?,
+            )
         } else {
             None
         };
-        let decoder = Linear::new(tok_embeddings.embeddings().clone(), decoder_bias);
+        let decoder = Linear::new(tok_embeddings.embeddings().clone(), None);
         let (global_theta, local_theta) = cfg
             .thetas()
             .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
@@ -502,6 +522,7 @@ impl ModernBertMlm {
             head_dense,
             head_norm,
             decoder,
+            decoder_bias,
             global_rotary: Rotary::new(
                 cfg.head_dim(),
                 global_theta,
@@ -592,9 +613,9 @@ impl ModernBertMlm {
         Ok((build(global)?, build(local)?))
     }
 
-    /// Final hidden state through the MLM head, `[batch, seq, hidden]`, for
+    /// Final hidden state (after `final_norm`), `[batch, seq, hidden]`, for
     /// right-padded `ids` (`[batch, seq]`, u32) with real lengths `lengths`.
-    fn head_states(&self, ids: &Tensor, lengths: &[usize]) -> CResult<Tensor> {
+    fn hidden_states(&self, ids: &Tensor, lengths: &[usize]) -> CResult<Tensor> {
         let (batch, seq) = ids.dims2()?;
         if lengths.len() != batch {
             candle_core::bail!("expected {batch} lengths, got {}", lengths.len());
@@ -626,30 +647,24 @@ impl ModernBertMlm {
                     .forward(&normed, rotary, mask, backend, self.tile)?)?;
             hidden = (&hidden + layer.mlp.forward(&layer.mlp_norm.forward(&hidden)?)?)?;
         }
-        let hidden = self.final_norm.forward(&hidden)?;
-        self.head_norm
-            .forward(&self.head_dense.forward(&hidden)?.gelu_erf()?)
+        self.final_norm.forward(&hidden)
     }
 
-    /// Full MLM logits `[batch, seq, vocab]`. Materializes the whole tensor
-    /// (`batch x seq x vocab`), so it is for tests and short inputs; the
-    /// encoder uses [`Self::splade`], which never holds more than one chunk.
-    pub fn logits(&self, ids: &Tensor, lengths: &[usize]) -> Result<Tensor> {
-        self.head_states(ids, lengths)
-            .and_then(|states| self.decoder.forward(&states))
-            .map_err(|error| {
-                MinSyncError::Embedding(format!("native sparse forward failed: {error}"))
-            })
+    /// MLM head and bias-free decoder for packed positions `[tokens, hidden]`.
+    fn project(&self, hidden: &Tensor) -> CResult<Tensor> {
+        let head = self
+            .head_norm
+            .forward(&self.head_dense.forward(hidden)?.gelu_erf()?)?;
+        self.decoder.forward(&head)
     }
 
     /// SPLADE term weights, one dense `[dimension]` row per input.
     ///
     /// `rows` are the real token ids of each input (the same ones that were
-    /// right-padded into `ids`). The decoder projection and the pooling work
-    /// on blocks of at most `logit_tokens` (rows x positions) at a time, so
-    /// the logit tensors and the temporaries derived from them stay bounded
-    /// whatever the batch size or the sequence length. The max over positions
-    /// and the per-row result are exact across any blocking.
+    /// right-padded into `ids`). Only their speaking positions go through the
+    /// MLM head and the decoder, at most `logit_tokens` of them at a time, so
+    /// the logit tensors stay bounded whatever the batch size or the sequence
+    /// length; the max over positions is exact across any blocking.
     pub fn splade(
         &self,
         ids: &Tensor,
@@ -658,30 +673,15 @@ impl ModernBertMlm {
     ) -> Result<Vec<Vec<f32>>> {
         let lengths: Vec<usize> = rows.iter().map(Vec::len).collect();
         let inner = || -> CResult<Vec<Vec<f32>>> {
-            let states = self.head_states(ids, &lengths)?;
-            let (batch, seq, _) = states.dims3()?;
-            let (block_rows, block_positions) =
-                logit_shape(seq, pooling.chunk_size, self.logit_tokens);
-            let mask = PoolMask::new(pooling, rows, seq, self.vocab_size, &self.device)?;
-            let mut out = Vec::with_capacity(batch);
-            let mut first = 0;
-            while first < batch {
-                let take_rows = block_rows.min(batch - first);
-                let block = states.narrow(0, first, take_rows)?;
-                let keep = mask.keep.narrow(0, first, take_rows)?;
-                let mut pooled =
-                    Tensor::zeros((take_rows, self.vocab_size), DType::F32, &self.device)?;
-                let mut start = 0;
-                while start < seq {
-                    let take = block_positions.min(seq - start);
-                    let logits = self.decoder.forward(&block.narrow(1, start, take)?)?;
-                    pooled = pooling.accumulate(&pooled, &logits, &keep.narrow(1, start, take)?)?;
-                    start += take;
-                }
-                out.extend(pooling.fold(&pooling.finish(&pooled, &mask.open)?)?);
-                first += take_rows;
-            }
-            Ok(out)
+            let states = self.hidden_states(ids, &lengths)?;
+            pooling.pool_states(
+                &states,
+                rows,
+                self.vocab_size,
+                |packed| self.project(packed),
+                self.decoder_bias.as_ref(),
+                self.logit_tokens,
+            )
         };
         inner().map_err(|error| {
             MinSyncError::Embedding(format!("native sparse forward failed: {error}"))
@@ -689,38 +689,27 @@ impl ModernBertMlm {
     }
 }
 
-/// Which positions may speak and which vocabulary entries may fire.
-struct PoolMask {
-    /// `[batch, seq, 1]`: 1 for a real, non-prefix position.
-    keep: Tensor,
-    /// `[1, vocab]`: 0 for a masked vocabulary entry.
-    open: Tensor,
+/// The positions that may speak (real, non-prefix tokens), packed row by row.
+struct Speakers {
+    /// `row * seq + position` of every speaking position, row-major.
+    index: Vec<u32>,
+    /// Exclusive end of each row's run in `index`.
+    ends: Vec<usize>,
 }
 
-impl PoolMask {
-    fn new(
-        pooling: &SpladePooling,
-        rows: &[Vec<u32>],
-        seq: usize,
-        vocab: usize,
-        device: &Device,
-    ) -> CResult<Self> {
-        let mut keep = vec![0f32; rows.len() * seq];
+impl Speakers {
+    fn new(pooling: &SpladePooling, rows: &[Vec<u32>], seq: usize) -> Self {
+        let mut index = Vec::with_capacity(rows.iter().map(Vec::len).sum());
+        let mut ends = Vec::with_capacity(rows.len());
         for (row, ids) in rows.iter().enumerate() {
             for (position, id) in ids.iter().enumerate() {
                 if !pooling.prefix_token_ids.contains(id) {
-                    keep[row * seq + position] = 1.0;
+                    index.push((row * seq + position) as u32);
                 }
             }
+            ends.push(index.len());
         }
-        let mut open = vec![1f32; vocab];
-        for &id in &pooling.masked_vocab_ids {
-            open[id as usize] = 0.0;
-        }
-        Ok(Self {
-            keep: Tensor::from_vec(keep, (rows.len(), seq, 1), device)?,
-            open: Tensor::from_vec(open, (1, vocab), device)?,
-        })
+        Self { index, ends }
     }
 }
 
@@ -733,8 +722,6 @@ pub struct SpladePooling {
     pub pooling_strategy: String,
     #[serde(default = "default_relu")]
     pub activation_function: String,
-    #[serde(default)]
-    pub chunk_size: Option<usize>,
     #[serde(default)]
     pub logit_shift: f64,
     #[serde(default)]
@@ -801,26 +788,98 @@ impl SpladePooling {
             .map_or(vocab_size, |max| *max as usize + 1)
     }
 
-    /// Fold one block of `logits` (`[rows, take, vocab]`) into the running
-    /// per-term max `pooled` (`[rows, vocab]`, f32) of the *shifted* logit
-    /// of the positions that may speak. `keep` is the block's `[rows, take,
-    /// 1]` slice of the position mask. Only the reduction touches the
-    /// per-position tensor: `relu`, `ln(1 + x)` and the vocabulary mask `open`
-    /// (0 or 1) are monotone, so they commute with the max over positions and
-    /// run once per row in [`Self::finish`]. `max` is exact across any
-    /// blocking, and the accumulator starts at zero because a masked position
-    /// contributes zero.
-    fn accumulate(&self, pooled: &Tensor, logits: &Tensor, keep: &Tensor) -> CResult<Tensor> {
-        // The reference multiplies the *shifted* logit by the mask before relu.
-        let shifted = (logits.to_dtype(DType::F32)? - self.logit_shift)?.broadcast_mul(keep)?;
-        pooled.maximum(&shifted.max(1)?)
+    /// Term weights of every row of `states` (`[batch, seq, width]`, rows
+    /// right-padded; `rows` are their real token ids). `project` maps packed
+    /// positions `[tokens, width]` to bias-free logits `[tokens, vocab]`, at
+    /// most `block` tokens at a time; `bias` (`[1, vocab]`, f32) is the
+    /// decoder bias.
+    ///
+    /// Only real, non-prefix positions are projected: padding and the prefix
+    /// never reach the decoder. Positions are reduced by a per-term max alone
+    /// and every later step (bias, shift, `relu`, `ln(1 + x)`, the 0/1
+    /// vocabulary mask) is monotone in the logit, so those run once per row
+    /// in [`Self::finish`] rather than once per position; a max is exact
+    /// across any blocking. A row with no speaking position pools to zero, as
+    /// in the reference, whose position mask zeroes the shifted logit.
+    fn pool_states(
+        &self,
+        states: &Tensor,
+        rows: &[Vec<u32>],
+        vocab: usize,
+        project: impl Fn(&Tensor) -> CResult<Tensor>,
+        bias: Option<&Tensor>,
+        block: usize,
+    ) -> CResult<Vec<Vec<f32>>> {
+        let (batch, seq, width) = states.dims3()?;
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let device = states.device();
+        let speakers = Speakers::new(self, rows, seq);
+        let total = speakers.index.len();
+        let mut best: Vec<Option<Tensor>> = vec![None; batch];
+        if total > 0 {
+            let index = Tensor::from_vec(speakers.index, total, device)?;
+            let packed = states
+                .reshape((batch * seq, width))?
+                .index_select(&index, 0)?;
+            let block = block.max(1);
+            let mut row = 0;
+            let mut start = 0;
+            while start < total {
+                let end = total.min(start.saturating_add(block));
+                let logits = project(&packed.narrow(0, start, end - start)?)?;
+                while speakers.ends[row] <= start {
+                    row += 1;
+                }
+                for (current, slot) in best.iter_mut().enumerate().skip(row) {
+                    let begin = if current == 0 {
+                        0
+                    } else {
+                        speakers.ends[current - 1]
+                    };
+                    if begin >= end {
+                        break;
+                    }
+                    let (lo, hi) = (begin.max(start), speakers.ends[current].min(end));
+                    if lo < hi {
+                        let local = logits.narrow(0, lo - start, hi - lo)?.max_keepdim(0)?;
+                        *slot = Some(match slot.take() {
+                            Some(previous) => previous.maximum(&local)?,
+                            None => local,
+                        });
+                    }
+                }
+                start = end;
+            }
+        }
+        let silent = Tensor::full(f32::NEG_INFINITY, (1, vocab), device)?;
+        let pooled = best
+            .into_iter()
+            .map(|row| match row {
+                Some(max) => max.to_dtype(DType::F32),
+                None => Ok(silent.clone()),
+            })
+            .collect::<CResult<Vec<_>>>()?;
+        let mut open = vec![1f32; vocab];
+        for &id in &self.masked_vocab_ids {
+            open[id as usize] = 0.0;
+        }
+        let open = Tensor::from_vec(open, (1, vocab), device)?;
+        self.fold(&self.finish(&Tensor::cat(&pooled, 0)?, bias, &open)?)
     }
 
-    /// Turn the accumulated max of shifted logits into term weights
-    /// `ln(1 + relu(max))`, zero for a masked vocabulary entry (`open`:
-    /// `[1, vocab]`).
-    fn finish(&self, pooled: &Tensor, open: &Tensor) -> CResult<Tensor> {
-        (pooled.broadcast_mul(open)?.relu()? + 1.0)?.log()
+    /// Term weights `ln(1 + relu(max + bias - shift))` from the per-row max
+    /// of the bias-free logits (`[rows, vocab]`, f32, `-inf` for a row that
+    /// had no speaking position), zero for a masked vocabulary entry (`open`:
+    /// `[1, vocab]`, 0 or 1). `relu` runs before the mask so `-inf` never
+    /// meets a zero.
+    fn finish(&self, pooled: &Tensor, bias: Option<&Tensor>, open: &Tensor) -> CResult<Tensor> {
+        let logit = match bias {
+            Some(bias) => pooled.broadcast_add(bias)?,
+            None => pooled.clone(),
+        };
+        ((logit - self.logit_shift)?.relu()?.broadcast_mul(open)? + 1.0)?.log()
     }
 
     /// Fold the vocabulary onto canonical terms (max per term), on the host.
@@ -853,10 +912,14 @@ impl SpladePooling {
         vocab_size: usize,
     ) -> Result<Vec<Vec<f32>>> {
         let inner = || -> CResult<Vec<Vec<f32>>> {
-            let (batch, seq, _) = logits.dims3()?;
-            let mask = PoolMask::new(self, rows, seq, vocab_size, logits.device())?;
-            let zeros = Tensor::zeros((batch, vocab_size), DType::F32, logits.device())?;
-            self.fold(&self.finish(&self.accumulate(&zeros, logits, &mask.keep)?, &mask.open)?)
+            self.pool_states(
+                logits,
+                rows,
+                vocab_size,
+                |x| Ok(x.clone()),
+                None,
+                usize::MAX,
+            )
         };
         inner().map_err(|error| {
             MinSyncError::Embedding(format!("native sparse pooling failed: {error}"))
@@ -1054,9 +1117,9 @@ mod tests {
     }
 
     #[test]
-    fn attention_tiling_and_logit_chunking_do_not_change_the_result() {
-        // Tile of 3 rows and a pooling chunk of 3 positions both split the
-        // 40-token row into many blocks; the reference ran it in one piece.
+    fn attention_tiling_does_not_change_the_result() {
+        // Tiles of 1, 3 and 7 query rows split the 40-token row into many
+        // blocks; the reference ran it in one piece.
         let (model, pooling, cfg) = load_model(DType::F32);
         let golden: Golden =
             serde_json::from_slice(&std::fs::read(fixture_dir().join("golden.json")).unwrap())
@@ -1066,25 +1129,14 @@ mod tests {
             .iter()
             .map(|row| row.ids.clone())
             .collect();
-        let whole = SpladePooling {
-            chunk_size: None,
-            ..pooling.clone()
-        };
-        let reference = run(&model, &whole, cfg.vocab_size, &rows);
-        let tiled = load_model(DType::F32).0.with_tile(3);
-        for chunk in [Some(1), Some(3), Some(7), Some(10_000)] {
-            let chunked = SpladePooling {
-                chunk_size: chunk,
-                ..pooling.clone()
-            };
-            let got = run(&tiled, &chunked, cfg.vocab_size, &rows);
+        let reference = run(&model, &pooling, cfg.vocab_size, &rows);
+        for tile in [1, 3, 7] {
+            let tiled = load_model(DType::F32).0.with_tile(tile);
+            let got = run(&tiled, &pooling, cfg.vocab_size, &rows);
             for (index, (a, b)) in got.iter().zip(&reference).enumerate() {
-                assert_eq!(a.indices(), b.indices(), "chunk {chunk:?} row {index}");
+                assert_eq!(a.indices(), b.indices(), "tile {tile} row {index}");
                 for (x, y) in a.values().iter().zip(b.values()) {
-                    assert!(
-                        (x - y).abs() < 1e-4,
-                        "chunk {chunk:?} row {index}: {x} vs {y}"
-                    );
+                    assert!((x - y).abs() < 1e-4, "tile {tile} row {index}: {x} vs {y}");
                 }
             }
         }
@@ -1116,7 +1168,6 @@ mod tests {
         SpladePooling {
             pooling_strategy: "max".into(),
             activation_function: "relu".into(),
-            chunk_size: None,
             logit_shift: shift,
             top_k: None,
             prefix_token_ids: prefix.to_vec(),
@@ -1176,7 +1227,6 @@ mod tests {
         let base = SpladePooling {
             pooling_strategy: "max".into(),
             activation_function: "relu".into(),
-            chunk_size: None,
             logit_shift: 0.0,
             top_k: None,
             prefix_token_ids: vec![],
@@ -1286,30 +1336,86 @@ mod tests {
     }
 
     #[test]
-    fn logit_blocks_never_exceed_the_token_cap_and_cover_the_batch() {
-        for (seq, chunk, cap) in [
-            (40, Some(128), 1000),
-            (4000, Some(128), 256),
-            (4000, None, 256),
-            (10, Some(0), 1),
-            (1, None, 1),
-            (7, Some(3), 100),
-            (5, Some(2), 0),
-        ] {
-            let (rows, positions) = logit_shape(seq, chunk, cap);
-            assert!(rows >= 1 && positions >= 1, "{seq} {chunk:?} {cap}");
-            assert!(
-                positions <= seq.max(1),
-                "{seq} {chunk:?} {cap}: {positions}"
-            );
-            assert!(
-                rows * positions <= cap.max(1),
-                "{seq} {chunk:?} {cap}: {rows} x {positions}"
-            );
+    fn packed_pooling_with_a_deferred_decoder_bias_matches_the_reference_formula() {
+        // Hidden states through a random decoder with bias, pooled over packed
+        // speaking positions in blocks of every size, against the reference
+        // written out in plain Rust: ln(1 + relu(max over real, non-prefix
+        // positions of (h . W + b) - shift)), nothing for a masked term, and
+        // nothing at all for a row with no speaking position (only the prefix
+        // token, or a single token that is the prefix).
+        let (batch, seq, hidden, vocab) = (5usize, 9usize, 6usize, 13usize);
+        let mut next = lcg(0x5851_F42D_4C95_7F2D);
+        let states: Vec<f32> = (0..batch * seq * hidden).map(|_| next() * 2.0).collect();
+        let weight: Vec<f32> = (0..vocab * hidden).map(|_| next()).collect();
+        let bias: Vec<f32> = (0..vocab).map(|_| next() * 3.0).collect();
+        let rows: Vec<Vec<u32>> = vec![
+            vec![1, 9, 5, 6, 7, 8, 5, 6, 7],
+            vec![9, 9],
+            vec![1, 9, 6],
+            vec![9],
+            vec![5],
+        ];
+        let masked = [3u32, 11];
+        let pooling = pooling_with(0.5, &[9], &masked, None);
+        let device = Device::Cpu;
+        let states_t = Tensor::from_vec(states.clone(), (batch, seq, hidden), &device).unwrap();
+        let weight_t = Tensor::from_vec(weight.clone(), (vocab, hidden), &device).unwrap();
+        let bias_t = Tensor::from_vec(bias.clone(), (1, vocab), &device).unwrap();
+        let project = |x: &Tensor| x.matmul(&weight_t.t()?);
+        for block in [1, 2, 3, 7, 10_000] {
+            let got = pooling
+                .pool_states(&states_t, &rows, vocab, project, Some(&bias_t), block)
+                .unwrap();
+            for (row, ids) in rows.iter().enumerate() {
+                for term in 0..vocab {
+                    let mut want = 0f32;
+                    if !masked.contains(&(term as u32)) {
+                        for (position, id) in ids.iter().enumerate() {
+                            if *id == 9 {
+                                continue;
+                            }
+                            let h = &states[(row * seq + position) * hidden..][..hidden];
+                            let w = &weight[term * hidden..][..hidden];
+                            let logit =
+                                h.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() + bias[term];
+                            want = want.max(((logit - 0.5).max(0.0) + 1.0).ln());
+                        }
+                    }
+                    assert!(
+                        (got[row][term] - want).abs() < 1e-5,
+                        "block {block} row {row} term {term}: {} vs {want}",
+                        got[row][term]
+                    );
+                }
+            }
         }
-        assert_eq!(logit_shape(40, Some(128), 1000), (25, 40));
-        assert_eq!(logit_shape(4000, Some(128), 256), (2, 128));
-        assert_eq!(logit_shape(4000, None, 256), (1, 256));
+    }
+
+    #[test]
+    fn reproduces_the_huggingface_reference_on_metal() {
+        // Same golden as the CPU test, through the Metal kernels (fused
+        // LayerNorm, rope over [batch, seq, heads, dim], packed pooling).
+        let Ok(metal) = Device::new_metal(0) else {
+            eprintln!("no Metal device");
+            return;
+        };
+        let dir = fixture_dir();
+        let cfg: ModernBertConfig =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let (_, pooling, _) = load_model(DType::F32);
+        let tensors = safetensors::load(dir.join("model.safetensors"), &metal).unwrap();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &metal);
+        let model = ModernBertMlm::load(&cfg, vb, 64).unwrap();
+        let golden: Golden =
+            serde_json::from_slice(&std::fs::read(dir.join("golden.json")).unwrap()).unwrap();
+        for case in &golden.cases {
+            let label = format!("metal {}/{}", case.kind, case.max_length);
+            let batched: Vec<Vec<u32>> = case.batched.iter().map(|row| row.ids.clone()).collect();
+            let together = run(&model, &pooling, cfg.vocab_size, &batched);
+            for (index, (got, want)) in together.iter().zip(&case.batched).enumerate() {
+                assert_matches(got, want, 1e-4, &format!("{label} batched[{index}]"));
+            }
+        }
     }
 
     #[test]

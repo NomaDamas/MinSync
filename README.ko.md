@@ -401,9 +401,9 @@ chunk를 길이순으로 정렬한 뒤 batch로 묶기 때문에 작은 값에�
 - **corpus 크기.** `--mode sparse`는 저장된 모든 chunk의 점수를 계산하며 sparse
   column에는 index가 없습니다. query(CLI, in-process)가 21k chunk에서 206 ms,
   106k에서 508 ms로 선형으로 늘어납니다.
-- **색인 속도.** 모든 chunk가 모델을 거칩니다. Metal에서 초당 약 16-25 chunk,
-  CPU에서 3-5 chunk입니다. SciFact 5,183개 파일은 BM25가 6초, SPLADE가 Metal에서
-  313초 걸렸습니다.
+- **색인 속도.** 모든 chunk가 모델을 거칩니다. Metal에서 초당 약 25-30 chunk,
+  CPU에서 3-5 chunk입니다. 한국어·영어 markdown 1,118 chunk의 sparse 전용 sync가
+  M4 Max에서 35초 걸렸습니다.
 - **디스크.** 인코딩된 chunk 하나가 약 5 KB입니다. 동시에 실행 중인 query가 파일을
   잃지 않도록 Lance가 교체된 파일을 10분간 보관하므로, 긴 sync 직후에는 다음
   sync가 정리하기 전까지 store가 데이터의 몇 배가 될 수 있습니다(21k chunk
