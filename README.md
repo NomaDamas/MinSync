@@ -52,6 +52,13 @@ cd MinSync
 cargo build --release
 ```
 
+The in-process models (dense embedder and SPLADE) run on Metal on macOS, with Accelerate for CPU matmuls. Other platforms run on the CPU by default; opt into a faster backend at build time:
+
+```bash
+cargo build --release --features cuda   # NVIDIA GPU, needs the CUDA toolkit; device "auto" picks GPU 0
+cargo build --release --features mkl    # Intel MKL BLAS for x86_64 CPUs
+```
+
 MinSync embeds in-process with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) by default. No API key, TEI server, or Hugging Face gate is required. The first `minsync sync` downloads the model into the local cache.
 
 No dense model at all? Build a sparse-only workspace, which needs no dense embedder, API key or embedding server (the sparse encoder still has its own small model, see [Sparse retrieval (SPLADE)](#sparse-retrieval-splade)):
