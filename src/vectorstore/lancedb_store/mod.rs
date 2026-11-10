@@ -21,7 +21,8 @@ use crate::error::{MinSyncError, Result};
 use crate::sparse::SparseVector;
 use crate::types::IndexState;
 use crate::vectorstore::{
-    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, VectorStore,
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, StoredEmbedding,
+    VectorStore,
 };
 use lancedb::DistanceType;
 use std::path::Path;
@@ -197,6 +198,10 @@ impl VectorStore for LanceDbStore {
 
     fn documents(&self) -> Result<Vec<Document>> {
         self.request(Command::Documents)
+    }
+
+    fn embeddings(&self) -> Result<Vec<StoredEmbedding>> {
+        self.request(Command::Embeddings)
     }
 
     fn scan_chunks(&self, after: Option<&str>, limit: usize) -> Result<Vec<StoredChunk>> {

@@ -609,6 +609,9 @@ async fn verify(
                             pair.paths.join(", ")
                         );
                     }
+                    if result.embedding_integrity.truncated {
+                        println!("  ... more pairs not listed");
+                    }
                     println!("Recommendation: run minsync sync --full");
                 }
             }

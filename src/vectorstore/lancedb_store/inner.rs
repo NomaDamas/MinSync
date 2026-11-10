@@ -8,9 +8,10 @@ use super::index::{
 };
 use super::schema::{
     batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse, batch_to_query_hits,
-    batch_to_scored_hits, batch_to_sparse_targets, batch_to_stored_chunks, dedupe_documents,
-    docs_to_batch, schema, score_sparse_batch, sparse_fields, sparse_rows_to_batch, string_col,
-    updates_to_batch, validate_schema, validate_vector,
+    batch_to_scored_hits, batch_to_sparse_targets, batch_to_stored_chunks,
+    batch_to_stored_embeddings, dedupe_documents, docs_to_batch, schema, score_sparse_batch,
+    sparse_fields, sparse_rows_to_batch, string_col, updates_to_batch, validate_schema,
+    validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, SPARSE_INDICES_COLUMN,
@@ -19,7 +20,9 @@ use super::{
 use crate::error::{MinSyncError, Result};
 use crate::sparse::{SparseVector, TopK};
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk};
+use crate::vectorstore::{
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, StoredEmbedding,
+};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use futures::TryStreamExt;
@@ -251,6 +254,30 @@ impl LanceDbInner {
 
     pub(super) async fn documents(&self) -> Result<Vec<Document>> {
         self.scan_documents(None).await
+    }
+
+    /// Every row's id, path, content hash and vector, without the text.
+    pub(super) async fn embeddings(&self) -> Result<Vec<StoredEmbedding>> {
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .select(Select::Columns(vec![
+                "id".to_string(),
+                "path".to_string(),
+                "content_hash".to_string(),
+                VECTOR_COLUMN.to_string(),
+            ]))
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut rows = Vec::new();
+        for batch in batches {
+            rows.extend(batch_to_stored_embeddings(&batch)?);
+        }
+        Ok(rows)
     }
 
     /// The next page of rows after `after`, in id order, read without the

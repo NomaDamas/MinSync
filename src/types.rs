@@ -184,9 +184,14 @@ pub struct VerifyResult {
     pub index_state: Option<IndexState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingIntegrityResult {
     pub flagged_pairs: Vec<EmbeddingIntegrityPair>,
+    /// More pairs exist than `flagged_pairs` lists: the report stops at a
+    /// fixed number so an embedder that returns one vector for everything
+    /// still finishes.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

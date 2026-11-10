@@ -7,7 +7,7 @@ use super::{
 };
 use crate::error::{MinSyncError, Result};
 use crate::sparse::SparseVector;
-use crate::vectorstore::{Document, DocumentUpdate, QueryHit};
+use crate::vectorstore::{Document, DocumentUpdate, QueryHit, StoredEmbedding};
 use arrow_array::builder::{Float32Builder, ListBuilder, StringBuilder, UInt32Builder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt32Type};
@@ -401,6 +401,30 @@ pub(super) fn batch_to_hash_embeddings(batch: &RecordBatch) -> Result<Vec<(Strin
                 .values()
                 .to_vec();
             (hashes.value(row).to_string(), vector)
+        })
+        .collect())
+}
+
+pub(super) fn batch_to_stored_embeddings(batch: &RecordBatch) -> Result<Vec<StoredEmbedding>> {
+    let ids = string_col(batch, "id")?;
+    let paths = string_col(batch, "path")?;
+    let hashes = string_col(batch, "content_hash")?;
+    let vectors = batch
+        .column_by_name(VECTOR_COLUMN)
+        .ok_or_else(|| missing_column(VECTOR_COLUMN))?
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| MinSyncError::VectorStore("vector column has unexpected type".into()))?;
+    Ok((0..batch.num_rows())
+        .map(|row| StoredEmbedding {
+            id: ids.value(row).to_string(),
+            path: paths.value(row).to_string(),
+            content_hash: hashes.value(row).to_string(),
+            embedding: vectors
+                .value(row)
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec(),
         })
         .collect())
 }
