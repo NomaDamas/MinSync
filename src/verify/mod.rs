@@ -103,7 +103,15 @@ pub async fn verify(
         }
     }
     basic_checks.insert("sample_chunks_match".to_string(), sample_ok);
-    let embedding_integrity = check_embedding_integrity(store)?;
+    // A sparse-only index stores a zero placeholder for every dense vector:
+    // no pair has a cosine similarity, so reading every row finds nothing.
+    let embedding_integrity = if config.is_sparse_only() {
+        EmbeddingIntegrityResult {
+            flagged_pairs: Vec::new(),
+        }
+    } else {
+        check_embedding_integrity(store)?
+    };
     basic_checks.insert(
         "embedding_integrity".to_string(),
         embedding_integrity.flagged_pairs.is_empty(),
@@ -203,6 +211,7 @@ mod tests {
         before_repair: crate::types::IndexState,
         after_repair: crate::types::IndexState,
         repaired: bool,
+        full_scans: std::sync::atomic::AtomicUsize,
     }
 
     impl VectorStore for StateTrackingStore {
@@ -226,6 +235,8 @@ mod tests {
         }
 
         fn documents(&self) -> Result<Vec<Document>> {
+            self.full_scans
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.documents()
         }
 
@@ -564,6 +575,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verify_sparse_only_skips_the_embedding_integrity_scan() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        sync.init(false, "none", "recursive")
+            .expect("init succeeds");
+        sync.sync(&chunker, &SparseOnly, &mut store, true, false, false)
+            .await
+            .expect("sync succeeds");
+        let state = crate::types::IndexState {
+            ann_indexed: false,
+            unindexed_rows: None,
+        };
+        let mut tracking_store = StateTrackingStore {
+            inner: store,
+            before_repair: state.clone(),
+            after_repair: state,
+            repaired: false,
+            full_scans: Default::default(),
+        };
+
+        let result = verify(
+            &dir.path().join(".minsync"),
+            dir.path(),
+            &chunker,
+            &mut tracking_store,
+            false,
+            None,
+        )
+        .await
+        .expect("verify succeeds");
+
+        assert!(result.all_passed, "{:?}", result.basic_checks);
+        assert_eq!(
+            tracking_store
+                .full_scans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "placeholder vectors can not be compared, so verify must not read every row"
+        );
+    }
+
+    #[tokio::test]
     async fn test_verify_clean() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
         std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write file");
@@ -667,6 +720,7 @@ mod tests {
             before_repair: before_repair.clone(),
             after_repair: after_repair.clone(),
             repaired: false,
+            full_scans: Default::default(),
         };
 
         let result = verify(
