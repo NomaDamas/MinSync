@@ -2,9 +2,11 @@
 //!
 //! Module layout: [`status`](mod@status) reports sync state, [`health`]
 //! checks the environment, [`sampling`] recomputes expected doc IDs, and
-//! this file orchestrates `minsync verify` (basic checks + stale repair).
+//! this file orchestrates `minsync verify` (basic checks + stale repair);
+//! [`integrity`] finds near-identical vectors over differing texts.
 
 mod health;
+mod integrity;
 mod sampling;
 mod status;
 
@@ -16,9 +18,9 @@ use crate::config::Config;
 use crate::error::{MinSyncError, Result};
 use crate::manifest::Manifest;
 use crate::state::Cursor;
-use crate::types::{EmbeddingIntegrityPair, EmbeddingIntegrityResult, VerifyResult};
-use crate::vectorstore::similarity::cosine_similarity;
+use crate::types::{EmbeddingIntegrityResult, VerifyResult};
 use crate::vectorstore::{Filter, VectorStore};
+use integrity::check_embedding_integrity;
 use sampling::{expected_doc_ids, sample_paths};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -106,9 +108,7 @@ pub async fn verify(
     // A sparse-only index stores a zero placeholder for every dense vector:
     // no pair has a cosine similarity, so reading every row finds nothing.
     let embedding_integrity = if config.is_sparse_only() {
-        EmbeddingIntegrityResult {
-            flagged_pairs: Vec::new(),
-        }
+        EmbeddingIntegrityResult::default()
     } else {
         check_embedding_integrity(store)?
     };
@@ -124,28 +124,6 @@ pub async fn verify(
         fixed,
         index_state,
     })
-}
-
-fn check_embedding_integrity(store: &dyn VectorStore) -> Result<EmbeddingIntegrityResult> {
-    let mut documents = store.documents()?;
-    documents.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut flagged_pairs = Vec::new();
-
-    for (left_index, left) in documents.iter().enumerate() {
-        for right in documents.iter().skip(left_index + 1) {
-            if cosine_similarity(&left.embedding, &right.embedding) < 0.999
-                || !texts_differ_substantially(&left.text, &right.text)
-            {
-                continue;
-            }
-            flagged_pairs.push(EmbeddingIntegrityPair {
-                chunk_ids: vec![left.id.clone(), right.id.clone()],
-                paths: vec![left.path.clone(), right.path.clone()],
-            });
-        }
-    }
-
-    Ok(EmbeddingIntegrityResult { flagged_pairs })
 }
 
 fn texts_differ_substantially(left: &str, right: &str) -> bool {
@@ -198,10 +176,12 @@ mod tests {
     use crate::id::content_hash;
     use crate::state::Transaction;
     use crate::sync::MinSync;
-    use crate::types::SyncState;
+    use crate::types::{EmbeddingIntegrityPair, SyncState};
     use crate::vectorstore::memory::InMemoryStore;
+    use crate::vectorstore::similarity::cosine_similarity;
     use crate::vectorstore::{Document, DocumentUpdate, QueryHit};
     use async_trait::async_trait;
+    use integrity::MAX_FLAGGED_PAIRS;
     use tempfile::TempDir;
 
     struct MockEmbedder;
@@ -736,5 +716,168 @@ mod tests {
 
         assert!(result.fixed);
         assert_eq!(result.index_state, Some(after_repair));
+    }
+
+    /// Deterministic xorshift values in [-1, 1).
+    struct Noise(u64);
+
+    impl Noise {
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+
+        fn vector(&mut self, dim: usize) -> Vec<f32> {
+            (0..dim).map(|_| self.next()).collect()
+        }
+    }
+
+    fn unit(mut v: Vec<f32>) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    /// A unit vector at cosine `cos` from the unit vector `base`.
+    fn twin(base: &[f32], cos: f32, noise: &mut Noise) -> Vec<f32> {
+        let raw = noise.vector(base.len());
+        let along: f32 = raw.iter().zip(base).map(|(r, b)| r * b).sum();
+        let ortho = unit(raw.iter().zip(base).map(|(r, b)| r - along * b).collect());
+        let sin = (1.0 - cos * cos).sqrt();
+        base.iter()
+            .zip(&ortho)
+            .map(|(b, o)| cos * b + sin * o)
+            .collect()
+    }
+
+    fn chunk(id: &str, path: &str, text: &str, embedding: Vec<f32>) -> Document {
+        Document {
+            id: id.to_string(),
+            embedding,
+            text: text.to_string(),
+            source_id: "source".to_string(),
+            path: path.to_string(),
+            chunk_schema_id: "schema".to_string(),
+            chunk_type: "text".to_string(),
+            heading_path: String::new(),
+            content_hash: content_hash(text),
+            seen_token: "token".to_string(),
+        }
+    }
+
+    /// Every pair, compared the way verify did before #152.
+    fn all_pairs_oracle(store: &dyn VectorStore) -> Vec<EmbeddingIntegrityPair> {
+        let documents = store.documents().expect("documents");
+        let mut pairs = Vec::new();
+        for (index, left) in documents.iter().enumerate() {
+            for right in &documents[index + 1..] {
+                if cosine_similarity(&left.embedding, &right.embedding) >= 0.999
+                    && texts_differ_substantially(&left.text, &right.text)
+                {
+                    pairs.push(EmbeddingIntegrityPair {
+                        chunk_ids: vec![left.id.clone(), right.id.clone()],
+                        paths: vec![left.path.clone(), right.path.clone()],
+                    });
+                }
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn test_embedding_integrity_matches_all_pairs_oracle() {
+        let dim = 48;
+        let mut noise = Noise(0x152);
+        let mut store = InMemoryStore::new();
+        let mut docs = Vec::new();
+        for i in 0..600 {
+            let base = unit(noise.vector(dim));
+            let text = format!("chunk {i} alpha{i} beta{i} gamma{i}");
+            docs.push(chunk(
+                &format!("c{i:04}"),
+                &format!("f{i}.txt"),
+                &text,
+                base.clone(),
+            ));
+            match i % 6 {
+                // Above the threshold with unrelated text: flagged.
+                0 => docs.push(chunk(
+                    &format!("c{i:04}-hi"),
+                    &format!("g{i}.txt"),
+                    &format!("unrelated words for {i} delta{i}"),
+                    twin(&base, 0.9993, &mut noise),
+                )),
+                // Below the threshold: not flagged.
+                1 => docs.push(chunk(
+                    &format!("c{i:04}-lo"),
+                    &format!("g{i}.txt"),
+                    &format!("unrelated words for {i} delta{i}"),
+                    twin(&base, 0.998, &mut noise),
+                )),
+                // Same vector, same words in another case: not flagged.
+                2 => docs.push(chunk(
+                    &format!("c{i:04}-case"),
+                    &format!("g{i}.txt"),
+                    &text.to_uppercase(),
+                    base.clone(),
+                )),
+                // The same file twice plus a flagged twin: every copy pairs.
+                3 => {
+                    docs.push(chunk(
+                        &format!("c{i:04}-copy"),
+                        &format!("copy{i}.txt"),
+                        &text,
+                        base.clone(),
+                    ));
+                    docs.push(chunk(
+                        &format!("c{i:04}-hi"),
+                        &format!("g{i}.txt"),
+                        &format!("unrelated words for {i} delta{i}"),
+                        base.iter().map(|x| x * 3.0).collect(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        store.upsert(&docs).expect("upsert");
+
+        let expected = all_pairs_oracle(&store);
+        let result = check_embedding_integrity(&store).expect("integrity check");
+
+        assert_eq!(expected.len(), 100 + 2 * 100);
+        assert_eq!(result.flagged_pairs, expected);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn test_embedding_integrity_stops_at_the_report_cap() {
+        // An embedder that returns one vector for every text puts all
+        // n(n-1)/2 pairs over the threshold.
+        let rows = 200;
+        let mut store = InMemoryStore::new();
+        let docs: Vec<_> = (0..rows)
+            .map(|i| {
+                chunk(
+                    &format!("c{i:04}"),
+                    &format!("f{i}.txt"),
+                    &format!("text number {i} word{i}"),
+                    vec![0.5; 16],
+                )
+            })
+            .collect();
+        store.upsert(&docs).expect("upsert");
+
+        let result = check_embedding_integrity(&store).expect("integrity check");
+
+        assert!(rows * (rows - 1) / 2 > MAX_FLAGGED_PAIRS);
+        assert!(result.truncated);
+        assert_eq!(result.flagged_pairs.len(), MAX_FLAGGED_PAIRS);
+        let oracle = all_pairs_oracle(&store);
+        assert!(result
+            .flagged_pairs
+            .iter()
+            .all(|pair| oracle.contains(pair)));
     }
 }

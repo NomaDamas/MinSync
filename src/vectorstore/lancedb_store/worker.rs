@@ -7,7 +7,9 @@ use super::{to_store_error, IndexingConfig};
 use crate::error::Result;
 use crate::sparse::SparseVector;
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk};
+use crate::vectorstore::{
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, StoredEmbedding,
+};
 use std::collections::HashMap;
 use std::sync::mpsc;
 
@@ -19,6 +21,7 @@ pub(super) enum Command {
     Fetch(Vec<String>, Resp<Vec<Document>>),
     FetchEmbeddingsByContentHash(Vec<String>, Resp<HashMap<String, Vec<f32>>>),
     Documents(Resp<Vec<Document>>),
+    Embeddings(Resp<Vec<StoredEmbedding>>),
     ScanChunks(Option<String>, usize, Resp<Vec<StoredChunk>>),
     ExistingIds(Vec<String>, Resp<std::collections::HashSet<String>>),
     InsertNew(Vec<Document>, Resp<()>),
@@ -108,6 +111,7 @@ pub(super) fn run_worker(
                 rt.block_on(inner.fetch_embeddings_by_content_hash(hashes)),
             ),
             Command::Documents(resp) => send_response(resp, rt.block_on(inner.documents())),
+            Command::Embeddings(resp) => send_response(resp, rt.block_on(inner.embeddings())),
             Command::ScanChunks(after, limit, resp) => {
                 send_response(resp, rt.block_on(inner.scan_chunks(after, limit)))
             }

@@ -20,6 +20,15 @@ pub struct Document {
     pub seen_token: String,
 }
 
+/// A stored row's dense vector and the fields that name it, without its text.
+#[derive(Debug, Clone)]
+pub struct StoredEmbedding {
+    pub id: String,
+    pub path: String,
+    pub content_hash: String,
+    pub embedding: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentUpdate {
     pub id: String,
@@ -94,6 +103,20 @@ pub trait VectorStore: Send + Sync {
     }
     fn documents(&self) -> Result<Vec<Document>> {
         Ok(Vec::new())
+    }
+    /// Every row's dense vector, without its text. Stores should project
+    /// only these columns; the default reads full rows.
+    fn embeddings(&self) -> Result<Vec<StoredEmbedding>> {
+        Ok(self
+            .documents()?
+            .into_iter()
+            .map(|doc| StoredEmbedding {
+                id: doc.id,
+                path: doc.path,
+                content_hash: doc.content_hash,
+                embedding: doc.embedding,
+            })
+            .collect())
     }
     /// Up to `limit` stored chunks whose id sorts after `after` (all of them
     /// from the start when `None`), in id order, without their dense
