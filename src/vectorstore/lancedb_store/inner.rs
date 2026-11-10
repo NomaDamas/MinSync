@@ -34,6 +34,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Candidate ids per `id IN (...)` predicate when rescoring.
+const RESCORE_CHUNK: usize = 512;
+
 pub(super) struct LanceDbInner {
     conn: Connection,
     table: Table,
@@ -634,10 +637,14 @@ impl LanceDbInner {
         Ok((manifest.version, manifest.timestamp_nanos))
     }
 
-    /// The answer from the inverted index, when one exists, was built from
+    /// The answer through the inverted index, when one exists, was built from
     /// exactly this table version and model, and can evaluate `filter`.
     /// `None` means "scan". Any trouble with the index is `None`, never an
     /// error: it is a copy, the table is the truth.
+    ///
+    /// The index names a superset of the top `topk`; those rows' exact
+    /// vectors are read from the table and scored with the scan's own loop,
+    /// so the ranking is the scan's, not an approximation of it.
     async fn ranked_from_index(
         &self,
         model: &str,
@@ -658,14 +665,57 @@ impl LanceDbInner {
         match sparse_index::scope(filter, file.meta()) {
             Scope::Unknown => Ok(None),
             Scope::Nothing => Ok(Some(Vec::new())),
-            Scope::Everything => match file.search(vector, topk) {
-                Ok(ranked) => Ok(Some(ranked)),
-                Err(error) => {
-                    tracing::warn!("sparse inverted index failed, scanning instead: {error}");
-                    Ok(None)
+            Scope::Everything => {
+                let candidates = match file.candidates(vector, topk) {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        tracing::warn!("sparse inverted index failed, scanning instead: {error}");
+                        return Ok(None);
+                    }
+                };
+                // Reading most of the table by id costs more than scanning it.
+                if candidates.len() > sparse_index::max_candidates(file.len()) {
+                    return Ok(None);
                 }
-            },
+                self.rescore(model, vector, &candidates, topk)
+                    .await
+                    .map(Some)
+            }
         }
+    }
+
+    /// The exact top-`topk` among the rows `ids`, scored from the table.
+    async fn rescore(
+        &self,
+        model: &str,
+        vector: &SparseVector,
+        ids: &[String],
+        topk: usize,
+    ) -> Result<Vec<(f32, String)>> {
+        let mut top = TopK::new(topk);
+        for chunk in ids.chunks(RESCORE_CHUNK) {
+            let predicate = format!(
+                "({}) AND {}",
+                id_in_filter(chunk.iter().map(String::as_str)),
+                has_sparse_filter(model)
+            );
+            let mut stream = self
+                .table
+                .query()
+                .only_if(predicate)
+                .select(Select::columns(&[
+                    "id",
+                    SPARSE_INDICES_COLUMN,
+                    SPARSE_VALUES_COLUMN,
+                ]))
+                .execute()
+                .await
+                .map_err(to_store_error)?;
+            while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+                score_sparse_batch(&batch, vector, &mut top)?;
+            }
+        }
+        Ok(top.into_sorted())
     }
 
     /// Build the index for the table as it is now, for the one model and
