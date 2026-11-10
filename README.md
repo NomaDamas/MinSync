@@ -691,6 +691,12 @@ dimension = 384
 
 `minsync serve` loads the native embedder once and serves it on loopback, so other tools (and repeated CLI calls) share one model instead of each loading its own copy. The server itself is im-not-llm's daemon (`inl_server`, the one `inl serve` runs), driven with MinSync's `[embedder]` / `[sparse]` settings; `minsync serve` and `inl serve` of the same model share one instance.
 
+The Rust engines use crates.io releases (`inl-core`, `inl-text`,
+`inl-sparse` 0.1.0; `inl-server` 0.1.1), with candle 0.11.1 from the registry;
+no candle git patch is required. Use `inl-server` 0.1.1 or later for CLI
+sharing: it includes the engine's default context in the instance identity,
+matching MinSync's settings.
+
 ```bash
 minsync serve                    # workspace config if present, else the default model
 minsync serve --port 8089 --idle-timeout 600
