@@ -61,7 +61,7 @@ minsync sync --full
 Before handing off an extension:
 
 1. Run `cargo fmt --all -- --check`.
-2. Run `cargo clippy --all-targets --all-features -- -D warnings`.
+2. Run `cargo clippy --all-targets -- -D warnings`.
 3. Run `cargo test`.
 4. Run one real CLI smoke test with `minsync init`, `minsync sync`, and `minsync query`. The native default needs no API key or TEI server; `openai:` / `tei:` still need credentials or a local server.
 5. Update `skills/minsync/SKILL.md` when agent operating rules change.

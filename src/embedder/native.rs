@@ -794,9 +794,7 @@ pub(crate) fn resolve_device(spec: NativeDevice) -> Result<Device> {
         NativeDevice::Cpu => Ok(Device::Cpu),
         NativeDevice::Auto => Ok(auto_device()),
         NativeDevice::Metal => metal_device(),
-        NativeDevice::Cuda => Err(MinSyncError::Config(
-            "device cuda requires a CUDA build of minsync".to_string(),
-        )),
+        NativeDevice::Cuda => cuda_device(),
     }
 }
 
@@ -805,7 +803,11 @@ fn auto_device() -> Device {
     {
         Device::new_metal(0).unwrap_or(Device::Cpu)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    {
+        Device::new_cuda(0).unwrap_or(Device::Cpu)
+    }
+    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
     {
         Device::Cpu
     }
@@ -821,6 +823,20 @@ fn metal_device() -> Result<Device> {
     {
         Err(MinSyncError::Config(
             "device metal is only available on macOS".to_string(),
+        ))
+    }
+}
+
+fn cuda_device() -> Result<Device> {
+    #[cfg(feature = "cuda")]
+    {
+        Device::new_cuda(0)
+            .map_err(|error| MinSyncError::Config(format!("failed to open cuda device: {error}")))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Err(MinSyncError::Config(
+            "device cuda requires a build with `--features cuda`".to_string(),
         ))
     }
 }

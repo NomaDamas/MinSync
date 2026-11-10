@@ -39,6 +39,13 @@ cd MinSync
 cargo build --release
 ```
 
+프로세스 안 모델(dense embedder와 SPLADE)은 macOS에서 Metal로 돌고, CPU matmul은 Accelerate를 씁니다. 다른 플랫폼은 기본적으로 CPU에서 돌며, 빌드할 때 더 빠른 backend를 고를 수 있습니다:
+
+```bash
+cargo build --release --features cuda   # NVIDIA GPU, CUDA toolkit 필요. device "auto"가 GPU 0을 고름
+cargo build --release --features mkl    # x86_64 CPU용 Intel MKL BLAS
+```
+
 MinSync는 기본적으로 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)를 프로세스 안에서 embedding합니다. API key, TEI 서버, Hugging Face 게이트가 필요 없습니다. 첫 `minsync sync`에서 모델을 로컬 캐시로 받습니다.
 
 dense 모델 없이 쓰려면 embedder, API 키, embedding 서버가 모두 필요 없는 sparse-only workspace를 만드세요(sparse encoder는 자체적으로 작은 모델을 씁니다. [Sparse 검색(SPLADE)](#sparse-검색splade) 참고).
@@ -679,7 +686,7 @@ CI는 Ubuntu, macOS, Windows에서 rustup으로 Rust 1.91을 설치한 뒤 `carg
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```

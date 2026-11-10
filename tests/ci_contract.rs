@@ -19,7 +19,7 @@ fn ci_workflow_defines_required_multi_os_validation() {
         "arduino/setup-protoc@v3",
         "repo-token: ${{ github.token }}",
         "cargo fmt --all -- --check",
-        "cargo clippy --all-targets --all-features -- -D warnings",
+        "cargo clippy --all-targets -- -D warnings",
         "cargo test",
         "cargo build --release",
         "Swatinem/rust-cache@v2",
@@ -34,7 +34,7 @@ fn ci_workflow_defines_required_multi_os_validation() {
         .find("arduino/setup-protoc@v3")
         .expect("expected workflow to define setup-protoc");
     let clippy_step = workflow
-        .find("cargo clippy --all-targets --all-features -- -D warnings")
+        .find("cargo clippy --all-targets -- -D warnings")
         .expect("expected workflow to define clippy");
     assert!(
         protoc_step < clippy_step,

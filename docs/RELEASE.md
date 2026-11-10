@@ -33,7 +33,7 @@ re-embed the index.
 ## 3. CI
 
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test`
 - [ ] `cargo build --release`
 - [ ] GitHub Actions CI passes on Ubuntu, macOS, and Windows.
