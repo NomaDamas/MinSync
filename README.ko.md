@@ -686,7 +686,7 @@ CI는 Ubuntu, macOS, Windows에서 rustup으로 Rust 1.91을 설치한 뒤 `carg
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```

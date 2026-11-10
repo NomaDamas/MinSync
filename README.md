@@ -781,7 +781,7 @@ CI runs on Ubuntu, macOS, and Windows with Rust 1.91 installed through rustup. I
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
