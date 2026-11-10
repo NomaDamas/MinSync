@@ -141,6 +141,10 @@ pub struct QueryResult {
 pub struct IndexState {
     pub ann_indexed: bool,
     pub unindexed_rows: Option<usize>,
+    /// An on-disk sparse index describes the current table version. Queries
+    /// may still scan for unsupported filters or broad candidate sets.
+    #[serde(default)]
+    pub sparse_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -7,20 +7,22 @@ use super::index::{
     compact_if_fragmented, compaction_options, maintain_index, maintain_scalar_indexes,
 };
 use super::schema::{
-    batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse, batch_to_query_hits,
-    batch_to_scored_hits, batch_to_sparse_targets, batch_to_stored_chunks, dedupe_documents,
-    docs_to_batch, schema, score_sparse_batch, sparse_fields, sparse_rows_to_batch, string_col,
-    updates_to_batch, validate_schema, validate_vector,
+    add_sparse_batch, batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse,
+    batch_to_query_hits, batch_to_scored_hits, batch_to_sparse_targets, batch_to_stored_chunks,
+    count_sparse_batch, dedupe_documents, docs_to_batch, schema, score_sparse_batch, sparse_fields,
+    sparse_rows_to_batch, string_col, updates_to_batch, validate_schema, validate_vector,
 };
+use super::sparse_index::{self, Scope};
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, SPARSE_INDICES_COLUMN,
     SPARSE_MODEL_COLUMN, SPARSE_VALUES_COLUMN, TABLE_NAME, VECTOR_COLUMN,
 };
 use crate::error::{MinSyncError, Result};
+use crate::sparse::inverted::IndexBuilder;
 use crate::sparse::{SparseVector, TopK};
 use crate::types::IndexState;
 use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk};
-use arrow_array::{RecordBatch, RecordBatchIterator};
+use arrow_array::{Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
@@ -29,13 +31,21 @@ use lancedb::table::OptimizeAction;
 use lancedb::{Connection, Table};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Candidate ids per `id IN (...)` predicate when rescoring.
+const RESCORE_CHUNK: usize = 512;
 
 pub(super) struct LanceDbInner {
     conn: Connection,
     table: Table,
     dim: usize,
     indexing: IndexingConfig,
+    /// Directory the store lives in; the sparse inverted index sits in it,
+    /// next to `documents.lance`.
+    store_dir: PathBuf,
+    read_only: bool,
 }
 
 impl LanceDbInner {
@@ -89,6 +99,8 @@ impl LanceDbInner {
             table,
             dim,
             indexing,
+            store_dir: PathBuf::from(uri),
+            read_only,
         })
     }
 
@@ -534,27 +546,16 @@ impl LanceDbInner {
         if topk == 0 || vector.is_empty() {
             return Ok(Vec::new());
         }
-        let mut predicate = has_sparse_filter(&model);
-        if let Some(filter) = &filter {
-            predicate = format!("({}) AND {predicate}", filter_to_sql(filter)?);
-        }
-        let mut stream = self
-            .table
-            .query()
-            .only_if(predicate)
-            .select(Select::columns(&[
-                "id",
-                SPARSE_INDICES_COLUMN,
-                SPARSE_VALUES_COLUMN,
-            ]))
-            .execute()
-            .await
-            .map_err(to_store_error)?;
-        let mut top = TopK::new(topk);
-        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
-            score_sparse_batch(&batch, &vector, &mut top)?;
-        }
-        let ranked = top.into_sorted();
+        let ranked = match self
+            .ranked_from_index(&model, &vector, filter.as_ref(), topk)
+            .await?
+        {
+            Some(ranked) => ranked,
+            None => {
+                self.ranked_by_scan(&model, &vector, filter.as_ref(), topk)
+                    .await?
+            }
+        };
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -593,6 +594,251 @@ impl LanceDbInner {
             .collect())
     }
 
+    /// The scan: the sparse columns of every matching row are streamed batch
+    /// by batch into a bounded heap, so the table is never materialized.
+    async fn ranked_by_scan(
+        &self,
+        model: &str,
+        vector: &SparseVector,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<(f32, String)>> {
+        let mut predicate = has_sparse_filter(model);
+        if let Some(filter) = filter {
+            predicate = format!("({}) AND {predicate}", filter_to_sql(filter)?);
+        }
+        let mut stream = self
+            .table
+            .query()
+            .only_if(predicate)
+            .select(Select::columns(&[
+                "id",
+                SPARSE_INDICES_COLUMN,
+                SPARSE_VALUES_COLUMN,
+            ]))
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        let mut top = TopK::new(topk);
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            score_sparse_batch(&batch, vector, &mut top)?;
+        }
+        Ok(top.into_sorted())
+    }
+
+    /// Identity of the table version this handle reads: what an index must
+    /// have been built from to describe it.
+    async fn table_identity(&self) -> Result<(u64, u128)> {
+        let native = self
+            .table
+            .as_native()
+            .ok_or_else(|| MinSyncError::VectorStore("the table is not a native table".into()))?;
+        let manifest = native.manifest().await.map_err(to_store_error)?;
+        Ok((manifest.version, manifest.timestamp_nanos))
+    }
+
+    /// The answer through the inverted index, when one exists, was built from
+    /// exactly this table version and model, and can evaluate `filter`.
+    /// `None` means "scan". Any trouble with the index is `None`, never an
+    /// error: it is a copy, the table is the truth.
+    ///
+    /// The index names a superset of the top `topk`; those rows' exact
+    /// vectors are read from the table and scored with the scan's own loop,
+    /// so the ranking is the scan's, not an approximation of it.
+    async fn ranked_from_index(
+        &self,
+        model: &str,
+        vector: &SparseVector,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Option<Vec<(f32, String)>>> {
+        if !self.indexing.sparse_inverted_index {
+            return Ok(None);
+        }
+        let Some(file) = sparse_index::open(&self.store_dir) else {
+            return Ok(None);
+        };
+        let (version, timestamp) = self.table_identity().await?;
+        if !sparse_index::describes(file.meta(), model, version, timestamp) {
+            return Ok(None);
+        }
+        match sparse_index::scope(filter, file.meta()) {
+            Scope::Unknown => Ok(None),
+            Scope::Nothing => Ok(Some(Vec::new())),
+            Scope::Everything => {
+                let candidates = match file.candidates(vector, topk) {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        tracing::warn!("sparse inverted index failed, scanning instead: {error}");
+                        return Ok(None);
+                    }
+                };
+                // Reading most of the table by id costs more than scanning it.
+                if candidates.len() > sparse_index::max_candidates(file.len()) {
+                    return Ok(None);
+                }
+                self.rescore(model, vector, &candidates, topk)
+                    .await
+                    .map(Some)
+            }
+        }
+    }
+
+    /// The exact top-`topk` among the rows `ids`, scored from the table.
+    async fn rescore(
+        &self,
+        model: &str,
+        vector: &SparseVector,
+        ids: &[String],
+        topk: usize,
+    ) -> Result<Vec<(f32, String)>> {
+        let mut top = TopK::new(topk);
+        for chunk in ids.chunks(RESCORE_CHUNK) {
+            let predicate = format!(
+                "({}) AND {}",
+                id_in_filter(chunk.iter().map(String::as_str)),
+                has_sparse_filter(model)
+            );
+            let mut stream = self
+                .table
+                .query()
+                .only_if(predicate)
+                .select(Select::columns(&[
+                    "id",
+                    SPARSE_INDICES_COLUMN,
+                    SPARSE_VALUES_COLUMN,
+                ]))
+                .execute()
+                .await
+                .map_err(to_store_error)?;
+            while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+                score_sparse_batch(&batch, vector, &mut top)?;
+            }
+        }
+        Ok(top.into_sorted())
+    }
+
+    /// Build the index for the table as it is now, for the one model and
+    /// source its sparse rows belong to. Returns whether an index describes
+    /// the table afterwards.
+    ///
+    /// The rows are scanned once to count terms and once more per memory
+    /// budget's worth of terms. Only a writer calls this, under the store
+    /// lock, so the table does not change between the scans.
+    async fn build_sparse_index(&self) -> Result<bool> {
+        let Some((model, source_id)) = self.sparse_model_and_source().await? else {
+            sparse_index::remove(&self.store_dir)?;
+            return Ok(false);
+        };
+        let predicate = has_sparse_filter(&model);
+        let rows = self
+            .table
+            .count_rows(Some(predicate.clone()))
+            .await
+            .map_err(to_store_error)?;
+        if rows < self.indexing.sparse_index_min_rows {
+            sparse_index::remove(&self.store_dir)?;
+            return Ok(false);
+        }
+        // Rows that still wait for their vector mean the sparse phase has not
+        // run yet (a sync flushes once before it and once after): the index
+        // would be thrown away by the next flush, and a query before then
+        // scans anyway. The stale file goes now so nothing can mistake it.
+        // A persistently failing sparse row also intentionally keeps the
+        // sidecar disabled; queries use the encoded subset via the scan.
+        if self
+            .table
+            .count_rows(Some(missing_sparse_filter(&model)))
+            .await
+            .map_err(to_store_error)?
+            > 0
+        {
+            sparse_index::remove(&self.store_dir)?;
+            return Ok(false);
+        }
+        let (version, timestamp) = self.table_identity().await?;
+        if let Some(file) = sparse_index::open(&self.store_dir) {
+            if sparse_index::describes(file.meta(), &model, version, timestamp)
+                && file.meta().source_id == source_id
+            {
+                return Ok(true);
+            }
+        }
+        let mut builder = IndexBuilder::new(
+            &sparse_index::index_path(&self.store_dir),
+            &model,
+            version,
+            timestamp,
+            self.indexing.sparse_index_memory_postings,
+        )?;
+        let columns = [
+            "id",
+            "source_id",
+            SPARSE_INDICES_COLUMN,
+            SPARSE_VALUES_COLUMN,
+        ];
+        let mut stream = self
+            .table
+            .query()
+            .only_if(predicate.clone())
+            .select(Select::columns(&columns))
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            count_sparse_batch(&batch, &mut builder)?;
+        }
+        for _ in 0..builder.plan()? {
+            let mut stream = self
+                .table
+                .query()
+                .only_if(predicate.clone())
+                .select(Select::columns(&columns))
+                .execute()
+                .await
+                .map_err(to_store_error)?;
+            while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+                add_sparse_batch(&batch, &mut builder)?;
+            }
+            builder.end_pass()?;
+        }
+        Ok(builder.finish()?.is_some())
+    }
+
+    /// The one model the table's sparse rows come from and the one source
+    /// they belong to, or `None` when the table holds sparse rows from several
+    /// models or sources (the scan handles those) or none at all.
+    async fn sparse_model_and_source(&self) -> Result<Option<(String, String)>> {
+        let mut stream = self
+            .table
+            .query()
+            .only_if("sparse_model IS NOT NULL")
+            .select(Select::columns(&[SPARSE_MODEL_COLUMN, "source_id"]))
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        let mut found: Option<(String, String)> = None;
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            let models = string_col(&batch, SPARSE_MODEL_COLUMN)?;
+            let sources = string_col(&batch, "source_id")?;
+            for row in 0..batch.num_rows() {
+                if models.is_null(row) {
+                    continue;
+                }
+                let pair = (
+                    models.value(row).to_string(),
+                    sources.value(row).to_string(),
+                );
+                match &found {
+                    None => found = Some(pair),
+                    Some(first) if *first != pair => return Ok(None),
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// End-of-sync maintenance. Folds new rows into the search indexes and
     /// prunes old versions, and compacts only once fragments pile up. A sync
     /// that adds a few files therefore appends fragments instead of rewriting
@@ -609,7 +855,8 @@ impl LanceDbInner {
         .await?;
         maintain_scalar_indexes(&self.table).await?;
         maintain_index(&self.table, &self.indexing).await?;
-        self.prune().await
+        self.prune().await?;
+        self.maintain_sparse_index().await
     }
 
     /// Full maintenance for `minsync optimize`: compact every fragment under
@@ -624,7 +871,23 @@ impl LanceDbInner {
             .map_err(to_store_error)?;
         maintain_scalar_indexes(&self.table).await?;
         maintain_index(&self.table, &self.indexing).await?;
-        self.prune().await
+        self.prune().await?;
+        self.maintain_sparse_index().await
+    }
+
+    /// Leave the inverted index describing the table as it is now (or no
+    /// index, when the option is off or the table is too small to need one).
+    /// Runs last in `flush`: compaction and index maintenance each commit a
+    /// new table version, and an index belongs to exactly one.
+    async fn maintain_sparse_index(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        sparse_index::cleanup_interrupted_builds(&self.store_dir)?;
+        if !self.indexing.sparse_inverted_index {
+            return sparse_index::remove(&self.store_dir);
+        }
+        self.build_sparse_index().await.map(|_| ())
     }
 
     /// Mid-sync maintenance: keep `id`/`path` scalar indexes current (so the
@@ -688,7 +951,20 @@ impl LanceDbInner {
         Ok(IndexState {
             ann_indexed: ann.is_some(),
             unindexed_rows,
+            sparse_indexed: self.sparse_index_ready().await?,
         })
+    }
+
+    /// Whether an inverted index describes the table as this handle reads it.
+    pub(super) async fn sparse_index_ready(&self) -> Result<bool> {
+        if !self.indexing.sparse_inverted_index {
+            return Ok(false);
+        }
+        let Some(file) = sparse_index::open(&self.store_dir) else {
+            return Ok(false);
+        };
+        let (version, timestamp) = self.table_identity().await?;
+        Ok(sparse_index::matches_table(file.meta(), version, timestamp))
     }
 
     pub(super) async fn doc_count(&self) -> Result<usize> {
@@ -748,5 +1024,81 @@ impl LanceDbInner {
             }
         }
         Ok(paths)
+    }
+}
+
+#[cfg(test)]
+mod sparse_path_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selective_queries_rescore_index_candidates_and_broad_queries_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceDbInner::open(
+            dir.path().to_str().unwrap(),
+            1,
+            IndexingConfig {
+                build_ann_index: false,
+                sparse_index_min_rows: 1,
+                ..IndexingConfig::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let docs: Vec<_> = (0..128)
+            .map(|i| Document {
+                id: format!("d{i:03}"),
+                embedding: vec![0.0],
+                text: format!("document {i}"),
+                source_id: "s".into(),
+                path: format!("{i}.txt"),
+                chunk_schema_id: "schema".into(),
+                chunk_type: "text".into(),
+                heading_path: String::new(),
+                content_hash: format!("h{i}"),
+                seen_token: "t".into(),
+            })
+            .collect();
+        let rows = docs
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| {
+                (
+                    doc.id.clone(),
+                    SparseVector::from_pairs([(0, 1.0), (i as u32 + 1, 2.0)]),
+                )
+            })
+            .collect();
+        store.insert_new(docs).await.unwrap();
+        store.set_sparse("m".into(), rows).await.unwrap();
+        store.flush().await.unwrap();
+        let query = SparseVector::from_pairs([(43, 1.5)]);
+        let indexed = store.ranked_from_index("m", &query, None, 1).await.unwrap();
+        assert_eq!(indexed, Some(vec![(3.0, "d042".into())]));
+        assert_eq!(
+            indexed.unwrap(),
+            store.ranked_by_scan("m", &query, None, 1).await.unwrap()
+        );
+        // Every row matches this term; avoid expensive lookups of most rows.
+        let broad = SparseVector::from_pairs([(0, 1.0)]);
+        assert_eq!(
+            store.ranked_from_index("m", &broad, None, 1).await.unwrap(),
+            None
+        );
+        // A write makes the sidecar ineligible until rebuilt.
+        store
+            .set_sparse("m".into(), vec![("d042".into(), SparseVector::default())])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.ranked_from_index("m", &query, None, 1).await.unwrap(),
+            None
+        );
+        assert!(store
+            .ranked_by_scan("m", &query, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

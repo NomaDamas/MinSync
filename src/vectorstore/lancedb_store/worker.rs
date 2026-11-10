@@ -61,6 +61,7 @@ pub(super) enum Command {
     AllPaths(Resp<Vec<String>>),
     IndexNames(Resp<Vec<String>>),
     IndexState(Resp<IndexState>),
+    SparseIndexReady(Resp<bool>),
     Shutdown,
 }
 
@@ -169,6 +170,9 @@ pub(super) fn run_worker(
             Command::AllPaths(resp) => send_response(resp, rt.block_on(inner.all_paths())),
             Command::IndexNames(resp) => send_response(resp, rt.block_on(inner.index_names())),
             Command::IndexState(resp) => send_response(resp, rt.block_on(inner.index_state())),
+            Command::SparseIndexReady(resp) => {
+                send_response(resp, rt.block_on(inner.sparse_index_ready()))
+            }
             Command::Shutdown => break,
         }
     }

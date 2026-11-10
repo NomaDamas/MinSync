@@ -126,8 +126,9 @@ config key, BM25 시절 index에서의 업그레이드 경로는
 MinSync는 디렉터리를 scan하고 manifest와 비교해 각 텍스트 파일의 변경 여부를 판단합니다. 변경된 파일은 한 번만 chunk로 나누며, 같은 stable chunk ID를 LanceDB의 dense 검색과 sparse 검색이 공유합니다. stale row는 mark-and-sweep으로 제거됩니다. vector 모드는 query를 dense embedding하고, sparse 모드는 sparse encoder로 query를 인코딩해 chunk의 sparse term weight와의 inner product로 순위를 매기며, hybrid 모드는 두 순위를 결정적인 RRF(`k=60`)로 결합합니다.
 
 sparse term weight는 같은 LanceDB table에 nullable list column(`sparse_indices`,
-`sparse_values`)과 `sparse_model` tag column으로 저장되며, sparse 검색은 이
-column들을 훑는 exact top-k inner-product scan입니다.
+`sparse_values`)과 `sparse_model` tag column으로 저장됩니다. sparse 검색은 exact
+top-k inner product이며, table이 충분히 크면 [sparse inverted index](#sparse-inverted-index)에서
+같은 순위를 훨씬 빠르게 구하고, 그렇지 않으면 이 column들을 훑는 scan으로 구합니다.
 
 상태는 `.minsync/`에 저장됩니다.
 
@@ -298,6 +299,69 @@ compact_fragment_threshold = 64
 
 `minsync optimize`는 compact + re-index + prune만 수행합니다(embedding, 파일 읽기 없음). 중단된 sync 때문에 조각난 store를 복구할 때 사용하세요.
 
+### Sparse inverted index
+
+sparse query는 query와 term을 공유하는 chunk만 점수가 생깁니다. inverted index는
+term마다 그 term을 가진 chunk와 weight를 보관하므로, query는 모든 chunk 대신 자기
+term의 posting list(150 term짜리 SPLADE query에서 전체 posting의 약 2%)만 읽습니다.
+**순위는 근사가 아니라 full scan과 같습니다.** 같은 inner product를 같은 순서로
+더하고 동점도 같게 처리합니다. index는 weight를 8비트 구간으로만 보관하므로 스스로
+순위를 매기지 못합니다. 대신 정확한 top-`k`를 반드시 포함하는 작은 후보 chunk 집합
+(`k = 10`이면 약 12개, `k = 1000`이면 약 1,200개)을 알려 주고, 그 후보의 정확한
+vector를 table에서 읽어 scan과 같은 루프로 점수를 계산합니다. 질의 결과의
+`index_state.sparse_indexed`는 현재 table에 맞는 sidecar가 있다는 뜻이며, 그 질의가
+실제로 사용했다는 뜻은 아닙니다. 넓은 질의나 지원하지 않는 filter는 scan합니다.
+
+index는 table 옆(`.minsync/store/`)의 파일 하나 `sparse-index.inv`입니다. table의
+sparse column을 복사한 파생 데이터이며 source of truth가 아닙니다.
+
+- `minsync sync`와 `minsync optimize`가 모든 row가 현재 모델의 vector를 가진 뒤
+  마지막에 씁니다. 할 일이 없는 sync는 기존 파일을 그대로 둡니다.
+- 만든 시점의 table version을 기록하며, table이 정확히 그 version(과 모델)일 때만
+  씁니다. 어떤 write든 index를 비켜 서게 하고, 다음 sync나 `optimize`가 다시 만들
+  때까지 query는 scan합니다. 파일이 없거나 잘리거나 손상돼도, 이전 릴리스가 쓴
+  index(형식이 다릅니다)여도 scan으로 돌아갑니다. 업그레이드 뒤 `minsync optimize`를
+  한 번 실행하세요.
+  구조 손상은 검사하지만 checksum은 없으므로 임의의 bit flip을 모두 감지하지는
+  못합니다. sidecar가 의심되면 지우고 `optimize`로 table에서 다시 만드세요.
+- workspace 자신의 `source_id`로 거른 query(`minsync query`가 보내는 것)에 답하며,
+  다른 filter는 scan합니다. 후보가 table의 4분의 1을 넘을 만큼 큰 `k`도 scan합니다.
+- 갱신이 아니라 통째로 다시 만듭니다. 파일 하나만 바뀐 sync도 파일을 새로 쓰고,
+  compact나 prune을 하는 `optimize`도 새 table version을 commit하므로 그렇습니다.
+  바뀐 것이 없는 sync나 `optimize`는 쓰지 않습니다(두 번째 `optimize`는 106k chunk에서
+  0.24초, 393k에서 1.6초). 재생성만 21k chunk에서 0.6초, 106k에서 2.6초, 393k에서
+  38초입니다. 하루 종일 편집되는(`minsync watch`) 큰 workspace에서 이 비용이 부담이면
+  `sparse_inverted_index = false`로 두고 scan을 쓰세요.
+- 만드는 동안 `sparse_index_memory_postings`개(각 8바이트)까지만 메모리에 두고,
+  그 예산만큼의 term마다 sparse column을 한 번씩 다시 읽습니다.
+
+```toml
+[vectorstore.options]
+sparse_inverted_index = true          # false: 만들지 않고 항상 scan, 다음 flush에서 파일 삭제
+sparse_index_min_rows = 2000          # 이보다 작은 table은 scan
+sparse_index_memory_postings = 32000000   # build pass당 posting 256 MB
+```
+
+비용은 MIRACL(실제 KURE-Sparse-nano vector, release build, Apple Silicon, MB = 10^6
+바이트)에서 측정했습니다. chunk당 posting은 한국어 733개, 영어 1,163개입니다.
+build 시간과 peak RSS는 완성된 workspace의 `minsync optimize` 값이고(21k 행은 로드
+도구의 `flush` 값이라 RSS가 없습니다), query 시간은 열린 store의 `query_sparse`
+평균이며 후보를 읽어 다시 점수 매기는 시간을 포함합니다.
+
+| chunk 수 | index 파일 | posting당 8B일 때 | build | build peak RSS | query: scan | query: index |
+|---:|---:|---:|---:|---:|---:|---:|
+| 21,201 | 31 MB | 124 MB | 0.6 s | - | 71 ms | 1.9 ms |
+| 106,005 | 155 MB | 620 MB | 2.6 s | 1.25 GB | 389 ms | 5.8 ms |
+| 393,500 | 851 MB | 3,661 MB | 37.5 s | 1.56 GB | 1,883 ms | 23.4 ms |
+
+파일은 posting당 약 2바이트입니다. posting list는 128개 단위 block으로 row 번호의
+차이(gap)를 bit-packing하고 weight는 posting당 1바이트이며, posting당 8바이트일 때보다
+4배 작습니다. 압축을 풀고 다시 점수를 매기는 비용이 있어서, 압축 없이 저장하던 때의
+106k / 393k의 3.4 / 13.8 ms보다 조금 느립니다. `minsync query` 프로세스처럼 store를
+열고 query 하나에 답하는 데는(모델 로드 제외) index가 있을 때 3.7 / 9.3 / 28 ms가
+걸립니다. 재현은 `examples/sparse_store_bench.rs`, `examples/sparse_inverted_bench.rs`와,
+답이 scan과 같음을 확인하는 `examples/sparse_index_verify.rs`를 보세요.
+
 ## Sparse 검색(SPLADE)
 
 MinSync는 [KURE-Sparse-nano](https://huggingface.co/nlpai-lab/KURE-Sparse-nano)
@@ -310,7 +374,7 @@ vector를 만들고, chunk의 sparse term weight와의 inner product로 순위�
 | 모드 | 동작 |
 |---|---|
 | `vector` (기본값) | dense query embedding, ANN/HNSW 검색 |
-| `sparse` | sparse query encoding, exact top-k inner-product scan |
+| `sparse` | sparse query encoding, exact top-k inner product([sparse inverted index](#sparse-inverted-index)가 table을 설명하면 그 index로, 아니면 scan으로) |
 | `hybrid` | dense와 sparse 순위를 결정적 RRF(`k=60`)로 융합 |
 
 JSON 결과에서 sparse 순위를 나타내는 필드는 `sparse_rank`입니다.
@@ -405,9 +469,11 @@ chunk를 길이순으로 정렬한 뒤 batch로 묶기 때문에 작은 값에�
   dense+sparse hybrid 7% / 23% / 33%). 문서가 3,000개가 되면 SPLADE는
   6% / 22% / 29%로 떨어지고 BM25는 97% / 100% / 100%를 유지합니다. 정확한
   조회는 `grep`을 쓰세요.
-- **corpus 크기.** `--mode sparse`는 저장된 모든 chunk의 점수를 계산하며 sparse
-  column에는 index가 없습니다. query(CLI, in-process)가 21k chunk에서 206 ms,
-  106k에서 508 ms로 선형으로 늘어납니다.
+- **corpus 크기.** inverted index가 없으면 `--mode sparse`는 저장된 모든 chunk의
+  점수를 계산합니다. query가 21k chunk에서 206 ms, 106k에서 508 ms로 선형으로
+  늘어납니다. index(chunk 2,000개 이상인 table에서 기본)를 쓰면 posting의 약 2%만
+  읽어 106k에서 5.8 ms, 393k chunk에서 23.4 ms이며 순위는 같습니다.
+  [Sparse inverted index](#sparse-inverted-index)를 보세요.
 - **색인 속도.** 모든 chunk가 모델을 거칩니다. Metal에서 초당 약 25-30 chunk,
   CPU에서 3-5 chunk입니다. 한국어·영어 markdown 1,118 chunk의 sparse 전용 sync가
   M4 Max에서 35초 걸렸습니다.

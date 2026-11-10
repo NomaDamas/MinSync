@@ -141,7 +141,9 @@ MinSync scans your directory, compares each text file to the manifest, chunks ch
 
 Sparse term weights live in the same LanceDB table as nullable list columns
 (`sparse_indices`, `sparse_values`) plus a `sparse_model` tag column; sparse
-search is an exact top-k inner-product scan over those columns.
+search is an exact top-k inner product, answered from the
+[sparse inverted index](#sparse-inverted-index) beside the table when one
+describes it and by a scan over those columns otherwise.
 
 State lives in `.minsync/`:
 
@@ -341,6 +343,81 @@ compact_fragment_threshold = 64
 
 `minsync optimize` runs only compact + re-index + prune (no embedding, no file reads) to repair a store that earlier interrupted syncs left fragmented.
 
+### Sparse inverted index
+
+A sparse query scores a chunk only if it shares a term with the query. The
+inverted index keeps, per term, the chunks that hold it and their weights, so
+a query reads the posting lists of its own terms (about 2% of all postings for
+a 150-term SPLADE query) instead of every chunk. **The ranking is the full
+scan's, not an approximation**: the same inner products, summed in the same
+order, ties broken the same way. The index keeps each weight only as an 8-bit
+bracket, so it cannot rank by itself; it names a small set of candidate chunks
+(about 12 for `k = 10`, 1,200 for `k = 1000`) that provably contains the exact
+top-`k`, and the candidates' exact vectors are read from the table and scored
+with the scan's own loop. `index_state.sparse_indexed` says a sidecar describes
+the current table, not that this particular query used it: broad queries and
+unsupported filters still scan.
+
+The index is one file, `sparse-index.inv`, beside the table
+(`.minsync/store/`). It is a derived copy of the table's sparse columns and is
+never the source of truth:
+
+- `minsync sync` and `minsync optimize` write it at the end, once every row has
+  a vector from the current model. A sync that finds nothing to do leaves the
+  existing file alone.
+- It records the table version it was built from. A query uses it only when the
+  table is still at exactly that version (and model); any write makes it step
+  aside, and the query scans until the next sync or `optimize` rebuilds it.
+  Missing, truncated or damaged files fall back to the scan too, and so does
+  an index written by an older release (its format differs): run
+  `minsync optimize` once after upgrading.
+  Structural damage is checked; the file has no checksum, so arbitrary
+  bit flips are not guaranteed to be detected. Delete it and run `optimize`
+  to rebuild a suspect sidecar from the table.
+- It answers queries filtered to the workspace's own `source_id` (what
+  `minsync query` sends); other filters scan. So does a `k` so large that the
+  candidates would be more than a quarter of the table.
+- It is rebuilt whole, not updated: a sync that changes even one file writes
+  the file again, and so does an `optimize` that compacts or prunes, because
+  that commits a new table version. A sync or an `optimize` that changes
+  nothing does not (a second `optimize` took 0.24 s at 106k chunks and 1.6 s
+  at 393k). The rebuild alone is 0.6 s at 21k chunks, 2.6 s at 106k and 38 s
+  at 393k. A workspace that is edited all day (`minsync watch`) and is large
+  enough for that to hurt can set `sparse_inverted_index = false` and keep the
+  scan.
+- Building holds at most `sparse_index_memory_postings` postings (8 bytes each)
+  in memory and re-reads the sparse columns once per budget's worth of terms.
+
+```toml
+[vectorstore.options]
+sparse_inverted_index = true          # false: never build, always scan; removes the file at the next flush
+sparse_index_min_rows = 2000          # smaller tables are scanned
+sparse_index_memory_postings = 32000000   # 256 MB of postings per build pass
+```
+
+Cost, measured on MIRACL (real KURE-Sparse-nano vectors, release build, Apple
+silicon; MB = 10^6 bytes): 733 postings per Korean chunk and 1,163 per English
+chunk. Build time and peak RSS are `minsync optimize` on a finished workspace
+(the 21k row is the `flush` of the load tool, not `optimize`, so it has no
+RSS). Query times are `LanceDbStore::query_sparse` on an open store, mean of
+the test queries, candidates read back and rescored included.
+
+| Chunks | Index file | At 8 B/posting | Build | Peak RSS of the build | Query: scan | Query: index |
+|---:|---:|---:|---:|---:|---:|---:|
+| 21,201 | 31 MB | 124 MB | 0.6 s | - | 71 ms | 1.9 ms |
+| 106,005 | 155 MB | 620 MB | 2.6 s | 1.25 GB | 389 ms | 5.8 ms |
+| 393,500 | 851 MB | 3,661 MB | 37.5 s | 1.56 GB | 1,883 ms | 23.4 ms |
+
+The file takes about 2 bytes per posting: posting lists are stored as
+bit-packed row-number gaps in blocks of 128, plus one byte per weight, 4x
+smaller than 8 bytes per posting. Decoding and rescoring cost some time against
+an uncompressed file (3.4 and 13.8 ms at 106k and 393k when postings took 8
+bytes). Opening the store and answering one query, as each `minsync query`
+process does (without loading the model), takes 3.7 / 9.3 / 28 ms with the
+index. To reproduce, see `examples/sparse_store_bench.rs`,
+`examples/sparse_inverted_bench.rs` and, for the proof that the answers equal
+the scan's, `examples/sparse_index_verify.rs`.
+
 ### Machine-readable progress
 
 A host app that spawns `minsync sync` can read progress as JSON lines instead of parsing human logs:
@@ -378,7 +455,7 @@ Select the mode with `--mode`:
 | Mode | Behavior |
 |---|---|
 | `vector` (default) | dense query embedding, ANN/HNSW search |
-| `sparse` | sparse query encoding, exact top-k inner-product scan |
+| `sparse` | sparse query encoding, exact top-k inner product (answered from the [sparse inverted index](#sparse-inverted-index) when one describes the table, by a scan otherwise) |
 | `hybrid` | reciprocal-rank fusion of the dense and sparse rankings (`k=60`) |
 
 The JSON result field for the sparse ranking is `sparse_rank`.
@@ -477,9 +554,11 @@ Measured on the corpora above (Apple Silicon, KURE-Sparse-nano):
   Qwen3-Embedding-0.6B: 2% / 9% / 14%; dense+sparse hybrid: 7% / 23% / 33%).
   With 3,000 such documents SPLADE drops to 6% / 22% / 29% while BM25 keeps
   97% / 100% / 100%. Use `grep` for exact lookups.
-- **Corpus size.** `--mode sparse` scores every stored chunk; there is no index
-  over the sparse columns. A query (CLI, in-process) takes 206 ms at 21k chunks
-  and 508 ms at 106k, growing linearly.
+- **Corpus size.** Without the inverted index a `--mode sparse` query scores
+  every stored chunk: 206 ms at 21k chunks and 508 ms at 106k, growing
+  linearly. With the index (the default for tables of 2,000 chunks or more) it
+  reads about 2% of the postings: 5.8 ms at 106k and 23.4 ms at 393k chunks,
+  with the same ranking. See [Sparse inverted index](#sparse-inverted-index).
 - **Indexing speed.** Every chunk goes through the model: about 25-30
   chunks/s on Metal and 3-5 on CPU. A sparse-only sync of 1,118 markdown
   chunks (Korean and English) took 35 s on an M4 Max.
