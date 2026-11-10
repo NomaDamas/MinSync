@@ -48,6 +48,16 @@ pub struct SparseTarget {
     pub text: String,
 }
 
+/// A stored chunk as an embedder switch copies it: everything but the dense
+/// vector (the rebuild computes a new one), plus the sparse vector and the
+/// model that produced it, which stay valid whatever the dense model is.
+#[derive(Debug, Clone)]
+pub struct StoredChunk {
+    /// The row with an empty `embedding`.
+    pub doc: Document,
+    pub sparse: Option<(String, SparseVector)>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Filter {
     Eq(String, String),
@@ -85,6 +95,11 @@ pub trait VectorStore: Send + Sync {
     fn documents(&self) -> Result<Vec<Document>> {
         Ok(Vec::new())
     }
+    /// Up to `limit` stored chunks whose id sorts after `after` (all of them
+    /// from the start when `None`), in id order, without their dense
+    /// vectors. Walking the store with the last id of each page visits every
+    /// row once, even while rows are being rewritten.
+    fn scan_chunks(&self, after: Option<&str>, limit: usize) -> Result<Vec<StoredChunk>>;
     /// Which of `ids` are present. Stores should avoid materializing full
     /// rows (vectors, text) for what is only an existence check.
     fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
@@ -96,8 +111,14 @@ pub trait VectorStore: Send + Sync {
     /// At most `limit` rows that hold no sparse vector from `model`: never
     /// encoded, or encoded by another model. Sync encodes these, so a fresh
     /// row, an old row after a model change and a row left over from an
-    /// interrupted run are all the same case.
-    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>>;
+    /// interrupted run are all the same case. `scope` narrows the search to
+    /// matching rows (the batch a sync just wrote) instead of the whole table.
+    fn rows_missing_sparse(
+        &self,
+        model: &str,
+        scope: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>>;
     /// How many rows [`VectorStore::rows_missing_sparse`] would return without a limit.
     fn count_missing_sparse(&self, model: &str) -> Result<usize>;
     /// Attach sparse vectors from `model` to existing rows by id. An id that
@@ -121,7 +142,16 @@ pub trait VectorStore: Send + Sync {
         filter: Option<&Filter>,
         topk: usize,
     ) -> Result<Vec<QueryHit>>;
+    /// End-of-sync maintenance: fold new rows into the search indexes and
+    /// prune old versions. It compacts only once fragments pile up, so a
+    /// sync that adds a few files stays an append.
     fn flush(&mut self) -> Result<()>;
+    /// Full maintenance for `minsync optimize`: compact every fragment under
+    /// the target size, refresh search indexes, and prune. Stores with
+    /// nothing more to do than [`VectorStore::flush`] keep the default.
+    fn optimize(&mut self) -> Result<()> {
+        self.flush()
+    }
     /// Cheap mid-sync maintenance so a long run that is killed leaves a
     /// store that is still fast to reopen: compact once fragments pile up
     /// and prune old versions. Unlike [`VectorStore::flush`] it never
@@ -157,6 +187,32 @@ pub fn create_vectorstore_readonly(
     store_path: &Path,
 ) -> Result<Box<dyn VectorStore>> {
     create_vectorstore_with_mode(config, store_path, true)
+}
+
+/// Read-only store opened at `dimension` instead of the configured one: the
+/// width the stored vector column actually has. A sparse query, or the old
+/// side of an embedder rebuild, reads an index whose dense width the current
+/// `[embedder]` no longer describes.
+pub fn create_vectorstore_readonly_with_dimension(
+    config: &Config,
+    store_path: &Path,
+    dimension: usize,
+) -> Result<Box<dyn VectorStore>> {
+    match config.vectorstore.id.as_str() {
+        "lancedb" => {
+            let mut indexing =
+                lancedb_store::IndexingConfig::from_options(Some(&config.vectorstore.options))?;
+            if dimension == crate::config::SPARSE_ONLY_DIMENSION {
+                indexing.build_ann_index = false;
+            }
+            Ok(Box::new(lancedb_store::LanceDbStore::open_readonly(
+                store_path, dimension, indexing,
+            )?))
+        }
+        other => Err(MinSyncError::Config(format!(
+            "unknown vectorstore id: {other}"
+        ))),
+    }
 }
 
 fn create_vectorstore_with_mode(

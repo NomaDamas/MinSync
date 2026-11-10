@@ -206,6 +206,13 @@ mod tests {
     }
 
     impl VectorStore for StateTrackingStore {
+        fn scan_chunks(
+            &self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<crate::vectorstore::StoredChunk>> {
+            self.inner.scan_chunks(after, limit)
+        }
         fn upsert(&mut self, docs: &[Document]) -> Result<()> {
             self.inner.upsert(docs)
         }
@@ -242,9 +249,10 @@ mod tests {
         fn rows_missing_sparse(
             &self,
             model: &str,
+            scope: Option<&crate::vectorstore::Filter>,
             limit: usize,
         ) -> Result<Vec<crate::vectorstore::SparseTarget>> {
-            self.inner.rows_missing_sparse(model, limit)
+            self.inner.rows_missing_sparse(model, scope, limit)
         }
 
         fn count_missing_sparse(&self, model: &str) -> Result<usize> {
@@ -407,6 +415,24 @@ mod tests {
             .expect("status succeeds");
 
         assert_eq!(result.state, SyncState::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn test_status_first_sync_interrupted() {
+        let (dir, sync, _chunker, _embedder, _store) = fixture();
+        let config = sync
+            .init(false, "openai:text-embedding-3-small", "recursive")
+            .expect("init succeeds");
+        Transaction::new(&config.source_id, "token", None, "sha256:next")
+            .save(&dir.path().join(".minsync").join("txn.json"))
+            .expect("save transaction");
+
+        let result = status(&dir.path().join(".minsync"))
+            .await
+            .expect("status succeeds");
+
+        assert_eq!(result.state, SyncState::Interrupted);
+        assert_eq!(result.last_synced_at, None);
     }
 
     #[tokio::test]

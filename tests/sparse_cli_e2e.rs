@@ -31,6 +31,7 @@ fn sparse_cli_queries_live_lancedb_without_embedder_credentials() {
         manifest_hash: "sha256:live".to_string(),
         chunk_schema_id: "recursive".to_string(),
         embedder_id: config.embedder.id.clone(),
+        embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: Some(model.clone()),
     }
@@ -118,6 +119,7 @@ fn sparse_query_on_an_index_from_another_model_fails_naming_the_fix() {
             manifest_hash: "sha256:live".to_string(),
             chunk_schema_id: "recursive".to_string(),
             embedder_id: config.embedder.id.clone(),
+            embedder: None,
             collection_path: config.collection.path.clone(),
             sparse_id,
         }
@@ -245,6 +247,7 @@ fn verify_cli_reports_duplicate_vector_corruption_pairs() {
         manifest_hash: "sha256:test".to_string(),
         chunk_schema_id: chunker.schema_id().to_string(),
         embedder_id: config.embedder.id.clone(),
+        embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: None,
     }
@@ -365,6 +368,7 @@ fn build_corrupt_verify_fixture_from_environment() {
         manifest_hash: "sha256:test".to_string(),
         chunk_schema_id: chunker.schema_id().to_string(),
         embedder_id: config.embedder.id.clone(),
+        embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: None,
     }

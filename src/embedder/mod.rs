@@ -1,5 +1,6 @@
 pub mod context_limit;
 pub mod deadline;
+mod gemma2;
 pub mod hub;
 pub mod native;
 pub mod openai;

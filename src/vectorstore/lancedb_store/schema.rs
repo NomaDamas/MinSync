@@ -388,6 +388,50 @@ pub(super) fn batch_to_documents(batch: &RecordBatch) -> Result<Vec<Document>> {
     Ok(docs)
 }
 
+/// Chunks of `batch` without their dense vector, each with the sparse vector
+/// and model it holds (if any). `batch` must not include the vector column.
+pub(super) fn batch_to_stored_chunks(
+    batch: &RecordBatch,
+) -> Result<Vec<crate::vectorstore::StoredChunk>> {
+    let ids = string_col(batch, "id")?;
+    let text = string_col(batch, "text")?;
+    let source_ids = string_col(batch, "source_id")?;
+    let paths = string_col(batch, "path")?;
+    let schemas = string_col(batch, "chunk_schema_id")?;
+    let chunk_types = string_col(batch, "chunk_type")?;
+    let headings = string_col(batch, "heading_path")?;
+    let hashes = string_col(batch, "content_hash")?;
+    let tokens = string_col(batch, "seen_token")?;
+    let models = string_col(batch, SPARSE_MODEL_COLUMN)?;
+    let indices = list_col(batch, SPARSE_INDICES_COLUMN)?;
+    let values = list_col(batch, SPARSE_VALUES_COLUMN)?;
+
+    let mut chunks = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let sparse = if models.is_null(row) {
+            None
+        } else {
+            sparse_at(indices, values, row)?.map(|vector| (models.value(row).to_string(), vector))
+        };
+        chunks.push(crate::vectorstore::StoredChunk {
+            doc: Document {
+                id: ids.value(row).to_string(),
+                embedding: Vec::new(),
+                text: text.value(row).to_string(),
+                source_id: source_ids.value(row).to_string(),
+                path: paths.value(row).to_string(),
+                chunk_schema_id: schemas.value(row).to_string(),
+                chunk_type: chunk_types.value(row).to_string(),
+                heading_path: headings.value(row).to_string(),
+                content_hash: hashes.value(row).to_string(),
+                seen_token: tokens.value(row).to_string(),
+            },
+            sparse,
+        });
+    }
+    Ok(chunks)
+}
+
 pub(super) fn batch_to_hash_embeddings(batch: &RecordBatch) -> Result<Vec<(String, Vec<f32>)>> {
     let hashes = string_col(batch, "content_hash")?;
     let vectors = batch

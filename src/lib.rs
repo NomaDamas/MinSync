@@ -3,6 +3,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod embedder;
+pub mod embedder_identity;
 pub mod error;
 pub(crate) mod file_size;
 pub mod id;

@@ -1,6 +1,6 @@
 [package]
 name = "minsync"
-version = "0.7.0"
+version = "0.7.3"
 edition = "2021"
 rust-version = "1.91"
 description = "Manifest-based incremental vector DB indexing CLI for text files"
@@ -63,8 +63,18 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11.0", features = ["metal"] }
-candle-nn = { version = "0.11.0", features = ["metal"] }
+# `accelerate` routes CPU matmuls to Accelerate.framework (always present on
+# macOS); without it candle's pure-Rust gemm runs SPLADE ~40x slower than Metal.
+candle-core = { version = "0.11.0", features = ["metal", "accelerate"] }
+candle-nn = { version = "0.11.0", features = ["metal", "accelerate"] }
+
+# Opt-in native backends for non-macOS builds; macOS gets Metal + Accelerate.
+# `--features mkl`: Intel MKL BLAS for x86_64 CPU encoders.
+# `--features cuda`: NVIDIA GPU (needs the CUDA toolkit at build time).
+[features]
+default = []
+mkl = ["candle-core/mkl", "candle-nn/mkl"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 # candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
 # float16x8_t which now requires the unstable stdarch_neon_f16 feature.

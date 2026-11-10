@@ -7,7 +7,7 @@ use super::{to_store_error, IndexingConfig};
 use crate::error::Result;
 use crate::sparse::SparseVector;
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget};
+use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk};
 use std::collections::HashMap;
 use std::sync::mpsc;
 
@@ -19,6 +19,7 @@ pub(super) enum Command {
     Fetch(Vec<String>, Resp<Vec<Document>>),
     FetchEmbeddingsByContentHash(Vec<String>, Resp<HashMap<String, Vec<f32>>>),
     Documents(Resp<Vec<Document>>),
+    ScanChunks(Option<String>, usize, Resp<Vec<StoredChunk>>),
     ExistingIds(Vec<String>, Resp<std::collections::HashSet<String>>),
     InsertNew(Vec<Document>, Resp<()>),
     Delete(Filter, Resp<usize>),
@@ -30,6 +31,7 @@ pub(super) enum Command {
     },
     RowsMissingSparse {
         model: String,
+        scope: Option<Filter>,
         limit: usize,
         resp: Resp<Vec<SparseTarget>>,
     },
@@ -52,6 +54,7 @@ pub(super) enum Command {
         resp: Resp<Vec<QueryHit>>,
     },
     Flush(Resp<()>),
+    Optimize(Resp<()>),
     Checkpoint(Resp<()>),
     FragmentCount(Resp<usize>),
     DocCount(Resp<usize>),
@@ -106,6 +109,9 @@ pub(super) fn run_worker(
                 rt.block_on(inner.fetch_embeddings_by_content_hash(hashes)),
             ),
             Command::Documents(resp) => send_response(resp, rt.block_on(inner.documents())),
+            Command::ScanChunks(after, limit, resp) => {
+                send_response(resp, rt.block_on(inner.scan_chunks(after, limit)))
+            }
             Command::ExistingIds(ids, resp) => {
                 send_response(resp, rt.block_on(inner.existing_ids(ids)))
             }
@@ -121,9 +127,15 @@ pub(super) fn run_worker(
                 topk,
                 resp,
             } => send_response(resp, rt.block_on(inner.query(vector, filter, topk))),
-            Command::RowsMissingSparse { model, limit, resp } => {
-                send_response(resp, rt.block_on(inner.rows_missing_sparse(model, limit)))
-            }
+            Command::RowsMissingSparse {
+                model,
+                scope,
+                limit,
+                resp,
+            } => send_response(
+                resp,
+                rt.block_on(inner.rows_missing_sparse(model, scope, limit)),
+            ),
             Command::CountMissingSparse(model, resp) => {
                 send_response(resp, rt.block_on(inner.count_missing_sparse(model)))
             }
@@ -149,6 +161,7 @@ pub(super) fn run_worker(
                 rt.block_on(inner.query_sparse(model, vector, filter, topk)),
             ),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
+            Command::Optimize(resp) => send_response(resp, rt.block_on(inner.optimize())),
             Command::Checkpoint(resp) => send_response(resp, rt.block_on(inner.checkpoint())),
             Command::FragmentCount(resp) => {
                 send_response(resp, rt.block_on(inner.fragment_count()));

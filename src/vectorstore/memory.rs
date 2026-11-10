@@ -1,7 +1,9 @@
 use crate::error::Result;
 use crate::sparse::{dot_terms, SparseVector, TopK};
 use crate::vectorstore::similarity::{cosine_similarity, matches_filter};
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, VectorStore};
+use crate::vectorstore::{
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, VectorStore,
+};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -79,6 +81,26 @@ impl VectorStore for InMemoryStore {
         Ok(docs)
     }
 
+    fn scan_chunks(&self, after: Option<&str>, limit: usize) -> Result<Vec<StoredChunk>> {
+        let mut ids: Vec<&String> = self
+            .docs
+            .keys()
+            .filter(|id| after.is_none_or(|after| id.as_str() > after))
+            .collect();
+        ids.sort();
+        Ok(ids
+            .into_iter()
+            .take(limit)
+            .map(|id| StoredChunk {
+                doc: Document {
+                    embedding: Vec::new(),
+                    ..self.docs[id].clone()
+                },
+                sparse: self.sparse.get(id).cloned(),
+            })
+            .collect())
+    }
+
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
         let original_len = self.docs.len();
         self.docs.retain(|_, doc| !matches_filter(doc, filter));
@@ -113,10 +135,16 @@ impl VectorStore for InMemoryStore {
         hits.truncate(topk);
         Ok(hits)
     }
-    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>> {
+    fn rows_missing_sparse(
+        &self,
+        model: &str,
+        scope: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>> {
         let mut missing: Vec<&Document> = self
             .docs
             .values()
+            .filter(|doc| scope.is_none_or(|scope| matches_filter(doc, scope)))
             .filter(|doc| {
                 self.sparse
                     .get(&doc.id)
@@ -330,7 +358,7 @@ mod sparse_tests {
             .set_sparse("m1", &[("a".to_string(), sv(&[(1, 1.0)]))])
             .unwrap();
         let missing: Vec<String> = store
-            .rows_missing_sparse("m1", 10)
+            .rows_missing_sparse("m1", None, 10)
             .unwrap()
             .into_iter()
             .map(|row| row.id)
@@ -364,7 +392,7 @@ mod sparse_tests {
             .collect();
         store.upsert(&docs).unwrap();
         let ids: Vec<String> = store
-            .rows_missing_sparse("m", 2)
+            .rows_missing_sparse("m", None, 2)
             .unwrap()
             .into_iter()
             .map(|row| row.id)

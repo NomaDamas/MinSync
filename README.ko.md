@@ -39,6 +39,13 @@ cd MinSync
 cargo build --release
 ```
 
+프로세스 안 모델(dense embedder와 SPLADE)은 macOS에서 Metal로 돌고, CPU matmul은 Accelerate를 씁니다. 다른 플랫폼은 기본적으로 CPU에서 돌며, 빌드할 때 더 빠른 backend를 고를 수 있습니다:
+
+```bash
+cargo build --release --features cuda   # NVIDIA GPU, CUDA toolkit 필요. device "auto"가 GPU 0을 고름
+cargo build --release --features mkl    # x86_64 CPU용 Intel MKL BLAS
+```
+
 MinSync는 기본적으로 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)를 프로세스 안에서 embedding합니다. API key, TEI 서버, Hugging Face 게이트가 필요 없습니다. 첫 `minsync sync`에서 모델을 로컬 캐시로 받습니다.
 
 dense 모델 없이 쓰려면 embedder, API 키, embedding 서버가 모두 필요 없는 sparse-only workspace를 만드세요(sparse encoder는 자체적으로 작은 모델을 씁니다. [Sparse 검색(SPLADE)](#sparse-검색splade) 참고).
@@ -267,6 +274,7 @@ index_optimize_delta_threshold = 10000
 | Embedder | Dimension |
 |---|---:|
 | `native:Qwen/Qwen3-Embedding-0.6B` (기본값) | 1024 |
+| `native:google/embeddinggemma-2` | 768 |
 | `tei:google/embeddinggemma-300m` | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
@@ -455,9 +463,9 @@ chunk를 길이순으로 정렬한 뒤 batch로 묶기 때문에 작은 값에�
   늘어납니다. index(chunk 2,000개 이상인 table에서 기본)를 쓰면 posting의 약 2%만
   읽어 106k에서 3.4 ms, 393k chunk에서 13.8 ms이며 순위는 같습니다.
   [Sparse inverted index](#sparse-inverted-index)를 보세요.
-- **색인 속도.** 모든 chunk가 모델을 거칩니다. Metal에서 초당 약 16-25 chunk,
-  CPU에서 3-5 chunk입니다. SciFact 5,183개 파일은 BM25가 6초, SPLADE가 Metal에서
-  313초 걸렸습니다.
+- **색인 속도.** 모든 chunk가 모델을 거칩니다. Metal에서 초당 약 25-30 chunk,
+  CPU에서 3-5 chunk입니다. 한국어·영어 markdown 1,118 chunk의 sparse 전용 sync가
+  M4 Max에서 35초 걸렸습니다.
 - **디스크.** 인코딩된 chunk 하나가 약 5 KB입니다. 동시에 실행 중인 query가 파일을
   잃지 않도록 Lance가 교체된 파일을 10분간 보관하므로, 긴 sync 직후에는 다음
   sync가 정리하기 전까지 store가 데이터의 몇 배가 될 수 있습니다(21k chunk
@@ -542,11 +550,40 @@ minsync sync
 minsync query "검색어" --k 5
 ```
 
-768차원 TEI 인덱스는 1024차원 벡터와 섞으면 안 됩니다. embedder를 바꾼 뒤에는 전체를 다시 임베딩하세요.
+### 기존 index의 embedder 바꾸기
+
+index에는 dense embedder 하나의 벡터만 들어 있습니다. `minsync sync`는 어떤 embedder(모델, 차원, passage prefix)로 만들었는지 `cursor.json`에 기록하고 매번 `[embedder]`와 비교하므로, 모델을 바꿔도 두 모델의 벡터가 섞일 수 없습니다. `[embedder]`(와 `[vectorstore.options] dimension`)를 새 모델로 고친 뒤 실행하세요.
 
 ```bash
-minsync sync --full
+minsync sync --reembed
 ```
+
+`--reembed`는 store에 이미 있는 chunk 텍스트로 모든 dense 벡터를 설정된 embedder로 다시 만듭니다. 파일을 다시 읽거나 다시 chunking하지 않고 sparse(SPLADE) 벡터는 그대로 옮기므로, 임베딩 한 번 분량만 들고 SPLADE 인코딩은 필요 없습니다. 새 벡터는 live store 옆의 staging store(`store.reembed`)에 쓰고, 마지막 행까지 옮기면 rename 한 번으로 교체합니다. 그때까지 live index는 sparse 질의를 계속 받습니다. 중간에 끊어도 안전하며, 다음 `sync --reembed`가 마지막으로 commit한 256개 chunk 페이지 다음부터 이어갑니다. 그동안 바뀐 파일은 재구축 뒤에 이어지는 sync가 반영합니다. `--reembed`는 `--full`과 함께 쓸 수 없고 JSON 결과에 `reembedded`를 출력합니다.
+
+**재구축 전에 새 embedder 점검하기.** `minsync sync --reembed --dry-run`은 설정된 embedder로 짧은 텍스트 하나를 임베딩해 본 결과(`probe`: 모델과 실제 벡터 차원)와 재구축하면 다시 임베딩할 chunk 수(`would_reembed`, 중단된 재구축을 이어받게 되면 `resuming`이 true)를 보여 줍니다. staging store도 마커도 만들지 않고 cursor도 건드리지 않습니다. 실제 `--reembed`도 같은 점검을 먼저 하므로, 로드되지 않는 모델, 닿지 않는 endpoint, NaN 출력, 모델 차원과 다른 `[vectorstore.options] dimension`은 요청 한 번 뒤에, chunk를 하나도 건드리기 전에 두 숫자와 고칠 설정을 알려 주며 멈춥니다. 첫 페이지에서 실패하지 않습니다. (`--dry-run`은 점검만 하며 새 모델이 더 잘 검색하는지는 알려 주지 못합니다. 그건 별도 workspace 등으로 직접 질의를 비교하세요.)
+
+재구축이 끝나기 전에는 두 모델을 섞게 될 동작이 종료 코드 `8`로 멈춥니다. `minsync sync`, `query --mode vector|hybrid`, `check`, `verify`, `optimize`, `watch`는 이전 모델과 새 모델을 알려 주고 `--reembed`를 안내합니다. `query --mode sparse`는 막지 않습니다. 저장된 벡터를 바꾸는 설정만 교체로 취급합니다. 모델, 차원, `passage_prefix`입니다. `dtype`, `device`, `batch_size`, timeout, `query_prefix`는 해당하지 않습니다.
+
+이전 버전이 만든 index에는 차원과 prefix가 기록되어 있지 않으므로, 다음 sync가 기록하기 전까지는 모델 변경만 감지합니다.
+
+`--embedder none`으로 바꿨다가 되돌리는 것도 같은 방식입니다. `--reembed`가 1차원 placeholder 벡터를 쓰거나(모델 호출 없음) 모든 chunk를 다시 임베딩합니다.
+
+`minsync init --force --embedder <id>`도 여전히 되지만 index를 버리고 모든 파일을 다시 읽으므로 `--reembed`를 권장합니다.
+
+### EmbeddingGemma 2
+
+`native:google/embeddinggemma-2`는 Google의 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)(Apache-2.0, 텍스트 타워 2.7억 파라미터, 768차원, 8K context)를 candle로 프로세스 안에서 실행합니다. 텍스트만 쓰며 체크포인트의 vision/audio 타워는 읽지 않습니다.
+
+```bash
+minsync init --embedder native:google/embeddinggemma-2
+```
+
+`init`은 `dimension = 768`과 모델이 학습된 검색 프롬프트(질의 `task: search result | query: `, passage `title: none | text: `)를 씁니다. 처음 사용할 때 1.5 GB 체크포인트(모든 modality 포함)를 모델 cache에 받습니다.
+
+- 기본값은 모든 device에서 `f32`입니다. 이 모델은 `float16`에서 overflow하므로 `dtype = "f16"`은 거부하며, `bf16`은 Metal에서만 됩니다(CPU matmul에 bf16 커널이 없습니다). Metal에서 `dtype = "bf16"`을 쓰면 실제 chunk(약 1000자) 297개를 임베딩할 때 peak footprint가 3.1 GB에서 1.9 GB로 줄고 속도는 같으며, 벡터는 `f32`와 코사인 유사도 0.9998 이내입니다.
+- `attention`은 `auto` 또는 `eager`만 받습니다. attention이 작아서(head 4개) eager로 실행합니다.
+- 벡터는 768차원 전체를 유지하며 Matryoshka 절단은 지원하지 않습니다.
+- encoder는 양방향입니다. 6개 layer 중 5개는 512 토큰 반경 안만 보고, 나머지 하나는 chunk 전체를 봅니다.
 
 ### Native 런타임
 
@@ -704,7 +741,7 @@ CI는 Ubuntu, macOS, Windows에서 rustup으로 Rust 1.91을 설치한 뒤 `carg
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```

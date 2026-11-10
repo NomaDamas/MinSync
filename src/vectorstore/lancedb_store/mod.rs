@@ -24,7 +24,9 @@ pub use index::IndexingConfig;
 use crate::error::{MinSyncError, Result};
 use crate::sparse::SparseVector;
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, VectorStore};
+use crate::vectorstore::{
+    Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk, VectorStore,
+};
 use lancedb::DistanceType;
 use std::path::Path;
 use std::sync::mpsc;
@@ -207,6 +209,10 @@ impl VectorStore for LanceDbStore {
         self.request(Command::Documents)
     }
 
+    fn scan_chunks(&self, after: Option<&str>, limit: usize) -> Result<Vec<StoredChunk>> {
+        self.request(|resp| Command::ScanChunks(after.map(str::to_string), limit, resp))
+    }
+
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
         self.request(|resp| Command::Delete(filter.clone(), resp))
     }
@@ -220,9 +226,15 @@ impl VectorStore for LanceDbStore {
         })
     }
 
-    fn rows_missing_sparse(&self, model: &str, limit: usize) -> Result<Vec<SparseTarget>> {
+    fn rows_missing_sparse(
+        &self,
+        model: &str,
+        scope: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<SparseTarget>> {
         self.request(|resp| Command::RowsMissingSparse {
             model: model.to_string(),
+            scope: scope.cloned(),
             limit,
             resp,
         })
@@ -270,6 +282,10 @@ impl VectorStore for LanceDbStore {
 
     fn flush(&mut self) -> Result<()> {
         self.request(Command::Flush)
+    }
+
+    fn optimize(&mut self) -> Result<()> {
+        self.request(Command::Optimize)
     }
 
     fn checkpoint(&mut self) -> Result<()> {
@@ -405,6 +421,89 @@ mod tests {
         assert_eq!(fetched[0].seen_token, "token-2");
         assert_eq!(fetched[1].path, "new-b-2.txt");
         assert_eq!(fetched[1].seen_token, "token-2");
+    }
+
+    /// Data files on disk: one per commit, plus a full copy for every rewrite.
+    fn data_file_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join(format!("{TABLE_NAME}.lance")).join("data"))
+            .expect("read data directory")
+            .count()
+    }
+
+    #[test]
+    fn test_flush_after_small_syncs_appends_instead_of_rewriting_the_table() {
+        // A sync that adds a few files must not copy the whole table: each copy
+        // stays on disk until the prune window passes, so frequent syncs would
+        // hold many table-sized copies at once.
+        let (dir, mut store) = store();
+        for i in 0..10 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+            store.flush().expect("flush");
+        }
+        assert_eq!(store.doc_count(), 10);
+        assert_eq!(store.fragment_count().expect("fragments"), 10);
+        assert_eq!(
+            data_file_count(dir.path()),
+            10,
+            "flush must leave no rewritten copy of the table"
+        );
+    }
+
+    #[test]
+    fn test_flush_compacts_once_fragments_pile_up() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut store = LanceDbStore::open_with_indexing(
+            dir.path(),
+            4,
+            IndexingConfig {
+                compact_fragment_threshold: 4,
+                ..IndexingConfig::default()
+            },
+        )
+        .expect("create store");
+        for i in 0..6 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+            store.flush().expect("flush");
+        }
+        assert_eq!(store.doc_count(), 6);
+        assert!(
+            store.fragment_count().expect("fragments") < 4,
+            "flush must compact once the fragment threshold is reached"
+        );
+    }
+
+    #[test]
+    fn test_optimize_compacts_below_the_fragment_threshold() {
+        let (_dir, mut store) = store();
+        for i in 0..3 {
+            store
+                .upsert(&[doc(
+                    &format!("id-{i}"),
+                    "a.txt",
+                    "t",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )])
+                .expect("upsert");
+        }
+        store.flush().expect("flush");
+        assert_eq!(store.fragment_count().expect("fragments"), 3);
+        store.optimize().expect("optimize");
+        assert_eq!(store.fragment_count().expect("fragments"), 1);
+        assert_eq!(store.doc_count(), 3);
     }
 
     #[test]
@@ -1100,7 +1199,7 @@ mod tests {
         // Null columns, not just a different model: the SQL predicate must
         // keep NULL rows in the "missing" set.
         assert_eq!(store.count_missing_sparse("m").expect("count"), 2);
-        let rows = store.rows_missing_sparse("m", 10).expect("rows");
+        let rows = store.rows_missing_sparse("m", None, 10).expect("rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.text.starts_with("text ")));
 
@@ -1109,9 +1208,13 @@ mod tests {
             .expect("set sparse");
 
         assert_eq!(store.count_missing_sparse("m").expect("count"), 1);
-        let missing = store.rows_missing_sparse("m", 10).expect("rows");
+        let missing = store.rows_missing_sparse("m", None, 10).expect("rows");
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].id, "b");
+        let scoped = store
+            .rows_missing_sparse("m", Some(&Filter::Eq("path".into(), "a.txt".into())), 10)
+            .expect("scoped rows");
+        assert!(scoped.is_empty(), "a.txt is encoded; b.txt is out of scope");
         // Another model has encoded nothing.
         assert_eq!(store.count_missing_sparse("other").expect("count"), 2);
     }
@@ -1123,8 +1226,14 @@ mod tests {
             .map(|i| doc(&format!("d{i}"), "x.txt", "t", vec![1.0, 0.0, 0.0, 0.0]))
             .collect();
         store.upsert(&docs).expect("seed");
-        assert_eq!(store.rows_missing_sparse("m", 3).expect("rows").len(), 3);
-        assert!(store.rows_missing_sparse("m", 0).expect("rows").is_empty());
+        assert_eq!(
+            store.rows_missing_sparse("m", None, 3).expect("rows").len(),
+            3
+        );
+        assert!(store
+            .rows_missing_sparse("m", None, 0)
+            .expect("rows")
+            .is_empty());
         assert_eq!(store.count_missing_sparse("m").expect("count"), 7);
     }
 

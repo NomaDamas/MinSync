@@ -11,8 +11,16 @@ pub enum MinSyncError {
     #[error("another sync is in progress")]
     LockFailed,
 
-    #[error("schema/embedder mismatch — run sync with --full")]
-    SchemaMismatch,
+    /// The configured dense embedder is not the one that built the stored
+    /// vectors (or a rebuild toward another one was interrupted). Mixing the
+    /// two would make every dense score meaningless, so the index is refused
+    /// until `minsync sync --reembed` rebuilds it.
+    #[error(
+        "the embedder changed since this index was built ({why}) — run `minsync sync --reembed` \
+         to rebuild every vector with the configured embedder (stored chunk text and sparse \
+         vectors are reused, no file is re-read), or restore the previous [embedder] settings"
+    )]
+    EmbedderChanged { why: String },
 
     #[error("never synced — run `minsync sync --full` first")]
     NeverSynced,
@@ -75,6 +83,7 @@ impl MinSyncError {
             Self::VectorStore(_) => 4,
             Self::Embedding(_) => 5,
             Self::Timeout(_) => 7,
+            Self::EmbedderChanged { .. } => 8,
             _ => 1,
         }
     }

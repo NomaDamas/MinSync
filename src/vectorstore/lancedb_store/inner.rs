@@ -8,8 +8,8 @@ use super::index::{
 };
 use super::schema::{
     add_sparse_batch, batch_to_documents, batch_to_hash_embeddings, batch_to_hash_sparse,
-    batch_to_query_hits, batch_to_scored_hits, batch_to_sparse_targets, count_sparse_batch,
-    dedupe_documents, docs_to_batch, schema, score_sparse_batch, sparse_fields,
+    batch_to_query_hits, batch_to_scored_hits, batch_to_sparse_targets, batch_to_stored_chunks,
+    count_sparse_batch, dedupe_documents, docs_to_batch, schema, score_sparse_batch, sparse_fields,
     sparse_rows_to_batch, string_col, updates_to_batch, validate_schema, validate_vector,
 };
 use super::sparse_index::{self, Scope};
@@ -21,7 +21,7 @@ use crate::error::{MinSyncError, Result};
 use crate::sparse::inverted::IndexBuilder;
 use crate::sparse::{SparseVector, TopK};
 use crate::types::IndexState;
-use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget};
+use crate::vectorstore::{Document, DocumentUpdate, Filter, QueryHit, SparseTarget, StoredChunk};
 use arrow_array::{Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use futures::TryStreamExt;
@@ -262,6 +262,63 @@ impl LanceDbInner {
         self.scan_documents(None).await
     }
 
+    /// The next page of rows after `after`, in id order, read without the
+    /// vector column (the rebuild replaces it) so a page costs text and
+    /// sparse bytes only.
+    pub(super) async fn scan_chunks(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<StoredChunk>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut columns: Vec<String> = [
+            "id",
+            "text",
+            "source_id",
+            "path",
+            "chunk_schema_id",
+            "chunk_type",
+            "heading_path",
+            "content_hash",
+            "seen_token",
+            SPARSE_MODEL_COLUMN,
+            SPARSE_INDICES_COLUMN,
+            SPARSE_VALUES_COLUMN,
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        columns.dedup();
+        let mut query = self
+            .table
+            .query()
+            .select(Select::Columns(columns))
+            .order_by(Some(vec![lancedb::query::ColumnOrdering::asc_nulls_last(
+                "id".to_string(),
+            )]))
+            .limit(limit);
+        if let Some(after) = after {
+            query = query.only_if(format!(
+                "id > '{}'",
+                super::filters::escape_sql_literal(&after)
+            ));
+        }
+        let batches: Vec<RecordBatch> = query
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut chunks = Vec::new();
+        for batch in batches {
+            chunks.extend(batch_to_stored_chunks(&batch)?);
+        }
+        Ok(chunks)
+    }
+
     /// Existence check that projects only `id`: no vectors or text are read.
     pub(super) async fn existing_ids(&self, ids: Vec<String>) -> Result<HashSet<String>> {
         if ids.is_empty() {
@@ -372,19 +429,25 @@ impl LanceDbInner {
         Ok(hits)
     }
 
-    /// Rows that hold no sparse vector from `model`, at most `limit`.
+    /// Rows that hold no sparse vector from `model`, at most `limit`,
+    /// restricted to `scope` when given.
     pub(super) async fn rows_missing_sparse(
         &self,
         model: String,
+        scope: Option<Filter>,
         limit: usize,
     ) -> Result<Vec<SparseTarget>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let mut predicate = missing_sparse_filter(&model);
+        if let Some(scope) = &scope {
+            predicate = format!("({}) AND {predicate}", filter_to_sql(scope)?);
+        }
         let batches: Vec<RecordBatch> = self
             .table
             .query()
-            .only_if(missing_sparse_filter(&model))
+            .only_if(predicate)
             .select(Select::columns(&["id", "path", "content_hash", "text"]))
             .limit(limit)
             .execute()
@@ -724,7 +787,29 @@ impl LanceDbInner {
         Ok(found)
     }
 
+    /// End-of-sync maintenance. Folds new rows into the search indexes and
+    /// prunes old versions, and compacts only once fragments pile up. A sync
+    /// that adds a few files therefore appends fragments instead of rewriting
+    /// the whole table: every rewrite leaves the previous copy on disk until
+    /// the prune window passes, so callers that sync often would otherwise
+    /// hold many table-sized copies at once. [`Self::optimize`] compacts
+    /// unconditionally.
     pub(super) async fn flush(&self) -> Result<()> {
+        compact_if_fragmented(
+            &self.table,
+            self.indexing.compact_fragment_threshold,
+            self.indexing.compact_target_rows,
+        )
+        .await?;
+        maintain_scalar_indexes(&self.table).await?;
+        maintain_index(&self.table, &self.indexing).await?;
+        self.prune().await?;
+        self.maintain_sparse_index().await
+    }
+
+    /// Full maintenance for `minsync optimize`: compact every fragment under
+    /// the target size, then refresh the search indexes and prune.
+    pub(super) async fn optimize(&self) -> Result<()> {
         self.table
             .optimize(OptimizeAction::Compact {
                 options: compaction_options(self.indexing.compact_target_rows),

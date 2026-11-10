@@ -323,6 +323,17 @@ pub const EMBEDDINGGEMMA_QUERY_PREFIX: &str = "task: search result | query: ";
 /// EmbeddingGemma retrieval prompt for documents without a title.
 pub const EMBEDDINGGEMMA_PASSAGE_PREFIX: &str = "title: none | text: ";
 
+/// In-process EmbeddingGemma 2 (candle). Same retrieval prompts and 768
+/// dimensions as EmbeddingGemma 1; runs on its own text tower, see
+/// [`crate::embedder::native`].
+pub const EMBEDDINGGEMMA2_ID: &str = "native:google/embeddinggemma-2";
+
+/// True for the embedder ids trained with the EmbeddingGemma retrieval prompts
+/// ([`EMBEDDINGGEMMA_QUERY_PREFIX`], [`EMBEDDINGGEMMA_PASSAGE_PREFIX`]).
+pub fn uses_embeddinggemma_prompts(embedder_id: &str) -> bool {
+    embedder_id == EMBEDDINGGEMMA_ID || embedder_id == EMBEDDINGGEMMA2_ID
+}
+
 /// Known embedding output dimension for embedder ids MinSync recognizes.
 /// Unknown models return `None`; set `[vectorstore.options].dimension`
 /// manually for those.
@@ -330,7 +341,7 @@ pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
     match embedder_id {
         NONE_EMBEDDER_ID => Some(SPARSE_ONLY_DIMENSION),
         "native:Qwen/Qwen3-Embedding-0.6B" => Some(1024),
-        "tei:google/embeddinggemma-300m" => Some(768),
+        "tei:google/embeddinggemma-300m" | EMBEDDINGGEMMA2_ID => Some(768),
         "openai:text-embedding-3-small" | "openai:text-embedding-ada-002" => Some(1536),
         "openai:text-embedding-3-large" => Some(3072),
         "tei:intfloat/multilingual-e5-small" => Some(384),

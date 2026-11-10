@@ -52,6 +52,13 @@ cd MinSync
 cargo build --release
 ```
 
+The in-process models (dense embedder and SPLADE) run on Metal on macOS, with Accelerate for CPU matmuls. Other platforms run on the CPU by default; opt into a faster backend at build time:
+
+```bash
+cargo build --release --features cuda   # NVIDIA GPU, needs the CUDA toolkit; device "auto" picks GPU 0
+cargo build --release --features mkl    # Intel MKL BLAS for x86_64 CPUs
+```
+
 MinSync embeds in-process with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) by default. No API key, TEI server, or Hugging Face gate is required. The first `minsync sync` downloads the model into the local cache.
 
 No dense model at all? Build a sparse-only workspace, which needs no dense embedder, API key or embedding server (the sparse encoder still has its own small model, see [Sparse retrieval (SPLADE)](#sparse-retrieval-splade)):
@@ -308,6 +315,7 @@ index_optimize_delta_threshold = 10000
 | Embedder | Dimension |
 |---|---:|
 | `native:Qwen/Qwen3-Embedding-0.6B` (default) | 1024 |
+| `native:google/embeddinggemma-2` | 768 |
 | `tei:google/embeddinggemma-300m` | 768 |
 | `openai:text-embedding-3-small` | 1536 |
 | `tei:intfloat/multilingual-e5-small` | 384 |
@@ -320,6 +328,8 @@ Agents adding another vector store should implement the `VectorStore` trait and 
 ### Write path, checkpoints and `optimize`
 
 A sync writes files in batches of `[sync] batch_files` (default 25). Per batch it does one id-only existence check, one embedding call, one metadata update for reused chunks, one append for new chunks and one stale-chunk sweep, so the commit count is independent of how many files are in the batch. It keeps BTree indexes on `id` and `path` so these filters stay index lookups, and every `[sync] checkpoint_every_files` files (default 50) compacts fragments (once there are at least `compact_fragment_threshold`, default 64) and prunes old versions. A running sync logs `sync progress` at each checkpoint. A crash redoes at most one batch.
+
+Every committed batch is searchable right away, including during the first sync: `minsync query` answers from the batches committed so far (files not reached yet are simply not found) while `.minsync/txn.json` marks a first sync as running or interrupted. Before any sync has started, `query` still fails with `never synced`.
 
 ```toml
 [sync]
@@ -479,9 +489,11 @@ there is no inference-free query mode. There is no `--language` flag on
 `minsync init` and no `[lexical]` config table: an old `config.toml` that still
 has `[lexical]` is silently ignored.
 
-`minsync sync` encodes sparse vectors in a catch-up phase at the end of the run.
-It is resumable and deduplicated by content hash, and independent of the dense
-phase. The model id is recorded in `.minsync/cursor.json` as `sparse_id` only
+`minsync sync` encodes sparse vectors batch by batch, right after each batch's
+dense commit, and finishes with a catch-up over every chunk still missing a
+vector (chunks from before sparse retrieval, a model change, an interrupted
+run). It is resumable and deduplicated by content hash, and a chunk the encoder
+rejects is tried once per run. The model id is recorded in `.minsync/cursor.json` as `sparse_id` only
 when every stored chunk holds a vector from that model. A sparse or hybrid
 query against an index whose last sync left `sparse_id` unset or set to another
 model (a changed `[sparse].id`, a sparse failure that left chunks unencoded, a
@@ -531,9 +543,9 @@ Measured on the corpora above (Apple Silicon, KURE-Sparse-nano):
   linearly. With the index (the default for tables of 2,000 chunks or more) it
   reads about 2% of the postings: 3.4 ms at 106k and 13.8 ms at 393k chunks,
   with the same ranking. See [Sparse inverted index](#sparse-inverted-index).
-- **Indexing speed.** Every chunk goes through the model: about 16-25
-  chunks/s on Metal and 3-5 on CPU. SciFact's 5,183 files took BM25 6 s and
-  SPLADE 313 s on Metal.
+- **Indexing speed.** Every chunk goes through the model: about 25-30
+  chunks/s on Metal and 3-5 on CPU. A sparse-only sync of 1,118 markdown
+  chunks (Korean and English) took 35 s on an M4 Max.
 - **Disk.** An encoded chunk takes about 5 KB. Lance keeps replaced files for
   10 minutes so that a concurrent query never loses its files, so right after a
   long sync the store can be several times larger than its data until the next
@@ -640,11 +652,40 @@ minsync sync
 minsync query "검색어" --k 5
 ```
 
-Existing indexes built with a 768-d TEI model must not mix 1024-d vectors. Switch embedders, then rebuild:
+### Changing the embedder of an existing index
+
+An index holds the vectors of one dense embedder. `minsync sync` records which one (model, dimension and passage prefix) in `cursor.json` and compares it with `[embedder]` on every run, so a switch can never mix two models' vectors. Edit `[embedder]` (and `[vectorstore.options] dimension`) to the new model, then:
 
 ```bash
-minsync sync --full
+minsync sync --reembed
 ```
+
+`--reembed` rebuilds every dense vector with the configured embedder from the chunk text already in the store: no file is re-read or re-chunked, and the sparse (SPLADE) vectors are carried over, so it costs one embedding pass and no SPLADE encoding. The new vectors are written to a staging store next to the live one (`store.reembed`), which replaces it in one rename when the last row is across; the live index keeps serving sparse queries until then. It is safe to interrupt: the next `sync --reembed` continues after the last committed page of 256 chunks. Files that changed in the meantime are picked up by the sync that follows the rebuild. `--reembed` cannot be combined with `--full`, and prints `reembedded` in its JSON result.
+
+**Check the new embedder before the rebuild.** `minsync sync --reembed --dry-run` embeds one short text with the configured embedder and reports what it saw (`probe`: model and the vector width it really produces) and how many chunks a rebuild would re-embed (`would_reembed`; `resuming` is true when an interrupted rebuild would continue). It changes nothing: no staging store, no marker, the cursor is untouched. A real `--reembed` runs the same probe first, so a model that cannot load, an unreachable endpoint, NaN output, or a `[vectorstore.options] dimension` that is not the model's width stops with a message naming both numbers and the setting to fix, after one request and before any chunk is touched, instead of failing on the first page. (`--dry-run` only probes; it cannot tell you whether the new model retrieves better. Compare that on your own queries, for example with a second workspace.)
+
+Until the rebuild finishes, anything that would mix the two models stops with exit code `8`: `minsync sync`, `query --mode vector|hybrid`, `check`, `verify`, `optimize` and `watch` name the old and new model and point at `--reembed`. `query --mode sparse` is never refused. Only settings that change the stored vector count as a switch: the model, the dimension and `passage_prefix`. `dtype`, `device`, `batch_size`, timeouts and `query_prefix` do not.
+
+An index written by an earlier version has no recorded dimension or prefix, so only a change of model is noticed for it until its next sync records them.
+
+Switching to `--embedder none` and back works the same way: `--reembed` writes the 1-float placeholder vectors (no model is called) or embeds every chunk again.
+
+`minsync init --force --embedder <id>` still works but discards the index and re-reads every file; prefer `--reembed`.
+
+### EmbeddingGemma 2
+
+`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process on candle, text only: the checkpoint's vision and audio towers are never loaded.
+
+```bash
+minsync init --embedder native:google/embeddinggemma-2
+```
+
+`init` writes `dimension = 768` and the retrieval prompts the model is trained with (`task: search result | query: ` for queries, `title: none | text: ` for passages). The first use downloads the 1.5 GB checkpoint (it carries every modality) into the model cache.
+
+- It runs in `f32` on every device by default. The model overflows `float16`, so `dtype = "f16"` is rejected; `bf16` is accepted on Metal only, because the CPU has no bf16 matmul. On Metal, `dtype = "bf16"` cut the peak footprint of embedding 297 real ~1000-character chunks from 3.1 GB to 1.9 GB at the same speed, and its vectors stay within 0.9998 cosine similarity of the `f32` ones.
+- `attention` accepts `auto` or `eager`; the model's attention is small (4 heads) and runs eagerly.
+- Vectors keep all 768 dimensions; Matryoshka truncation is not exposed.
+- The encoder is bidirectional. Five of every six layers attend within a 512-token radius; the sixth sees the whole chunk.
 
 ### Native runtime
 
@@ -656,7 +697,7 @@ dtype = "auto"      # auto | f32 | f16 | bf16
 attention = "auto"  # auto | eager | tiled | fused
 ```
 
-- `dtype`: `auto` is `f16` on Metal and `f32` elsewhere. Half precision shrinks the model's footprint by a third; the vector stays within 0.0001 cosine similarity of its `f32` counterpart, which did not change retrieval results in our tests. Set `dtype = "f32"` for full precision. Existing indexes stay valid.
+- `dtype`: `auto` is `f16` on Metal and `f32` elsewhere, except for EmbeddingGemma 2, which is `f32` everywhere. Half precision shrinks the Qwen3 model's footprint by a third; the vector stays within 0.0001 cosine similarity of its `f32` counterpart, which did not change retrieval results in our tests. Set `dtype = "f32"` for full precision. Existing indexes stay valid.
 - `attention`: `auto` uses the device's fused kernel (Metal scaled-dot-product attention, CPU flash attention) and tiles the score matrix on other devices (CUDA builds), so peak memory no longer grows with the square of the chunk length. `eager` is the reference implementation that materializes the whole score matrix (several GiB for long chunks); `tiled` computes it block by block on any device; `fused` fails if the device has no fused kernel.
 
 Median of three `minsync sync` runs at the default chunk size on an Apple M4 Max (macOS, Metal), compared with the previous release (f32, eager attention):
@@ -803,7 +844,7 @@ CI runs on Ubuntu, macOS, and Windows with Rust 1.91 installed through rustup. I
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```

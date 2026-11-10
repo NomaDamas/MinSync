@@ -18,7 +18,14 @@ pub async fn status(minsync_dir: &Path) -> Result<StatusResult> {
     let txn_path = minsync_dir.join("txn.json");
 
     if !cursor_path.exists() {
-        return Ok(status_result(&config, None, SyncState::NotSynced, None));
+        // A first sync that is running or was interrupted has committed
+        // batches that `query` already answers from.
+        let state = if txn_path.exists() {
+            SyncState::Interrupted
+        } else {
+            SyncState::NotSynced
+        };
+        return Ok(status_result(&config, None, state, None));
     }
 
     let cursor = Cursor::load(&cursor_path)?;

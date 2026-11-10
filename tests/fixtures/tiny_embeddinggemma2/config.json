@@ -1,0 +1,53 @@
+{
+ "architectures": [
+  "EmbeddingGemma2Model"
+ ],
+ "model_type": "embedding_gemma2",
+ "text_config": {
+  "vocab_size": 64,
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_hidden_layers": 6,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 16,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "rms_norm_eps": 1e-06,
+  "attention_bias": false,
+  "sliding_window": 3,
+  "layer_types": [
+   "sliding_attention",
+   "sliding_attention",
+   "full_attention",
+   "sliding_attention",
+   "sliding_attention",
+   "full_attention"
+  ],
+  "hidden_size_per_layer_input": 16,
+  "embedding_dim": 24,
+  "rope_parameters": {
+   "sliding_attention": {
+    "rope_type": "default",
+    "rope_theta": 10000.0
+   },
+   "full_attention": {
+    "rope_type": "default",
+    "rope_theta": 1000000.0
+   }
+  },
+  "pad_token_id": 0,
+  "bos_token_id": 2,
+  "eos_token_id": 1,
+  "max_position_embeddings": 4096,
+  "per_layer_config": {
+   "02": {
+    "head_dim": 32,
+    "num_key_value_heads": 1
+   },
+   "05": {
+    "head_dim": 32,
+    "num_key_value_heads": 1
+   }
+  }
+ }
+}
