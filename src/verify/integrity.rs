@@ -8,10 +8,12 @@
 //! candidate pairs: [`TABLES`] tables, each keyed by [`BITS`] sign bits of
 //! the centered unit vector. Each candidate is then confirmed with the exact
 //! cosine and text test, so the check never reports a pair the all-pairs scan
-//! would not. A pair at the threshold shares a key in at least one table with
-//! probability 1 - 3e-7 even for vectors close to the corpus mean (where
-//! centering widens their angle the most), and the hyperplanes come from a
-//! fixed seed, so the result is deterministic.
+//! would not. Before centering, a pair at the threshold (angle 0.0447 rad)
+//! agrees on a 16-bit key with probability (1 - 0.0447/π)^16 = 0.795, so it
+//! misses all 16 tables with probability 1e-11; centering widens angles near
+//! the mean, and on two real 52k-row indexes (Qwen3-Embedding-0.6B,
+//! EmbeddingGemma 2) 10^6 planted pairs at the threshold never missed. The
+//! hyperplanes come from a fixed seed, so the result is deterministic.
 
 use super::texts_differ_substantially;
 use crate::error::Result;
