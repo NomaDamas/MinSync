@@ -57,8 +57,8 @@ pub struct IndexingConfig {
     /// identical zero vectors is meaningless and can fail.
     pub build_ann_index: bool,
     /// Answer sparse queries from an on-disk inverted index (built at the end
-    /// of a sync, `optimize`, or lazily by the first query) instead of
-    /// scanning every row. The results are the same; see
+    /// of a sync or `optimize`) instead of scanning every row when selective.
+    /// The results are the same; see
     /// [`crate::sparse::inverted`].
     pub sparse_inverted_index: bool,
     /// Fewest sparse rows that get an index.

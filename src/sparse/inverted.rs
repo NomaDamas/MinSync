@@ -259,6 +259,9 @@ impl IndexBuilder {
         if indices.is_empty() {
             return Ok(());
         }
+        if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(corrupt("row terms are not strictly ascending"));
+        }
         match &self.source_id {
             None => self.source_id = Some(source_id.to_string()),
             Some(seen) if seen != source_id => {
@@ -315,7 +318,9 @@ impl IndexBuilder {
             .final_path
             .parent()
             .ok_or_else(|| corrupt("the index path has no directory"))?;
-        let temp = NamedTempFile::new_in(dir)?;
+        let temp = tempfile::Builder::new()
+            .prefix(".minsync-sparse-index-")
+            .tempfile_in(dir)?;
         self.out = Some(BufWriter::with_capacity(1 << 20, temp));
         self.directory = Vec::with_capacity(self.counts.len() + 1);
 
@@ -632,6 +637,7 @@ pub struct InvertedFile {
     directory_at: u64,
     id_offsets_at: u64,
     id_blob_at: u64,
+    id_blob_len: u64,
 }
 
 impl InvertedFile {
@@ -697,6 +703,7 @@ impl InvertedFile {
             directory_at,
             id_offsets_at,
             id_blob_at,
+            id_blob_len: blob_len,
         })
     }
 
@@ -760,6 +767,9 @@ impl InvertedFile {
         let (from, to) = (u64_at(&raw, 0), u64_at(&raw, 8));
         if to < from {
             return Err(corrupt("id offsets are not ascending"));
+        }
+        if to > self.id_blob_len {
+            return Err(corrupt("id offsets point outside the id blob"));
         }
         let mut bytes = vec![0u8; (to - from) as usize];
         read_exact_at(&self.file, &mut bytes, self.id_blob_at + from)?;
@@ -1318,19 +1328,6 @@ mod tests {
         assert!(!dir.path().join("missing.inv").exists());
     }
 
-    /// A row that lists one term twice would put two postings of one row in a
-    /// list, which the gap coding cannot express.
-    #[test]
-    fn a_term_listed_twice_in_a_row_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut builder = IndexBuilder::new(&dir.path().join("x.inv"), "m", 1, 1, 100).unwrap();
-        builder.count_row("a", "s", &[1, 1]).unwrap();
-        assert_eq!(builder.plan().unwrap(), 1);
-        builder.add_row("a", &[1, 1], &[1.0, 2.0]).unwrap();
-
-        assert!(builder.end_pass().is_err());
-    }
-
     #[test]
     fn a_row_with_no_terms_may_appear_in_every_scan() {
         let dir = tempfile::tempdir().unwrap();
@@ -1379,6 +1376,45 @@ mod tests {
         std::fs::write(&path, &bad).unwrap();
         let index = InvertedFile::open(&path).expect("the trailer is intact");
         assert!(index.candidates(&query, 5).is_err());
+    }
+
+    #[test]
+    fn id_offsets_outside_the_blob_are_rejected_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = rows(&[("a", &[(1, 1.0)]), ("b", &[(1, 2.0)])]);
+        let path = dir.path().join("x.inv");
+        write(&path, &data, 100).unwrap();
+        let index = InvertedFile::open(&path).unwrap();
+        let offset = index.id_offsets_at as usize + 8;
+        let blob_len = index.id_blob_len;
+        drop(index);
+        let good = std::fs::read(&path).unwrap();
+        for end in [blob_len + 1, u64::MAX] {
+            let mut bad = good.clone();
+            bad[offset..offset + 8].copy_from_slice(&end.to_le_bytes());
+            std::fs::write(&path, &bad).unwrap();
+            let index = InvertedFile::open(&path).unwrap();
+            assert!(index.candidates(&vector(&[(1, 1.0)]), 2).is_err());
+        }
+    }
+
+    #[test]
+    fn unsorted_or_duplicate_row_terms_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.inv");
+        for terms in [&[5, 1][..], &[1, 1][..]] {
+            let mut builder = IndexBuilder::new(&path, "m", 7, 99, 100).unwrap();
+            assert!(builder.count_row("bad", "src", terms).is_err());
+            // A rejected row must not become a partial row in the next build.
+            builder.count_row("good", "src", &[1, 5]).unwrap();
+            for _ in 0..builder.plan().unwrap() {
+                builder.add_row("good", &[1, 5], &[1.0, 2.0]).unwrap();
+                builder.end_pass().unwrap();
+            }
+            builder.finish().unwrap();
+            let index = InvertedFile::open(&path).unwrap();
+            assert_eq!(index.candidates(&vector(&[(5, 1.0)]), 1).unwrap(), ["good"]);
+        }
     }
 
     #[test]

@@ -354,8 +354,9 @@ order, ties broken the same way. The index keeps each weight only as an 8-bit
 bracket, so it cannot rank by itself; it names a small set of candidate chunks
 (about 12 for `k = 10`, 1,200 for `k = 1000`) that provably contains the exact
 top-`k`, and the candidates' exact vectors are read from the table and scored
-with the scan's own loop. `index_state.sparse_indexed` in a query result says
-which path answered.
+with the scan's own loop. `index_state.sparse_indexed` says a sidecar describes
+the current table, not that this particular query used it: broad queries and
+unsupported filters still scan.
 
 The index is one file, `sparse-index.inv`, beside the table
 (`.minsync/store/`). It is a derived copy of the table's sparse columns and is
@@ -370,6 +371,9 @@ never the source of truth:
   Missing, truncated or damaged files fall back to the scan too, and so does
   an index written by an older release (its format differs): run
   `minsync optimize` once after upgrading.
+  Structural damage is checked; the file has no checksum, so arbitrary
+  bit flips are not guaranteed to be detected. Delete it and run `optimize`
+  to rebuild a suspect sidecar from the table.
 - It answers queries filtered to the workspace's own `source_id` (what
   `minsync query` sends); other filters scan. So does a `k` so large that the
   candidates would be more than a quarter of the table.

@@ -36,6 +36,22 @@ pub(super) fn index_path(store_dir: &Path) -> PathBuf {
     store_dir.join(FILE_NAME)
 }
 
+/// Called by the writer before maintenance, never by read-only queries.
+/// An abruptly killed process cannot run NamedTempFile's destructor.
+pub(super) fn cleanup_interrupted_builds(store_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(store_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".minsync-sparse-index-")
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
 /// Whether `file` was built from this table version. The creation time is
 /// compared too: a table that was dropped and rebuilt, or restored, can reuse
 /// a version number.

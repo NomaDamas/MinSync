@@ -744,6 +744,8 @@ impl LanceDbInner {
         // run yet (a sync flushes once before it and once after): the index
         // would be thrown away by the next flush, and a query before then
         // scans anyway. The stale file goes now so nothing can mistake it.
+        // A persistently failing sparse row also intentionally keeps the
+        // sidecar disabled; queries use the encoded subset via the scan.
         if self
             .table
             .count_rows(Some(missing_sparse_filter(&model)))
@@ -881,6 +883,7 @@ impl LanceDbInner {
         if self.read_only {
             return Ok(());
         }
+        sparse_index::cleanup_interrupted_builds(&self.store_dir)?;
         if !self.indexing.sparse_inverted_index {
             return sparse_index::remove(&self.store_dir);
         }
@@ -1021,5 +1024,81 @@ impl LanceDbInner {
             }
         }
         Ok(paths)
+    }
+}
+
+#[cfg(test)]
+mod sparse_path_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selective_queries_rescore_index_candidates_and_broad_queries_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceDbInner::open(
+            dir.path().to_str().unwrap(),
+            1,
+            IndexingConfig {
+                build_ann_index: false,
+                sparse_index_min_rows: 1,
+                ..IndexingConfig::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let docs: Vec<_> = (0..128)
+            .map(|i| Document {
+                id: format!("d{i:03}"),
+                embedding: vec![0.0],
+                text: format!("document {i}"),
+                source_id: "s".into(),
+                path: format!("{i}.txt"),
+                chunk_schema_id: "schema".into(),
+                chunk_type: "text".into(),
+                heading_path: String::new(),
+                content_hash: format!("h{i}"),
+                seen_token: "t".into(),
+            })
+            .collect();
+        let rows = docs
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| {
+                (
+                    doc.id.clone(),
+                    SparseVector::from_pairs([(0, 1.0), (i as u32 + 1, 2.0)]),
+                )
+            })
+            .collect();
+        store.insert_new(docs).await.unwrap();
+        store.set_sparse("m".into(), rows).await.unwrap();
+        store.flush().await.unwrap();
+        let query = SparseVector::from_pairs([(43, 1.5)]);
+        let indexed = store.ranked_from_index("m", &query, None, 1).await.unwrap();
+        assert_eq!(indexed, Some(vec![(3.0, "d042".into())]));
+        assert_eq!(
+            indexed.unwrap(),
+            store.ranked_by_scan("m", &query, None, 1).await.unwrap()
+        );
+        // Every row matches this term; avoid expensive lookups of most rows.
+        let broad = SparseVector::from_pairs([(0, 1.0)]);
+        assert_eq!(
+            store.ranked_from_index("m", &broad, None, 1).await.unwrap(),
+            None
+        );
+        // A write makes the sidecar ineligible until rebuilt.
+        store
+            .set_sparse("m".into(), vec![("d042".into(), SparseVector::default())])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.ranked_from_index("m", &query, None, 1).await.unwrap(),
+            None
+        );
+        assert!(store
+            .ranked_by_scan("m", &query, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

@@ -141,8 +141,8 @@ pub struct QueryResult {
 pub struct IndexState {
     pub ann_indexed: bool,
     pub unindexed_rows: Option<usize>,
-    /// Sparse queries are answered by an on-disk inverted index that
-    /// describes the table as it is now (not by scanning every row).
+    /// An on-disk sparse index describes the current table version. Queries
+    /// may still scan for unsupported filters or broad candidate sets.
     #[serde(default)]
     pub sparse_indexed: bool,
 }

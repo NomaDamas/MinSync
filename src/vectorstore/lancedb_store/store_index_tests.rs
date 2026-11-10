@@ -113,6 +113,20 @@ fn an_indexed_query_returns_exactly_what_the_scan_returns() {
     }
 }
 
+#[test]
+fn a_retry_removes_interrupted_index_builds_without_touching_other_files() {
+    let (dir, mut store) = indexed_store();
+    seed(&mut store, 40);
+    let orphan = dir.path().join(".minsync-sparse-index-interrupted");
+    let unrelated = dir.path().join("other.tmp");
+    std::fs::write(&orphan, b"partial index").unwrap();
+    std::fs::write(&unrelated, b"unrelated").unwrap();
+    store.flush().unwrap();
+    assert!(!orphan.exists());
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated");
+    assert!(store.sparse_index_ready().unwrap());
+}
+
 /// Sixty of 240 rows have the very same vector, so they tie at the k-th score
 /// for every `k` up to 60: which of them are in the answer is decided by id,
 /// and only an exact rescore can do that (the index stores brackets, not
@@ -360,8 +374,8 @@ fn a_reader_opened_beside_a_writer_never_returns_a_newer_or_older_answer() {
         .expect("write after the reader opened");
     writer.flush().expect("flush");
 
-    // The reader pinned its version at open: its answer is the old table's,
-    // computed from the old table's index, not the new index and not a mix.
+    // The reader pinned its version at open: the new sidecar does not match,
+    // so it scans the old table rather than mixing versions.
     let again = ranked(&reader.query_sparse("m", &query, None, 10).expect("reader"));
     assert_eq!(again, pinned);
     let fresh =

@@ -3,7 +3,7 @@
 //! Compares three engines over the same encoded vectors, query by query:
 //!
 //! * the **oracle**: an in-memory full scan with `dot_terms` and `TopK`,
-//! * the **index**: the on-disk inverted index (`InvertedFile::search`),
+//! * the **index**: on-disk candidates rescored from their exact vectors,
 //! * with `--store DIR`, the LanceDB table's `query_sparse` with the index and
 //!   with `sparse_inverted_index = false` (the scan the product used before).
 //!

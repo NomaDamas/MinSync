@@ -309,7 +309,8 @@ term의 posting list(150 term짜리 SPLADE query에서 전체 posting의 약 2%)
 순위를 매기지 못합니다. 대신 정확한 top-`k`를 반드시 포함하는 작은 후보 chunk 집합
 (`k = 10`이면 약 12개, `k = 1000`이면 약 1,200개)을 알려 주고, 그 후보의 정확한
 vector를 table에서 읽어 scan과 같은 루프로 점수를 계산합니다. 질의 결과의
-`index_state.sparse_indexed`가 어느 경로로 답했는지 알려 줍니다.
+`index_state.sparse_indexed`는 현재 table에 맞는 sidecar가 있다는 뜻이며, 그 질의가
+실제로 사용했다는 뜻은 아닙니다. 넓은 질의나 지원하지 않는 filter는 scan합니다.
 
 index는 table 옆(`.minsync/store/`)의 파일 하나 `sparse-index.inv`입니다. table의
 sparse column을 복사한 파생 데이터이며 source of truth가 아닙니다.
@@ -321,6 +322,8 @@ sparse column을 복사한 파생 데이터이며 source of truth가 아닙니�
   때까지 query는 scan합니다. 파일이 없거나 잘리거나 손상돼도, 이전 릴리스가 쓴
   index(형식이 다릅니다)여도 scan으로 돌아갑니다. 업그레이드 뒤 `minsync optimize`를
   한 번 실행하세요.
+  구조 손상은 검사하지만 checksum은 없으므로 임의의 bit flip을 모두 감지하지는
+  못합니다. sidecar가 의심되면 지우고 `optimize`로 table에서 다시 만드세요.
 - workspace 자신의 `source_id`로 거른 query(`minsync query`가 보내는 것)에 답하며,
   다른 filter는 scan합니다. 후보가 table의 4분의 1을 넘을 만큼 큰 `k`도 scan합니다.
 - 갱신이 아니라 통째로 다시 만듭니다. 파일 하나만 바뀐 sync도 파일을 새로 쓰고,
