@@ -3401,7 +3401,8 @@ dependencies = [
 [[package]]
 name = "inl-core"
 version = "0.1.1"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=9e60a9edaab3e4152a43c35b301ccc7e5f4767fc#9e60a9edaab3e4152a43c35b301ccc7e5f4767fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "788f24af3a58167951bfac6c8a6324fe247e68dd14791d869e5d877435545605"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3420,7 +3421,8 @@ dependencies = [
 [[package]]
 name = "inl-late"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=9e60a9edaab3e4152a43c35b301ccc7e5f4767fc#9e60a9edaab3e4152a43c35b301ccc7e5f4767fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "649882f779c2c6495d2b407622bf56587f202994f37c5b0a03ff3fd56dedb00a"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3439,7 +3441,8 @@ dependencies = [
 [[package]]
 name = "inl-server"
 version = "0.3.1"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=9e60a9edaab3e4152a43c35b301ccc7e5f4767fc#9e60a9edaab3e4152a43c35b301ccc7e5f4767fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eefefcb8f4bebc13c371342e8d6fad409c67745c66f9a5646a3ff8b6e4739cc1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3461,7 +3464,8 @@ dependencies = [
 [[package]]
 name = "inl-sparse"
 version = "0.1.2"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=9e60a9edaab3e4152a43c35b301ccc7e5f4767fc#9e60a9edaab3e4152a43c35b301ccc7e5f4767fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ad3bfb986171cb40ef21cbb38a9823c20809fa8b84f9ca219a1f8121eb726e"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3477,7 +3481,8 @@ dependencies = [
 [[package]]
 name = "inl-text"
 version = "0.1.0"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=9e60a9edaab3e4152a43c35b301ccc7e5f4767fc#9e60a9edaab3e4152a43c35b301ccc7e5f4767fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3480b6b60de8dbd99b8a9162cb874d4e0280ec61aa8c7d13a82f69ebcd6399e"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3495,7 +3500,8 @@ dependencies = [
 [[package]]
 name = "inl-vision"
 version = "0.1.1"
-source = "git+https://github.com/NomaDamas/im-not-llm?rev=9e60a9edaab3e4152a43c35b301ccc7e5f4767fc#9e60a9edaab3e4152a43c35b301ccc7e5f4767fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f484b7c5cae8f68a599f85452c2a4c873611d24623b25f2287de72224c2aed8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5683,7 +5689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -5702,7 +5708,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

@@ -71,16 +71,6 @@ default = []
 mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-server/mkl"]
 cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-server/cuda"]
 
-# TEMPORARY: inl-sparse 0.1.2 and inl-server 0.3.1 are not on crates.io yet.
-# Every inl crate must come from the same source (one `InlError` type), so all
-# of them are patched together. Remove this section once those are published.
-[patch.crates-io]
-inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
-inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
-inl-sparse = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
-inl-late = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
-inl-server = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
-
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"
 
