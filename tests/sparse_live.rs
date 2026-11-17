@@ -169,6 +169,16 @@ async fn a_running_serve_sparse_gives_the_same_vectors_as_in_process() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let bin = env!("CARGO_BIN_EXE_minsync");
+    // The default on Apple silicon is the Neural Engine (fp16), which this
+    // 2e-3 fp32 bar does not apply to (see the ANE test below): serve the
+    // candle f32 path explicitly.
+    std::fs::create_dir_all(workspace.path().join(".minsync")).unwrap();
+    let mut pinned = minsync::config::Config::default_for("live");
+    pinned.sparse.device = Some("auto".to_string());
+    pinned.sparse.dtype = Some("f32".to_string());
+    pinned
+        .save(&workspace.path().join(".minsync/config.toml"))
+        .unwrap();
     let mut child = Command::new(bin)
         .current_dir(workspace.path())
         .args([
@@ -217,11 +227,13 @@ async fn a_running_serve_sparse_gives_the_same_vectors_as_in_process() {
 }
 
 #[tokio::test]
-#[ignore = "live: loads the real checkpoint on the default device (Metal on macOS)"]
+#[ignore = "live: loads the real checkpoint on Metal"]
 async fn half_precision_on_the_default_device_keeps_scores_and_ranking() {
     let golden = golden();
+    // Metal explicitly: `auto` is the Neural Engine on Apple silicon, which is
+    // covered by its own test; this one compares candle's f16 against f32.
     let on_default = |dtype: &str| SparseConfig {
-        device: Some("auto".to_string()),
+        device: Some("metal".to_string()),
         dtype: Some(dtype.to_string()),
         ..SparseConfig::default()
     };
@@ -285,4 +297,47 @@ async fn throughput_by_device_and_dtype() {
             chunks.len()
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+fn sparse_cosine(a: &SparseVector, b: &SparseVector) -> f32 {
+    a.dot(b) / (a.dot(a).sqrt() * b.dot(b).sqrt())
+}
+
+/// The Apple Neural Engine (fp16) against the Sentence-Transformers fp32
+/// reference, through the same adapter `minsync sync` uses. Weights are not
+/// bit-equal, so the bar is cosine (inl-ane's own bar is 0.998 over a corpus),
+/// plus the ranking retrieval consumes.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "live: runs KURE-Sparse-nano on the Apple Neural Engine; run with --ignored"]
+async fn the_neural_engine_matches_the_reference_and_is_the_default_on_apple_silicon() {
+    let golden = golden();
+    // No device named: on Apple silicon the default is the Neural Engine.
+    let default = SparseConfig::default();
+    let encoder = NativeSparseEncoder::from_config(&default).unwrap();
+    let identity = encoder.identity().await.unwrap();
+    println!("identity: {identity:?}");
+    if cfg!(target_arch = "aarch64") {
+        assert_eq!(identity.device, "ane");
+        assert_eq!(identity.dtype, "f16");
+    }
+    assert_eq!(identity.dimension, 36282);
+
+    let query = encoder.encode_query(&golden.query).await.unwrap();
+    let docs = encoder.encode(&golden.docs).await.unwrap();
+    let q_cos = sparse_cosine(&query, &to_vector(&golden.q));
+    println!("query cosine {q_cos:.6}");
+    assert!(q_cos > 0.998, "query cosine {q_cos}");
+    for (index, (ours, theirs)) in docs.iter().zip(&golden.d).enumerate() {
+        let cos = sparse_cosine(ours, &to_vector(theirs));
+        println!(
+            "doc {index}: nnz {} (ref {}), cosine {cos:.6}",
+            ours.len(),
+            theirs.indices.len()
+        );
+        assert!(cos > 0.998, "doc {index} cosine {cos}");
+    }
+    let scores: Vec<f32> = docs.iter().map(|d| query.dot(d)).collect();
+    assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
 }

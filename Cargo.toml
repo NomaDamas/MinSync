@@ -2,7 +2,7 @@
 name = "minsync"
 version = "0.7.3"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.94"
 description = "Manifest-based incremental vector DB indexing CLI for text files"
 license = "MIT"
 repository = "https://github.com/NomaDamas/MinSync"
@@ -51,38 +51,29 @@ arrow-schema = "58.3.0"
 futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 libc = "0.2"
-hf-hub = { version = "0.5.0", default-features = false, features = [
-    "ureq",
-    "rustls-tls",
-] }
-tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
 parking_lot = "0.12"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "0.22"
+# All model inference lives in im-not-llm; MinSync only adapts its engines.
+inl-core = "0.1.1"
+inl-text = "0.1.0"
+inl-sparse = "0.1.2"
+inl-server = { version = "0.3.1", default-features = false }
+# Apple Neural Engine engines (Core ML, macOS only; the package table and
+# layout code build everywhere): the default for the SPLADE encoder on Apple
+# silicon, opt-in (`device = "ane"`) for the dense embedders.
+inl-ane = "0.1.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `accelerate` routes CPU matmuls to Accelerate.framework (always present on
 # macOS); without it candle's pure-Rust gemm runs SPLADE ~40x slower than Metal.
-candle-core = { version = "0.11.0", features = ["metal", "accelerate"] }
-candle-nn = { version = "0.11.0", features = ["metal", "accelerate"] }
+inl-core = { version = "0.1.1", features = ["accelerate"] }
 
 # Opt-in native backends for non-macOS builds; macOS gets Metal + Accelerate.
 # `--features mkl`: Intel MKL BLAS for x86_64 CPU encoders.
 # `--features cuda`: NVIDIA GPU (needs the CUDA toolkit at build time).
 [features]
 default = []
-mkl = ["candle-core/mkl", "candle-nn/mkl"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-
-# candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
-# float16x8_t which now requires the unstable stdarch_neon_f16 feature.
-# huggingface/candle#3845 gates those types behind target_feature="fp16".
-[patch.crates-io]
-candle-core = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
-candle-nn = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
+mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-server/mkl"]
+cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-server/cuda"]
 
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"

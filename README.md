@@ -52,7 +52,7 @@ cd MinSync
 cargo build --release
 ```
 
-The in-process models (dense embedder and SPLADE) run on Metal on macOS, with Accelerate for CPU matmuls. Other platforms run on the CPU by default; opt into a faster backend at build time:
+The in-process models (dense embedder and SPLADE) run on Metal on macOS, with Accelerate for CPU matmuls. All model inference is done by [im-not-llm](https://github.com/NomaDamas/im-not-llm) (`inl-text`, `inl-sparse`, `inl-server`); MinSync adapts its engines and does no inference of its own. Other platforms run on the CPU by default; opt into a faster backend at build time:
 
 ```bash
 cargo build --release --features cuda   # NVIDIA GPU, needs the CUDA toolkit; device "auto" picks GPU 0
@@ -471,8 +471,8 @@ max_retries = 3
 timeout_seconds = 60
 query_prefix = "[Q] "
 passage_prefix = "[D] "
-device = "auto"                      # auto | cpu | metal | cuda (native only)
-dtype = "auto"                       # resolves to f32 on every device (native only)
+device = "auto"                      # auto | cpu | metal | cuda | ane (native only); auto is the Neural Engine on Apple silicon
+dtype = "auto"                       # f32 on cpu/metal/cuda, f16 on ane (native only)
 max_length = 2048
 
 # Optional, unset by default:
@@ -484,7 +484,8 @@ max_length = 2048
 
 Providers:
 
-- `native:` runs the model in-process on [candle](https://github.com/huggingface/candle) (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
+- `native:` runs the model in-process through [im-not-llm](https://github.com/NomaDamas/im-not-llm)'s `inl-sparse` engine (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling, on candle). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
+- On Apple silicon the sparse encoder runs on the **Apple Neural Engine** by default (`inl-ane`, a Core ML package, fp16): about 350 MB resident instead of about 1.3 GB on Metal (measured with `footprint` on `inl serve`), at the cost of fp16 weights (cosine ≥ 0.998 to the fp32 reference), a one-time Core ML compile on first load, and speed: indexing a 177-file / 2,337-chunk tree took about 95 s on the Neural Engine vs about 44 s on Metal (peak 410 MB vs 1.4 GB), and each `query` pays a 3.7 s model load (query peak 300-350 MB). Choose `device = "metal"` when latency matters more than memory. `device = "metal"`, `"cpu"` or `dtype = "f32"` keeps the candle path. Dense embedders use the Neural Engine only when you set `device = "ane"` under `[embedder]` (Qwen3-Embedding-0.6B: 184 MB vs 2.9 GB; EmbeddingGemma 2: 233 MB vs 2.0 GB; the first load compiles for about 2 to 4 minutes). A `device = "ane"` that cannot be honoured (no package for the model, a dtype other than f16, a non-Apple machine) is an error, never a silent fallback.
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
 - `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
@@ -658,7 +659,7 @@ max_batch_tokens = 4096           # optional, native only
 
 ## Local Embeddings
 
-The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process on [candle](https://github.com/huggingface/candle) (the model code is ported from [fastembed-rs](https://github.com/Anush008/fastembed-rs); see `THIRD_PARTY_NOTICES.md`). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
+The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process through [im-not-llm](https://github.com/NomaDamas/im-not-llm)'s `inl-text` engine (candle; the Qwen3 model code derives from [fastembed-rs](https://github.com/Anush008/fastembed-rs), see that project's notices). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
 
 The first embedding call downloads the Apache-2.0 model via Hugging Face Hub into `~/.cache/minsync/models` (override with `model_cache_dir` in `config.toml`, `FASTEMBED_CACHE_DIR`, or `HF_HOME`). Later runs load from cache.
 
@@ -690,7 +691,7 @@ Switching to `--embedder none` and back works the same way: `--reembed` writes t
 
 ### EmbeddingGemma 2
 
-`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process on candle, text only: the checkpoint's vision and audio towers are never loaded.
+`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process through `inl-text`, text only: the checkpoint's vision and audio towers are never loaded.
 
 ```bash
 minsync init --embedder native:google/embeddinggemma-2
@@ -856,7 +857,7 @@ comparison, extension boundary, and accepted scope decision.
 
 ## Development
 
-CI runs on Ubuntu, macOS, and Windows with Rust 1.91 installed through rustup. It runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`. The build expects a working C compiler toolchain. CI also installs `protoc` through `arduino/setup-protoc`; non-Windows local builds use vendored protoc from `protobuf-src`, while Windows and LanceDB dependency build scripts require a `protoc` binary on `PATH`. Normal CI uses no secrets.
+CI runs on Ubuntu, macOS, and Windows with Rust 1.94 installed through rustup. It runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`. The build expects a working C compiler toolchain. CI also installs `protoc` through `arduino/setup-protoc`; non-Windows local builds use vendored protoc from `protobuf-src`, while Windows and LanceDB dependency build scripts require a `protoc` binary on `PATH`. Normal CI uses no secrets.
 
 ```bash
 cargo fmt --all -- --check

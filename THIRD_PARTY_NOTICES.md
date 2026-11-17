@@ -4,47 +4,27 @@ MinSync is MIT licensed (see `LICENSE`). The files listed here contain code
 derived from other projects under their own licenses, and the dependencies
 below are linked into the `minsync` executable under their own licenses.
 
-## fastembed-rs: Qwen3 model code
+## im-not-llm: model inference
 
-`src/embedder/qwen3/` is derived from `src/models/qwen3.rs` of
-[fastembed-rs](https://github.com/Anush008/fastembed-rs) 7.0.1.
+All in-process model inference (the Qwen3-Embedding and EmbeddingGemma 2 text
+towers and the ModernBERT SPLADE encoder, on candle) is the
+[im-not-llm](https://github.com/NomaDamas/im-not-llm) crates `inl-core`,
+`inl-text`, `inl-sparse` and `inl-server`, linked into the `minsync`
+executable. MinSync contains no model code of its own.
 
-- Copyright 2026 Anush008 and the fastembed-rs contributors
-- License: Apache License, Version 2.0 (<http://www.apache.org/licenses/LICENSE-2.0>)
-
-Changes made in MinSync: the text-embedding path only (no vision-language
-code); per-device attention backends; candle's fused RMSNorm; host-side padding
-mask and rotary tables; pooling and normalization on the last token in f32.
-
-## candle: ModernBERT sparse encoder
-
-`src/sparse/modernbert.rs` implements the ModernBERT masked-LM with
-`ShiftedTopK` SPLADE pooling that the default sparse checkpoint family ships.
-It is written against that checkpoint family rather than reusing
-`candle_transformers::models::modernbert`, which is not a dependency of this
-crate, applies no padding mask to the sliding window of padded keys, and has no
-MLM-logit chunking. Weight names and numerics follow the Hugging Face
-reference; the golden test reproduces its output.
-
+- License: MIT OR Apache-2.0
+- Their own third-party notices (including the fastembed-rs-derived Qwen3 code,
+  Apache-2.0) are in that repository's `THIRD_PARTY_NOTICES.md`.
 - Library: [candle](https://github.com/huggingface/candle) (`candle-core`,
-  `candle-nn`)
-- License: Apache License, Version 2.0 or MIT
-  (<http://www.apache.org/licenses/LICENSE-2.0> or
-  <https://opensource.org/licenses/MIT>)
+  `candle-nn`), Apache License, Version 2.0 or MIT.
 
 ## google/embeddinggemma-2: EmbeddingGemma 2 text tower
 
-`src/embedder/gemma2.rs` implements the text tower of EmbeddingGemma 2 on
-candle, written against the Hugging Face `transformers` reference
-(`EmbeddingGemma2TextModel`) and the checkpoint's Sentence-Transformers
-pipeline; the golden tests reproduce their output. The weights are **not** part
-of MinSync: the `native:` embedder downloads them from Hugging Face on first
-use.
+The weights are **not** part of MinSync: the `native:` embedder downloads them
+from Hugging Face on first use.
 
-- Reference: `transformers` (<https://github.com/huggingface/transformers>),
-  Apache License, Version 2.0 (<http://www.apache.org/licenses/LICENSE-2.0>)
 - Model: `google/embeddinggemma-2` (270M-parameter text tower), Apache
-  License, Version 2.0
+  License, Version 2.0 (<http://www.apache.org/licenses/LICENSE-2.0>)
 
 ## nlpai-lab/KURE-Sparse-nano: learned sparse (SPLADE) model
 

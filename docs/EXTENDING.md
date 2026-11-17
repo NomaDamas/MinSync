@@ -31,7 +31,7 @@ If the backend has asynchronous APIs, hide that behind a synchronous `VectorStor
 
 Current provider prefixes:
 
-- `native:` for in-process candle embeddings (Qwen3, `src/embedder/qwen3/`).
+- `native:` for in-process embeddings. The models live in [im-not-llm](https://github.com/NomaDamas/im-not-llm) (`inl-text`); `src/embedder/native.rs` only maps `[embedder]` settings onto its options.
 - `openai:` for OpenAI-compatible embeddings.
 - `tei:` for Hugging Face Text Embeddings Inference.
 

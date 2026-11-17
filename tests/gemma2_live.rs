@@ -61,3 +61,28 @@ async fn matches_the_sentence_transformers_reference_in_f32() {
         assert!(similarity > 0.9999, "alone row {row}: cosine {similarity}");
     }
 }
+
+/// EmbeddingGemma 2 on the Apple Neural Engine (opt-in: `device = "ane"`),
+/// against the same fp32 reference as the candle test above.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: runs native:google/embeddinggemma-2 on the Apple Neural Engine; run with --ignored"]
+async fn the_neural_engine_matches_the_reference_when_asked_for() {
+    let golden = golden();
+    let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+    config.embedder.id = "native:google/embeddinggemma-2".to_string();
+    config.embedder.device = Some("ane".to_string());
+    let model = NativeEmbedder::from_config(&config.embedder).unwrap();
+    let identity = model.identity().await.unwrap();
+    println!("identity: {identity:?}");
+    assert_eq!((identity.device, identity.dtype), ("ane", "f16"));
+    assert_eq!(identity.dimension, 768);
+    let vectors = model.embed(&golden.texts).await.unwrap();
+    let worst = vectors
+        .iter()
+        .zip(&golden.emb)
+        .map(|(a, b)| cosine(a, b))
+        .fold(f32::MAX, f32::min);
+    println!("worst cosine to the reference {worst:.6}");
+    assert!(worst > 0.999, "worst cosine {worst}");
+}

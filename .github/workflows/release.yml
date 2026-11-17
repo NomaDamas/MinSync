@@ -35,7 +35,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: 1.94.1
           targets: ${{ matrix.target }}
 
       - uses: arduino/setup-protoc@v3
@@ -118,7 +118,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: 1.94.1
 
       - uses: arduino/setup-protoc@v3
         with:
