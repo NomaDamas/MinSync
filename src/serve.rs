@@ -154,27 +154,44 @@ mod tests {
         assert!(error.to_string().contains("only serves native"), "{error}");
     }
 
-    /// A server on the Neural Engine and one on Metal produce different
-    /// vectors (fp16 vs f32), so an unset device that resolves to the ANE must
-    /// not collide with an explicit Metal one.
-    #[test]
-    fn the_neural_engine_and_metal_are_different_instances() {
-        let sparse = |device: Option<&str>| SparseConfig {
+    fn kure(device: Option<&str>) -> SparseConfig {
+        SparseConfig {
             id: "native:nlpai-lab/KURE-Sparse-nano".to_string(),
             device: device.map(str::to_string),
             ..SparseConfig::default()
-        };
-        let metal = sparse_instance_key(&sparse(Some("metal"))).unwrap();
-        let auto = sparse_instance_key(&sparse(None)).unwrap();
-        let ane = sparse_instance_key(&sparse(Some("ane"))).unwrap();
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
+        }
+    }
+
+    /// A server on the Neural Engine and one on Metal produce different
+    /// vectors (fp16 vs f32), so an unset device that resolves to the ANE must
+    /// not collide with an explicit Metal one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_neural_engine_and_metal_are_different_instances() {
+        let metal = sparse_instance_key(&kure(Some("metal"))).unwrap();
+        let auto = sparse_instance_key(&kure(None)).unwrap();
+        let ane = sparse_instance_key(&kure(Some("ane"))).unwrap();
+        assert_ne!(ane, metal);
+        if cfg!(target_arch = "aarch64") {
             assert_eq!(auto, ane, "the default on Apple silicon is the ANE");
             assert_ne!(auto, metal);
+        } else {
+            assert_eq!(auto, sparse_instance_key(&kure(Some("auto"))).unwrap());
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        assert_eq!(auto, sparse_instance_key(&sparse(Some("auto"))).unwrap());
-        assert_ne!(ane, metal);
+    }
+
+    /// Off macOS an unset device is the candle path, and `device = "ane"` is a
+    /// config error that names the cause, not an instance of its own.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_the_default_is_candle_and_ane_is_refused() {
+        assert_eq!(
+            sparse_instance_key(&kure(None)).unwrap(),
+            sparse_instance_key(&kure(Some("auto"))).unwrap()
+        );
+        let error = sparse_instance_key(&kure(Some("ane"))).unwrap_err();
+        assert!(matches!(error, MinSyncError::Config(_)), "{error:?}");
+        assert!(error.to_string().contains("Apple silicon"), "{error}");
     }
 
     #[test]
