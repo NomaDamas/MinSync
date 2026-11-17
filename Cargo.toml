@@ -51,38 +51,35 @@ arrow-schema = "58.3.0"
 futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 libc = "0.2"
-hf-hub = { version = "0.5.0", default-features = false, features = [
-    "ureq",
-    "rustls-tls",
-] }
-tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
 parking_lot = "0.12"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "0.22"
+# All model inference lives in im-not-llm; MinSync only adapts its engines.
+inl-core = "0.1.1"
+inl-text = "0.1.0"
+inl-sparse = "0.1.2"
+inl-server = { version = "0.3.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `accelerate` routes CPU matmuls to Accelerate.framework (always present on
 # macOS); without it candle's pure-Rust gemm runs SPLADE ~40x slower than Metal.
-candle-core = { version = "0.11.0", features = ["metal", "accelerate"] }
-candle-nn = { version = "0.11.0", features = ["metal", "accelerate"] }
+inl-core = { version = "0.1.1", features = ["accelerate"] }
 
 # Opt-in native backends for non-macOS builds; macOS gets Metal + Accelerate.
 # `--features mkl`: Intel MKL BLAS for x86_64 CPU encoders.
 # `--features cuda`: NVIDIA GPU (needs the CUDA toolkit at build time).
 [features]
 default = []
-mkl = ["candle-core/mkl", "candle-nn/mkl"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-server/mkl"]
+cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-server/cuda"]
 
-# candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
-# float16x8_t which now requires the unstable stdarch_neon_f16 feature.
-# huggingface/candle#3845 gates those types behind target_feature="fp16".
+# TEMPORARY: inl-sparse 0.1.2 and inl-server 0.3.1 are not on crates.io yet.
+# Every inl crate must come from the same source (one `InlError` type), so all
+# of them are patched together. Remove this section once those are published.
 [patch.crates-io]
-candle-core = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
-candle-nn = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
+inl-core = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
+inl-text = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
+inl-sparse = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
+inl-late = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
+inl-server = { git = "https://github.com/NomaDamas/im-not-llm", rev = "9e60a9edaab3e4152a43c35b301ccc7e5f4767fc" }
 
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"

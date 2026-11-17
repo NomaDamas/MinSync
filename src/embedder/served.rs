@@ -86,7 +86,7 @@ impl ServedEmbedder {
         let pass = settings
             .per_batch_timeout_seconds
             .unwrap_or(settings.timeout_seconds)
-            .max(super::native::CPU_BATCH_TIMEOUT.as_secs());
+            .max(inl_core::device::CPU_BATCH_TIMEOUT.as_secs());
         Ok(Self::new(
             Box::new(local),
             crate::serve::default_state_dir(&instance),
@@ -307,7 +307,7 @@ mod tests {
             "device": "cpu", "attention": "eager", "max_length": 2048,
             "max_inputs": max_inputs, "instance": instance, "pid": 1,
             "host": addr.ip().to_string(), "port": addr.port(),
-            "url": format!("http://{addr}"), "version": "test",
+            "url": format!("http://{addr}"), "uptime_seconds": 1, "requests_total": 0, "loaded": true, "build": {"version": "test", "features": []}, "version": "test",
         })
     }
 
@@ -468,7 +468,7 @@ mod tests {
             "status": "ok", "model_id": "Fake/Model", "dimension": 2, "dtype": "f32",
             "device": "cpu", "attention": "eager", "max_length": 2048, "max_inputs": 512,
             "instance": INSTANCE, "pid": 1, "host": addr.ip().to_string(),
-            "port": addr.port(), "url": format!("http://{addr}"), "version": "test",
+            "port": addr.port(), "url": format!("http://{addr}"), "uptime_seconds": 1, "requests_total": 0, "loaded": true, "build": {"version": "test", "features": []}, "version": "test",
         }))
         .unwrap();
         // Answers `/health`; reads `/embed` and closes without a response.

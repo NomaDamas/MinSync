@@ -402,7 +402,7 @@ max_length = 2048
 
 Provider:
 
-- `native:`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(299 MB)를 model cache로 받으며, 모델은 f32로 메모리에 올라가 약 600 MB를 차지합니다.
+- `native:`는 [im-not-llm](https://github.com/NomaDamas/im-not-llm)의 `inl-sparse` 엔진(candle 기반)으로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(299 MB)를 model cache로 받으며, 모델은 f32로 메모리에 올라가 약 600 MB를 차지합니다.
 - `tei:`는 Text Embeddings Inference 서버의 `POST /embed_sparse`를 호출하며 `base_url`이 그 서버를 가리킵니다.
 - `native:`는 실행 중인 `minsync serve --sparse`를 자동으로 채택합니다(discovery 규칙은 dense embedder와 같으며 `MINSYNC_SERVER=off`로 끕니다). `minsync serve --sparse`는 TEI 호환 `POST /embed_sparse`와 `GET /health`(kind `sparse`)를 제공합니다.
 
@@ -551,7 +551,7 @@ max_concurrent = 1
 
 ## 로컬 Embedding
 
-기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 [candle](https://github.com/huggingface/candle)로 프로세스 안에서 실행됩니다(모델 코드는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)에서 가져왔으며 `THIRD_PARTY_NOTICES.md`에 표기했습니다). `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
+기본 embedder `native:Qwen/Qwen3-Embedding-0.6B`는 [im-not-llm](https://github.com/NomaDamas/im-not-llm)의 `inl-text` 엔진(candle 기반)으로 프로세스 안에서 실행됩니다(Qwen3 모델 코드는 [fastembed-rs](https://github.com/Anush008/fastembed-rs)에서 가져왔으며 해당 프로젝트의 notices에 표기돼 있습니다). `minsync init`은 `dimension = 1024`를 쓰고 query/passage prefix는 비웁니다. Apple Silicon에서는 Metal, 그 외에는 CPU를 사용합니다.
 
 첫 embedding 호출이 Apache-2.0 모델을 Hugging Face Hub에서 `~/.cache/minsync/models`로 받습니다. `config.toml`의 `model_cache_dir`, `FASTEMBED_CACHE_DIR`, `HF_HOME`으로 경로를 바꿀 수 있습니다. 이후 실행은 캐시에서 로드합니다.
 
@@ -583,7 +583,7 @@ minsync sync --reembed
 
 ### EmbeddingGemma 2
 
-`native:google/embeddinggemma-2`는 Google의 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)(Apache-2.0, 텍스트 타워 2.7억 파라미터, 768차원, 8K context)를 candle로 프로세스 안에서 실행합니다. 텍스트만 쓰며 체크포인트의 vision/audio 타워는 읽지 않습니다.
+`native:google/embeddinggemma-2`는 Google의 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)(Apache-2.0, 텍스트 타워 2.7억 파라미터, 768차원, 8K context)를 `inl-text`로 프로세스 안에서 실행합니다. 텍스트만 쓰며 체크포인트의 vision/audio 타워는 읽지 않습니다.
 
 ```bash
 minsync init --embedder native:google/embeddinggemma-2

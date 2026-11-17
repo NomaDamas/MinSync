@@ -91,6 +91,27 @@ impl MinSyncError {
 
 pub type Result<T> = std::result::Result<T, MinSyncError>;
 
+/// Inference engines (`im-not-llm`) report their own error type; this keeps
+/// each class where MinSync's callers and exit codes expect it: a deadline is
+/// still [`MinSyncError::Timeout`] (exit 7), a bad setting is still
+/// [`MinSyncError::Config`], and every load or forward-pass failure is still
+/// [`MinSyncError::Embedding`] (exit 5).
+impl From<inl_core::InlError> for MinSyncError {
+    fn from(error: inl_core::InlError) -> Self {
+        use inl_core::InlError;
+        match error {
+            InlError::Config(message) => Self::Config(message),
+            InlError::Timeout(message) => Self::Timeout(message),
+            InlError::Inference(message) | InlError::InvalidInput(message) => {
+                Self::Embedding(message)
+            }
+            InlError::Io(error) => Self::Io(error),
+            InlError::Json(error) => Self::Json(error),
+            InlError::Other(message) => Self::Other(message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +128,31 @@ mod tests {
         ] {
             assert_ne!(other, 7);
         }
+    }
+
+    #[test]
+    fn inference_errors_keep_their_class_and_exit_code() {
+        use inl_core::InlError;
+        let timeout = MinSyncError::from(InlError::Timeout("pass stuck".into()));
+        assert!(matches!(timeout, MinSyncError::Timeout(ref m) if m.contains("pass stuck")));
+        assert_eq!(timeout.exit_code(), 7);
+
+        let config = MinSyncError::from(InlError::Config("bad device".into()));
+        assert!(matches!(config, MinSyncError::Config(ref m) if m == "bad device"));
+        assert_eq!(config.exit_code(), 1);
+
+        for inference in [
+            InlError::Inference("load failed".into()),
+            InlError::InvalidInput("too long".into()),
+        ] {
+            let mapped = MinSyncError::from(inference);
+            assert!(matches!(mapped, MinSyncError::Embedding(_)), "{mapped:?}");
+            assert_eq!(mapped.exit_code(), 5);
+        }
+
+        let io = MinSyncError::from(InlError::Io(std::io::Error::other("disk")));
+        assert!(matches!(io, MinSyncError::Io(_)));
+        let other = MinSyncError::from(InlError::Other("misc".into()));
+        assert!(matches!(other, MinSyncError::Other(ref m) if m == "misc"));
     }
 }

@@ -1,13 +1,15 @@
 //! Node-API binding for MinSync's native embedder.
 //!
-//! Inference is `minsync::embedder::session::NativeSession`, the engine behind
-//! `minsync sync` / `minsync query`: same weights and cache, same batch planner
-//! and padded-token cap, same per-batch deadline. This crate only converts
-//! types and maps errors. Work runs on tokio's blocking pool, never on the JS
-//! thread.
+//! Inference is `inl_text::TextSession` from `im-not-llm`, configured through
+//! the same `[embedder]` settings (`minsync::embedder::native::text_options`)
+//! that `minsync sync` / `minsync query` use: same weights and cache, same
+//! batch planner and padded-token cap, same per-batch deadline. This crate only
+//! converts types and maps errors. Work runs on tokio's blocking pool, never on
+//! the JS thread.
 
+use inl_text::{TextIdentity, TextSession};
 use minsync::config::{Config, DEFAULT_EMBEDDER_ID};
-use minsync::embedder::session::NativeSession;
+use minsync::embedder::native::{text_options, NativeIdentity};
 use minsync::error::MinSyncError;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -160,7 +162,7 @@ fn seconds(value: u32) -> u64 {
     u64::from(value)
 }
 
-fn build_session(options: EmbedderOptions) -> minsync::error::Result<NativeSession> {
+fn build_session(options: EmbedderOptions) -> minsync::error::Result<TextSession> {
     let mut settings = Config::default_for("node").embedder;
     settings.id = options
         .id
@@ -183,14 +185,14 @@ fn build_session(options: EmbedderOptions) -> minsync::error::Result<NativeSessi
     let idle = options
         .idle_unload_seconds
         .map(|value| Duration::from_secs(seconds(value)));
-    NativeSession::new(&settings, idle)
+    Ok(TextSession::new(text_options(&settings)?, idle)?)
 }
 
 /// In-process native embedder. The model loads on first use and stays
 /// resident until `unload()`, `dispose()` or the idle timeout.
 #[napi]
 pub struct NativeEmbedder {
-    session: Arc<NativeSession>,
+    session: Arc<TextSession>,
 }
 
 #[napi]
@@ -222,7 +224,12 @@ impl NativeEmbedder {
     /// resident, since those are only known once it is.
     #[napi]
     pub async fn identity(&self) -> Result<EmbedderIdentity> {
-        let identity = self.session.identity().await.map_err(to_napi)?;
+        let identity: TextIdentity = self
+            .session
+            .identity()
+            .await
+            .map_err(|error| to_napi(error.into()))?;
+        let identity = NativeIdentity::from(identity);
         Ok(EmbedderIdentity {
             id: identity.id,
             dimension: identity.dimension as u32,
@@ -240,7 +247,7 @@ impl NativeEmbedder {
         texts: Vec<String>,
         abort: Option<&AbortHandle>,
     ) -> Result<Vec<Float32Array>> {
-        let vectors = abortable(abort, self.session.embed(&texts)).await?;
+        let vectors = abortable(abort, async { Ok(self.session.embed(&texts).await?) }).await?;
         Ok(vectors.into_iter().map(Float32Array::new).collect())
     }
 
@@ -251,7 +258,7 @@ impl NativeEmbedder {
         text: String,
         abort: Option<&AbortHandle>,
     ) -> Result<Float32Array> {
-        let vector = abortable(abort, self.session.embed_query(&text)).await?;
+        let vector = abortable(abort, async { Ok(self.session.embed_query(&text).await?) }).await?;
         Ok(Float32Array::new(vector))
     }
 

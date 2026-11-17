@@ -1,6 +1,6 @@
 # @nomadamas/minsync-native
 
-MinSync's native embedder (Qwen3 on [candle](https://github.com/huggingface/candle), Metal on macOS) as an in-process
+MinSync's native embedder (Qwen3 via [im-not-llm](https://github.com/NomaDamas/im-not-llm)'s `inl-text` on candle, Metal on macOS) as an in-process
 [Node-API](https://nodejs.org/api/n-api.html) addon. Same engine, weights, cache and batch limits as the `minsync` CLI's
 `native:` embedder, without a second process, a port, or a cold model load per call.
 

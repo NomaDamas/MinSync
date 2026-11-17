@@ -76,7 +76,7 @@ impl ServedSparseEncoder {
         let pass = settings
             .per_batch_timeout_seconds
             .unwrap_or(settings.timeout_seconds)
-            .max(crate::embedder::native::CPU_BATCH_TIMEOUT.as_secs());
+            .max(inl_core::device::CPU_BATCH_TIMEOUT.as_secs());
         Ok(Self::new(
             Box::new(local),
             crate::serve::default_state_dir(&instance),
@@ -340,7 +340,7 @@ mod tests {
             "dtype": "f32", "device": "cpu", "attention": "tiled", "max_length": 2048,
             "max_inputs": max_inputs, "instance": instance, "pid": 1,
             "host": addr.ip().to_string(), "port": addr.port(),
-            "url": format!("http://{addr}"), "version": "test",
+            "url": format!("http://{addr}"), "uptime_seconds": 1, "requests_total": 0, "loaded": true, "build": {"version": "test", "features": []}, "version": "test",
         })
     }
 

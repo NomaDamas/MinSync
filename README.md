@@ -52,7 +52,7 @@ cd MinSync
 cargo build --release
 ```
 
-The in-process models (dense embedder and SPLADE) run on Metal on macOS, with Accelerate for CPU matmuls. Other platforms run on the CPU by default; opt into a faster backend at build time:
+The in-process models (dense embedder and SPLADE) run on Metal on macOS, with Accelerate for CPU matmuls. All model inference is done by [im-not-llm](https://github.com/NomaDamas/im-not-llm) (`inl-text`, `inl-sparse`, `inl-server`); MinSync adapts its engines and does no inference of its own. Other platforms run on the CPU by default; opt into a faster backend at build time:
 
 ```bash
 cargo build --release --features cuda   # NVIDIA GPU, needs the CUDA toolkit; device "auto" picks GPU 0
@@ -484,7 +484,7 @@ max_length = 2048
 
 Providers:
 
-- `native:` runs the model in-process on [candle](https://github.com/huggingface/candle) (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
+- `native:` runs the model in-process through [im-not-llm](https://github.com/NomaDamas/im-not-llm)'s `inl-sparse` engine (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling, on candle). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
 - `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
@@ -658,7 +658,7 @@ max_batch_tokens = 4096           # optional, native only
 
 ## Local Embeddings
 
-The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process on [candle](https://github.com/huggingface/candle) (the model code is ported from [fastembed-rs](https://github.com/Anush008/fastembed-rs); see `THIRD_PARTY_NOTICES.md`). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
+The default embedder `native:Qwen/Qwen3-Embedding-0.6B` runs in-process through [im-not-llm](https://github.com/NomaDamas/im-not-llm)'s `inl-text` engine (candle; the Qwen3 model code derives from [fastembed-rs](https://github.com/Anush008/fastembed-rs), see that project's notices). `minsync init` writes `dimension = 1024` and no query/passage prefixes. On Apple Silicon the native path uses Metal; elsewhere it uses CPU.
 
 The first embedding call downloads the Apache-2.0 model via Hugging Face Hub into `~/.cache/minsync/models` (override with `model_cache_dir` in `config.toml`, `FASTEMBED_CACHE_DIR`, or `HF_HOME`). Later runs load from cache.
 
@@ -690,7 +690,7 @@ Switching to `--embedder none` and back works the same way: `--reembed` writes t
 
 ### EmbeddingGemma 2
 
-`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process on candle, text only: the checkpoint's vision and audio towers are never loaded.
+`native:google/embeddinggemma-2` runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0, 270M-parameter text tower, 768 dimensions, 8K context) in-process through `inl-text`, text only: the checkpoint's vision and audio towers are never loaded.
 
 ```bash
 minsync init --embedder native:google/embeddinggemma-2
