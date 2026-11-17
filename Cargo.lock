@@ -3399,6 +3399,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "inl-ane"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82d4bfeb3697c04dfd5538426f3d90cc960fe7394a4357688b28aeb43544c82c"
+dependencies = [
+ "async-trait",
+ "half",
+ "hex",
+ "inl-core",
+ "inl-sparse",
+ "memmap2",
+ "objc2",
+ "objc2-core-ml",
+ "objc2-foundation",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "inl-core"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4761,6 +4785,7 @@ dependencies = [
  "futures",
  "hex",
  "ignore",
+ "inl-ane",
  "inl-core",
  "inl-server",
  "inl-sparse",
@@ -5151,6 +5176,17 @@ dependencies = [
  "bitflags 2.11.1",
  "dispatch2",
  "objc2",
+]
+
+[[package]]
+name = "objc2-core-ml"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201b055e6acfa0f9f15568255d3f03ce2b54bc86d1814442dc69138e36813e18"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -5689,7 +5725,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -5708,7 +5744,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

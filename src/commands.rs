@@ -787,11 +787,11 @@ async fn serve(
     let started = if args.sparse {
         let settings = serve_sparse_settings(minsync_dir, args.embedder)?;
         let engine = crate::sparse::native::NativeSparseEncoder::from_config(&settings)?;
-        crate::serve::start_sparse(std::sync::Arc::new(engine.into_engine()), options).await?
+        crate::serve::start_sparse(engine.into_engine(), options).await?
     } else {
         let settings = serve_settings(minsync_dir, args.embedder)?;
         let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
-        crate::serve::start(std::sync::Arc::new(engine.into_engine()), options).await?
+        crate::serve::start(engine.into_engine(), options).await?
     };
     let server = match started {
         crate::serve::Started::Adopted(health) => {

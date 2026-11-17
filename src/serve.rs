@@ -8,7 +8,7 @@
 //! model instance, and where its state directory lives.
 
 use crate::config::{EmbedderConfig, SparseConfig, DEFAULT_SPARSE_MAX_LENGTH};
-use crate::embedder::native::{minsync_cache_root, DEFAULT_MAX_LENGTH};
+use crate::embedder::native::{minsync_cache_root, resolve_backend, Backend, DEFAULT_MAX_LENGTH};
 use crate::error::{MinSyncError, Result};
 use inl_server::{EngineKind, InstanceKey};
 use std::path::PathBuf;
@@ -29,9 +29,12 @@ pub fn instance_key(settings: &EmbedderConfig) -> Result<String> {
             settings.id
         )));
     };
+    // The engine a model runs on is part of its identity: a Neural Engine
+    // server and a Metal server of one model produce different vectors.
+    let device = resolved_device(model, false, &settings.device, &settings.dtype)?;
     Ok(inl_server::instance_key(&InstanceKey {
         model: model.to_string(),
-        device: settings.device.clone(),
+        device,
         dtype: settings.dtype.clone(),
         attention: settings.attention.clone(),
         max_length: Some(settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH)),
@@ -48,14 +51,31 @@ pub fn sparse_instance_key(settings: &SparseConfig) -> Result<String> {
             settings.id
         )));
     };
+    let device = resolved_device(model, true, &settings.device, &settings.dtype)?;
     Ok(inl_server::instance_key(&InstanceKey {
         model: model.to_string(),
-        device: settings.device.clone(),
+        device,
         dtype: settings.dtype.clone(),
         attention: None,
         max_length: Some(settings.max_length.unwrap_or(DEFAULT_SPARSE_MAX_LENGTH)),
         kind: EngineKind::Sparse,
     })?)
+}
+
+/// The configured device, with a default that lands on the Neural Engine named
+/// `ane` so it never shares an instance with the same model on Metal.
+fn resolved_device(
+    model: &str,
+    sparse: bool,
+    device: &Option<String>,
+    dtype: &Option<String>,
+) -> Result<Option<String>> {
+    Ok(
+        match resolve_backend(model, sparse, device.as_deref(), dtype.as_deref())? {
+            Backend::Ane => Some("ane".to_string()),
+            Backend::Candle => device.clone(),
+        },
+    )
 }
 
 /// Default state directory for an instance:
@@ -132,6 +152,29 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("only serves native"), "{error}");
+    }
+
+    /// A server on the Neural Engine and one on Metal produce different
+    /// vectors (fp16 vs f32), so an unset device that resolves to the ANE must
+    /// not collide with an explicit Metal one.
+    #[test]
+    fn the_neural_engine_and_metal_are_different_instances() {
+        let sparse = |device: Option<&str>| SparseConfig {
+            id: "native:nlpai-lab/KURE-Sparse-nano".to_string(),
+            device: device.map(str::to_string),
+            ..SparseConfig::default()
+        };
+        let metal = sparse_instance_key(&sparse(Some("metal"))).unwrap();
+        let auto = sparse_instance_key(&sparse(None)).unwrap();
+        let ane = sparse_instance_key(&sparse(Some("ane"))).unwrap();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            assert_eq!(auto, ane, "the default on Apple silicon is the ANE");
+            assert_ne!(auto, metal);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert_eq!(auto, sparse_instance_key(&sparse(Some("auto"))).unwrap());
+        assert_ne!(ane, metal);
     }
 
     #[test]

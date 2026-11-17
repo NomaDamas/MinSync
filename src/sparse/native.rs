@@ -6,11 +6,12 @@
 
 use super::{SparseEncoder, SparseVector};
 use crate::config::{SparseConfig, DEFAULT_SPARSE_MAX_LENGTH};
-use crate::embedder::native::{model_cache_dir, parse_native_model_id};
+use crate::embedder::native::{model_cache_dir, parse_native_model_id, resolve_backend, Backend};
 use crate::error::Result;
 use async_trait::async_trait;
 use inl_core::EngineInfo;
-use inl_sparse::SparseOptions;
+use inl_sparse::{SparseEngine, SparseOptions};
+use std::sync::Arc;
 
 /// The engine options `settings` describes.
 pub fn sparse_options(settings: &SparseConfig) -> Result<SparseOptions> {
@@ -32,31 +33,83 @@ pub fn sparse_options(settings: &SparseConfig) -> Result<SparseOptions> {
     })
 }
 
+fn sparse_engine(settings: &SparseConfig, model: &str) -> Result<(Arc<dyn SparseEngine>, usize)> {
+    match resolve_backend(
+        model,
+        true,
+        settings.device.as_deref(),
+        settings.dtype.as_deref(),
+    )? {
+        Backend::Candle => {
+            let options = sparse_options(settings)?;
+            let max_length = options.max_length;
+            Ok((
+                Arc::new(inl_sparse::SparseEncoder::new(options)?),
+                max_length,
+            ))
+        }
+        Backend::Ane => {
+            #[cfg(target_os = "macos")]
+            {
+                let max_length = settings.max_length.unwrap_or(DEFAULT_SPARSE_MAX_LENGTH);
+                let options = crate::embedder::native::ane_options(
+                    model,
+                    model_cache_dir(settings.model_cache_dir.as_deref()),
+                    max_length,
+                    settings.timeout_seconds,
+                    settings.per_batch_timeout_seconds,
+                );
+                Ok((
+                    Arc::new(inl_ane::AneSparseEncoder::new(options)?),
+                    max_length,
+                ))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(crate::error::MinSyncError::Config(
+                "the Apple Neural Engine needs an Apple silicon Mac".to_string(),
+            ))
+        }
+    }
+}
+
 pub struct NativeSparseEncoder {
     model_id: String,
     max_length: usize,
-    engine: inl_sparse::SparseEncoder,
+    query_prefix: Option<String>,
+    passage_prefix: Option<String>,
+    engine: Arc<dyn SparseEngine>,
 }
 
 impl NativeSparseEncoder {
     pub fn from_config(settings: &SparseConfig) -> Result<Self> {
-        let options = sparse_options(settings)?;
+        let model_id = parse_native_model_id(&settings.id)?.to_string();
+        let (engine, max_length) = sparse_engine(settings, &model_id)?;
         Ok(Self {
-            model_id: options.id.clone(),
-            max_length: options.max_length,
-            engine: inl_sparse::SparseEncoder::new(options)?,
+            model_id,
+            max_length,
+            query_prefix: settings.query_prefix.clone(),
+            passage_prefix: settings.passage_prefix.clone(),
+            engine,
         })
     }
 
     /// The sparse space this encoder produces (`dimension` is the number of
     /// terms). Loads the model if it is not resident.
     pub async fn identity(&self) -> Result<EngineInfo> {
-        Ok(self.engine.identity().await?)
+        Ok(self.engine.load().await?)
     }
 
-    /// The engine, for a server that drives it directly.
-    pub fn into_engine(self) -> inl_sparse::SparseEncoder {
+    /// The engine, for a server that drives it directly. It encodes exactly
+    /// the text it is given: the server applies the prefixes.
+    pub fn into_engine(self) -> Arc<dyn SparseEngine> {
         self.engine
+    }
+
+    fn prefixed(prefix: &Option<String>, text: &str) -> String {
+        match prefix {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text.to_string(),
+        }
     }
 }
 
@@ -75,15 +128,36 @@ impl SparseEncoder for NativeSparseEncoder {
     }
 
     async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
-        Ok(self.engine.count_truncated(texts).await?)
+        // A chunk can only reach the limit if its UTF-8 byte length does; skip
+        // tokenizing the clearly short ones.
+        let candidates: Vec<String> = texts
+            .iter()
+            .filter(|text| text.len() >= self.max_length)
+            .map(|text| Self::prefixed(&self.passage_prefix, text))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let counts = self.engine.token_counts(&candidates).await?;
+        Ok(counts.iter().filter(|&&n| n >= self.max_length).count())
     }
 
     async fn encode(&self, texts: &[String]) -> Result<Vec<SparseVector>> {
-        Ok(self.engine.encode(texts).await?)
+        let inputs = texts
+            .iter()
+            .map(|text| Self::prefixed(&self.passage_prefix, text))
+            .collect();
+        Ok(self.engine.encode(inputs).await?)
     }
 
     async fn encode_query(&self, text: &str) -> Result<SparseVector> {
-        Ok(self.engine.encode_query(text).await?)
+        let input = Self::prefixed(&self.query_prefix, text);
+        self.engine
+            .encode(vec![input])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::error::MinSyncError::Embedding("empty response".to_string()))
     }
 }
 

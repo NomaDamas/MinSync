@@ -389,7 +389,7 @@ max_retries = 3
 timeout_seconds = 60
 query_prefix = "[Q] "
 passage_prefix = "[D] "
-device = "auto"                      # auto | cpu | metal | cuda (native 전용)
+device = "auto"                      # auto | cpu | metal | cuda | ane (native 전용); auto는 Apple silicon에서 Neural Engine
 dtype = "auto"                       # 모든 장치에서 f32로 결정됨 (native 전용)
 max_length = 2048
 
@@ -403,6 +403,7 @@ max_length = 2048
 Provider:
 
 - `native:`는 [im-not-llm](https://github.com/NomaDamas/im-not-llm)의 `inl-sparse` 엔진(candle 기반)으로 프로세스 안에서 모델을 실행합니다(ModernBERT masked-LM + ShiftedTopK SPLADE pooling). Python도 ONNX runtime도 쓰지 않으므로 macOS, Windows, Linux에서 단일 binary로 동작합니다. 첫 사용 시 Hugging Face에서 가중치(299 MB)를 model cache로 받으며, 모델은 f32로 메모리에 올라가 약 600 MB를 차지합니다.
+- Apple silicon에서는 sparse encoder가 기본으로 **Apple Neural Engine**(`inl-ane`, Core ML 패키지, fp16)에서 실행됩니다. `inl serve` 기준 `footprint` 실측으로 Metal 약 1.3 GB 대신 약 350 MB만 상주하며, 대신 가중치가 fp16이라 fp32 레퍼런스 대비 cosine 0.998 이상이고, 첫 로드에 Core ML 컴파일이 한 번 필요하며, 속도가 느립니다. 177개 파일·2,337 청크 인덱싱이 Neural Engine에서 약 95초, Metal에서 약 44초였고(피크 410 MB vs 1.4 GB), `query`마다 모델 로드 3.7초가 듭니다(query 피크 300~350 MB). 지연이 메모리보다 중요하면 `device = "metal"`을 쓰세요. `device = "metal"`, `"cpu"` 또는 `dtype = "f32"`를 지정하면 candle 경로를 씁니다. dense embedder는 `[embedder]`에 `device = "ane"`를 지정할 때만 Neural Engine을 씁니다(Qwen3-Embedding-0.6B 184 MB vs 2.9 GB, EmbeddingGemma 2 233 MB vs 2.0 GB, 첫 로드 컴파일 약 2~4분). 지킬 수 없는 `device = "ane"`(모델 패키지 없음, f16 외 dtype, Apple 기기가 아님)는 조용히 대체하지 않고 오류입니다.
 - `tei:`는 Text Embeddings Inference 서버의 `POST /embed_sparse`를 호출하며 `base_url`이 그 서버를 가리킵니다.
 - `native:`는 실행 중인 `minsync serve --sparse`를 자동으로 채택합니다(discovery 규칙은 dense embedder와 같으며 `MINSYNC_SERVER=off`로 끕니다). `minsync serve --sparse`는 TEI 호환 `POST /embed_sparse`와 `GET /health`(kind `sparse`)를 제공합니다.
 
@@ -748,7 +749,7 @@ cross-platform Rust 도구로 유지합니다. 범용 증분 dataflow framework�
 
 ## 개발
 
-CI는 Ubuntu, macOS, Windows에서 rustup으로 Rust 1.91을 설치한 뒤 `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`를 실행합니다. Build에는 C compiler toolchain이 필요합니다. CI는 `arduino/setup-protoc`으로 `protoc`을 설치합니다. Non-Windows local build는 `protobuf-src` vendored protoc을 사용하지만, Windows와 LanceDB dependency build script는 `PATH`의 `protoc` binary를 요구합니다. 일반 CI에는 secret이 필요하지 않습니다.
+CI는 Ubuntu, macOS, Windows에서 rustup으로 Rust 1.94을 설치한 뒤 `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`를 실행합니다. Build에는 C compiler toolchain이 필요합니다. CI는 `arduino/setup-protoc`으로 `protoc`을 설치합니다. Non-Windows local build는 `protobuf-src` vendored protoc을 사용하지만, Windows와 LanceDB dependency build script는 `PATH`의 `protoc` binary를 요구합니다. 일반 CI에는 secret이 필요하지 않습니다.
 
 ```bash
 cargo fmt --all -- --check

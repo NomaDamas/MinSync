@@ -471,8 +471,8 @@ max_retries = 3
 timeout_seconds = 60
 query_prefix = "[Q] "
 passage_prefix = "[D] "
-device = "auto"                      # auto | cpu | metal | cuda (native only)
-dtype = "auto"                       # resolves to f32 on every device (native only)
+device = "auto"                      # auto | cpu | metal | cuda | ane (native only); auto is the Neural Engine on Apple silicon
+dtype = "auto"                       # f32 on cpu/metal/cuda, f16 on ane (native only)
 max_length = 2048
 
 # Optional, unset by default:
@@ -485,6 +485,7 @@ max_length = 2048
 Providers:
 
 - `native:` runs the model in-process through [im-not-llm](https://github.com/NomaDamas/im-not-llm)'s `inl-sparse` engine (a ModernBERT masked-LM with ShiftedTopK SPLADE pooling, on candle). No Python and no ONNX runtime, so the CLI stays a single binary on macOS, Windows and Linux. The first use downloads the weights from Hugging Face into the model cache (299 MB; the model is held in memory as f32, about 600 MB).
+- On Apple silicon the sparse encoder runs on the **Apple Neural Engine** by default (`inl-ane`, a Core ML package, fp16): about 350 MB resident instead of about 1.3 GB on Metal (measured with `footprint` on `inl serve`), at the cost of fp16 weights (cosine ≥ 0.998 to the fp32 reference), a one-time Core ML compile on first load, and speed: indexing a 177-file / 2,337-chunk tree took about 95 s on the Neural Engine vs about 44 s on Metal (peak 410 MB vs 1.4 GB), and each `query` pays a 3.7 s model load (query peak 300-350 MB). Choose `device = "metal"` when latency matters more than memory. `device = "metal"`, `"cpu"` or `dtype = "f32"` keeps the candle path. Dense embedders use the Neural Engine only when you set `device = "ane"` under `[embedder]` (Qwen3-Embedding-0.6B: 184 MB vs 2.9 GB; EmbeddingGemma 2: 233 MB vs 2.0 GB; the first load compiles for about 2 to 4 minutes). A `device = "ane"` that cannot be honoured (no package for the model, a dtype other than f16, a non-Apple machine) is an error, never a silent fallback.
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse`; `base_url` points at it.
 - `native:` adopts a running `minsync serve --sparse` automatically, with the same discovery rules as the dense embedder (`MINSYNC_SERVER=off` disables it). `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
@@ -856,7 +857,7 @@ comparison, extension boundary, and accepted scope decision.
 
 ## Development
 
-CI runs on Ubuntu, macOS, and Windows with Rust 1.91 installed through rustup. It runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`. The build expects a working C compiler toolchain. CI also installs `protoc` through `arduino/setup-protoc`; non-Windows local builds use vendored protoc from `protobuf-src`, while Windows and LanceDB dependency build scripts require a `protoc` binary on `PATH`. Normal CI uses no secrets.
+CI runs on Ubuntu, macOS, and Windows with Rust 1.94 installed through rustup. It runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`. The build expects a working C compiler toolchain. CI also installs `protoc` through `arduino/setup-protoc`; non-Windows local builds use vendored protoc from `protobuf-src`, while Windows and LanceDB dependency build scripts require a `protoc` binary on `PATH`. Normal CI uses no secrets.
 
 ```bash
 cargo fmt --all -- --check

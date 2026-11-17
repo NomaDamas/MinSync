@@ -2,7 +2,7 @@
 name = "minsync"
 version = "0.7.3"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.94"
 description = "Manifest-based incremental vector DB indexing CLI for text files"
 license = "MIT"
 repository = "https://github.com/NomaDamas/MinSync"
@@ -57,6 +57,10 @@ inl-core = "0.1.1"
 inl-text = "0.1.0"
 inl-sparse = "0.1.2"
 inl-server = { version = "0.3.1", default-features = false }
+# Apple Neural Engine engines (Core ML, macOS only; the package table and
+# layout code build everywhere): the default for the SPLADE encoder on Apple
+# silicon, opt-in (`device = "ane"`) for the dense embedders.
+inl-ane = "0.1.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `accelerate` routes CPU matmuls to Accelerate.framework (always present on

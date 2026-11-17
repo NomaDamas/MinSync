@@ -2,7 +2,7 @@
 name = "minsync-node"
 version = "0.7.3"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.94"
 description = "Node-API binding exposing MinSync's native embedder for in-process use"
 license = "MIT"
 repository = "https://github.com/NomaDamas/MinSync"
