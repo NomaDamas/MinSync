@@ -299,6 +299,7 @@ async fn throughput_by_device_and_dtype() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn sparse_cosine(a: &SparseVector, b: &SparseVector) -> f32 {
     a.dot(b) / (a.dot(a).sqrt() * b.dot(b).sqrt())
 }
