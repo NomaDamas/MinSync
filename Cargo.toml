@@ -1,6 +1,6 @@
 [package]
 name = "minsync"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 rust-version = "1.94"
 description = "Manifest-based incremental vector DB indexing CLI for text files"
