@@ -3400,9 +3400,9 @@ dependencies = [
 
 [[package]]
 name = "inl-ane"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82d4bfeb3697c04dfd5538426f3d90cc960fe7394a4357688b28aeb43544c82c"
+checksum = "0d70215e14bf042efe91524bd68d58d422c4c8ae4ac03748d7ac0f11addce5b1"
 dependencies = [
  "async-trait",
  "half",
@@ -3424,9 +3424,9 @@ dependencies = [
 
 [[package]]
 name = "inl-core"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "788f24af3a58167951bfac6c8a6324fe247e68dd14791d869e5d877435545605"
+checksum = "951097353e65ab36ec2774ba846b0c25094ce5e0f81a715e5ddbd21cf4084b20"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -3464,9 +3464,9 @@ dependencies = [
 
 [[package]]
 name = "inl-server"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eefefcb8f4bebc13c371342e8d6fad409c67745c66f9a5646a3ff8b6e4739cc1"
+checksum = "d020c20084ac825fa1c3f0c3d6e70b3079a7d2f2b344c32385375754cea7ccf5"
 dependencies = [
  "async-trait",
  "axum",
@@ -3504,9 +3504,9 @@ dependencies = [
 
 [[package]]
 name = "inl-text"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3480b6b60de8dbd99b8a9162cb874d4e0280ec61aa8c7d13a82f69ebcd6399e"
+checksum = "edfd45aeb2353aab24efce0e6ca8378008189b2b38cf298dbadc74846c062fde"
 dependencies = [
  "async-trait",
  "candle-core",

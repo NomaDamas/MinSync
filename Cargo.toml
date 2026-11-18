@@ -60,7 +60,7 @@ inl-server = { version = "0.3.1", default-features = false }
 # Apple Neural Engine engines (Core ML, macOS only; the package table and
 # layout code build everywhere): the default for the SPLADE encoder on Apple
 # silicon, opt-in (`device = "ane"`) for the dense embedders.
-inl-ane = "0.1.0"
+inl-ane = "0.1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `accelerate` routes CPU matmuls to Accelerate.framework (always present on
