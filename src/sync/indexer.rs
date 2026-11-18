@@ -3,9 +3,15 @@
 //! whole group to the store with one commit per kind of write.
 //!
 //! Per batch of N files the store sees exactly: one `existing_ids`, one
-//! `update` (reused chunks), one `insert_new` (new chunks), one stale-chunk
-//! sweep, and one delete for removed files. The cost of a LanceDB write is
-//! dominated by the commit, not the rows, so N files cost about what one did.
+//! `update` (reused chunks), one `insert_new` (new chunks), and one delete for
+//! removed files. The cost of a LanceDB write is dominated by the commit, not
+//! the rows, so N files cost about what one did.
+//!
+//! The stale-chunk sweep (an edited file's old rows) is NOT part of the batch:
+//! [`sweep_stale_rows`] runs after the batch's new rows have their sparse
+//! vectors. A file's old rows are the only ones a sparse query can still find
+//! until then, so sweeping them with the batch would leave the file out of
+//! every lexical search between the sweep and the encode.
 //!
 //! One bad file must not sink the run. With `[sync] on_file_error = "skip"`
 //! (the default) a file whose read, chunk, token-count, embed or store step
@@ -513,7 +519,6 @@ async fn commit(
         .collect();
     let mut chunks_deleted = 0;
     let truncated_total: usize = files.iter().map(|file| file.truncated).sum();
-    let indexed_paths: Vec<String> = files.iter().map(|file| file.item.path.clone()).collect();
 
     // One id-only existence check for the whole batch. Purged files skip it:
     // their rows are cleared before the insert, so every chunk is written new.
@@ -682,18 +687,8 @@ async fn commit(
             .map_err(&store_stage)?;
     }
 
-    // Stale chunks of every indexed file (content changed: old ids no longer
-    // carry this run's token) in one sweep, then removed files in one delete.
-    if !indexed_paths.is_empty() {
-        chunks_deleted += context
-            .store
-            .delete_by_filter(&Filter::And(vec![
-                Filter::Eq("source_id".to_string(), source_id.to_string()),
-                Filter::In("path".to_string(), indexed_paths),
-                Filter::Neq("seen_token".to_string(), context.sync_token.to_string()),
-            ]))
-            .map_err(&store_stage)?;
-    }
+    // A removed file's rows go with the batch: nothing replaces them. (An edited
+    // file's old rows stay until `sweep_stale_rows` runs, after its new rows are encoded.)
     if !delete_paths.is_empty() {
         chunks_deleted += context
             .store
@@ -706,6 +701,31 @@ async fn commit(
     result.chunks_deleted += chunks_deleted;
     result.chunks_truncated += truncated_total;
     Ok(())
+}
+
+/// Delete the old rows of files that were just re-indexed: rows of `paths` whose `seen_token`
+/// is not this run's. Returns how many rows went.
+///
+/// This is the second half of replacing an edited file. The first half (`index_batch`) adds
+/// the new rows; this one removes the old ones, and the caller runs it only once the new rows
+/// have their sparse vectors, so that at every instant between the two writes the file
+/// answers a sparse query with its old rows or its new ones, never with neither.
+///
+/// Idempotent, and safe to repeat after a crash: the old rows still carry the old token.
+pub(super) fn sweep_stale_rows(
+    store: &mut dyn VectorStore,
+    source_id: &str,
+    sync_token: &str,
+    paths: Vec<String>,
+) -> Result<usize> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    store.delete_by_filter(&Filter::And(vec![
+        Filter::Eq("source_id".to_string(), source_id.to_string()),
+        Filter::In("path".to_string(), paths),
+        Filter::Neq("seen_token".to_string(), sync_token.to_string()),
+    ]))
 }
 
 fn is_finite_embedding(embedding: &[f32]) -> bool {

@@ -19,7 +19,7 @@ use crate::sparse::SparseEncoder;
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
-use indexer::{index_batch, BatchItem, BatchKind, SyncFileContext};
+use indexer::{index_batch, sweep_stale_rows, BatchItem, BatchKind, SyncFileContext};
 use result::{change_path, empty_sync_result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -770,18 +770,11 @@ impl MinSync {
                 }
             }
 
-            // Phase two of the stage commit contract. The store commits of
-            // this batch have returned (`index_batch` above), and only now
-            // are completions made durable, so a recorded path is always safe
-            // to skip on resume. A crash right here repeats the batch, which
-            // is harmless because the commits are idempotent. One fsync for
-            // the whole batch. Failures are recorded as failures and never
-            // count as done, so a resumed run retries them.
-            journal.append(&completion_records(
-                group,
-                &result.files_failed[failed_before..],
-            ))?;
-
+            // An edited file is replaced in three steps, and a sparse query must find the file after
+            // each of them: (1) `index_batch` adds the new rows, (2) the sparse step gives them their
+            // vectors, (3) only then are the old rows swept. The old rows are the only ones a sparse
+            // query can find until step 2 is done, so sweeping them earlier (as part of the batch)
+            // dropped the file from every lexical search while its new rows waited to be encoded.
             if let Some(encoder) = &self.sparse {
                 let written: Vec<String> = group
                     .iter()
@@ -800,6 +793,36 @@ impl MinSync {
                     .await?;
                 }
             }
+
+            // A file whose new rows did not land keeps its old ones: they stay searchable until it
+            // succeeds. A sweep error aborts the run; nothing is journaled yet, so the next run redoes
+            // this batch and sweeps again (the old rows still carry the old token).
+            let failed_paths: HashSet<&str> = result.files_failed[failed_before..]
+                .iter()
+                .map(|failure| failure.path.as_str())
+                .collect();
+            let replaced: Vec<String> = group
+                .iter()
+                .filter(|(item, _)| {
+                    matches!(item.kind, BatchKind::Index)
+                        && !failed_paths.contains(item.path.as_str())
+                })
+                .map(|(item, _)| item.path.clone())
+                .collect();
+            result.chunks_deleted +=
+                sweep_stale_rows(store, &config.source_id, &sync_token, replaced)?;
+
+            // Phase two of the stage commit contract. The store commits of
+            // this batch have returned (`index_batch` and the sweep above), and only now
+            // are completions made durable, so a recorded path is always safe
+            // to skip on resume: a recorded file has no old rows left. A crash right here
+            // repeats the batch, which is harmless because the commits are idempotent. One
+            // fsync for the whole batch. Failures are recorded as failures and never
+            // count as done, so a resumed run retries them.
+            journal.append(&completion_records(
+                group,
+                &result.files_failed[failed_before..],
+            ))?;
 
             processed_this_run += take;
             since_checkpoint += take;
@@ -1912,6 +1935,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// What [`SpyStore`] asks after every write: does a sparse query for `query` still find a row of `path`?
+    struct SparseProbe {
+        model: &'static str,
+        query: crate::sparse::SparseVector,
+        path: &'static str,
+    }
+
     /// Wraps [`InMemoryStore`] to count write calls and inject a crash.
     #[derive(Default)]
     struct SpyStore {
@@ -1926,11 +1956,27 @@ mod tests {
         fail_upserts_after: Option<usize>,
         /// Fail any insert that carries a row for this path.
         poison_path: Option<String>,
+        /// Asks `query_sparse` after every write and records, per write, whether `probe.path` answered.
+        probe: Option<SparseProbe>,
+        probe_log: Vec<(&'static str, bool)>,
+        /// Make every `set_sparse` fail, as an encoder-side crash after the dense rows were written.
+        fail_set_sparse: bool,
     }
 
     impl SpyStore {
         fn checks(&self) -> usize {
             self.existing_ids_calls.load(Ordering::SeqCst)
+        }
+
+        fn probe_after(&mut self, write: &'static str) {
+            let Some(probe) = &self.probe else { return };
+            let found = self
+                .inner
+                .query_sparse(probe.model, &probe.query, None, 50)
+                .expect("probe query")
+                .iter()
+                .any(|hit| hit.path == probe.path);
+            self.probe_log.push((write, found));
         }
     }
 
@@ -1950,7 +1996,9 @@ mod tests {
                 return Err(MinSyncError::VectorStore("injected crash".into()));
             }
             self.upsert_calls += 1;
-            self.inner.upsert(docs)
+            let written = self.inner.upsert(docs);
+            self.probe_after("upsert");
+            written
         }
         fn insert_new(&mut self, docs: &[Document]) -> Result<()> {
             if self
@@ -1966,7 +2014,9 @@ mod tests {
             }
             self.upsert_calls += 1;
             self.insert_calls += 1;
-            self.inner.upsert(docs)
+            let written = self.inner.upsert(docs);
+            self.probe_after("insert_new");
+            written
         }
         fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
             self.existing_ids_calls.fetch_add(1, Ordering::SeqCst);
@@ -1974,14 +2024,18 @@ mod tests {
         }
         fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()> {
             self.update_batch_sizes.push(updates.len());
-            self.inner.update(updates)
+            let written = self.inner.update(updates);
+            self.probe_after("update");
+            written
         }
         fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
             self.inner.fetch(ids)
         }
         fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
             self.delete_calls += 1;
-            self.inner.delete_by_filter(filter)
+            let deleted = self.inner.delete_by_filter(filter);
+            self.probe_after("delete_by_filter");
+            deleted
         }
         fn query(
             &self,
@@ -2007,7 +2061,12 @@ mod tests {
             model: &str,
             rows: &[(String, crate::sparse::SparseVector)],
         ) -> Result<()> {
-            self.inner.set_sparse(model, rows)
+            if self.fail_set_sparse {
+                return Err(MinSyncError::VectorStore("injected sparse failure".into()));
+            }
+            let written = self.inner.set_sparse(model, rows);
+            self.probe_after("set_sparse");
+            written
         }
         fn fetch_sparse_by_content_hash(
             &self,
@@ -3467,6 +3526,88 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_an_edited_files_old_rows_keep_answering_sparse_queries_until_its_new_rows_are_encoded(
+    ) {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        init_sync(&sync);
+        let sync = sync.with_sparse_encoder(CountingSparse::new("m1"));
+        let mut store = SpyStore::default();
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first sync");
+
+        // The same five-letter term and every other word changed: the chunk gets a new id, so its old
+        // row is replaced rather than updated in place.
+        std::fs::write(dir.path().join("a.txt"), "alpha epsilon zeta").expect("edit a");
+        store.probe = Some(SparseProbe {
+            model: "m1",
+            query: crate::sparse::SparseVector::from_pairs([(5, 1.0)]),
+            path: "a.txt",
+        });
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("incremental sync");
+
+        assert!(
+            result.chunks_added > 0 && result.chunks_deleted > 0,
+            "the edit must replace a chunk (added {}, deleted {})",
+            result.chunks_added,
+            result.chunks_deleted
+        );
+        assert!(!store.probe_log.is_empty(), "the probe must have run");
+        assert!(
+            store.probe_log.iter().all(|(_, found)| *found),
+            "a sparse query lost the edited file between two writes: {:?}",
+            store.probe_log
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_run_stopped_after_an_edited_file_was_written_still_sweeps_its_old_rows_on_resume(
+    ) {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").expect("write a");
+        init_sync(&sync);
+        let sync = sync.with_sparse_encoder(CountingSparse::new("m1"));
+        let mut store = SpyStore::default();
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("first sync");
+
+        std::fs::write(dir.path().join("a.txt"), "alpha epsilon zeta").expect("edit a");
+        store.fail_set_sparse = true;
+        let error = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect_err("encoding the edited rows fails");
+        assert!(
+            error.to_string().contains("injected sparse failure"),
+            "{error}"
+        );
+
+        store.fail_set_sparse = false;
+        sync.sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("resumed sync");
+
+        let texts: Vec<String> = store
+            .inner
+            .documents()
+            .expect("documents")
+            .into_iter()
+            .map(|doc| doc.text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["alpha epsilon zeta".to_string()],
+            "no stale row may outlive the resumed run"
+        );
+        assert_eq!(store.count_missing_sparse("m1").unwrap(), 0);
     }
 
     #[tokio::test]
