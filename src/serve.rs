@@ -8,14 +8,15 @@
 //! model instance, and where its state directory lives.
 
 use crate::config::{EmbedderConfig, SparseConfig, DEFAULT_SPARSE_MAX_LENGTH};
-use crate::embedder::native::{minsync_cache_root, resolve_backend, Backend, DEFAULT_MAX_LENGTH};
+use crate::embedder::native::{resolve_backend, Backend, DEFAULT_MAX_LENGTH};
 use crate::error::{MinSyncError, Result};
-use inl_server::{EngineKind, InstanceKey};
-use std::path::PathBuf;
+use inl_server::{FoundInstance, InstanceKey};
+use std::path::{Path, PathBuf};
 
 pub use inl_server::{
-    loopback_client, parse_loopback_host, probe, start, start_sparse, Health, ServeOptions,
-    Started, DEFAULT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_INPUTS, DEFAULT_MAX_REQUEST_BYTES,
+    default_state_dir, loopback_client, parse_loopback_host, probe, start, start_sparse,
+    EngineKind, Health, ServeOptions, Started, DEFAULT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_INPUTS,
+    DEFAULT_MAX_REQUEST_BYTES,
 };
 
 /// Identity of a served dense model: everything that changes the vectors the
@@ -78,11 +79,49 @@ fn resolved_device(
     )
 }
 
-/// Default state directory for an instance:
-/// `~/.cache/minsync/serve/<instance>` (`%LOCALAPPDATA%\minsync\serve` on
-/// Windows).
-pub fn default_state_dir(instance: &str) -> PathBuf {
-    minsync_cache_root().join("serve").join(instance)
+/// The directory every launcher (`inl serve`, `minsync serve`) publishes its
+/// instance directories in: `<inl cache root>/serve`
+/// (`~/.cache/im-not-llm/serve`).
+pub fn serve_root() -> PathBuf {
+    inl_core::device::cache_root().join("serve")
+}
+
+/// A running server, started by any launcher, that serves `model` as `kind`
+/// and would produce the same vectors this workspace expects — whatever its
+/// instance key (which encodes device, dtype, attention and `max_length`, a
+/// key a consumer cannot rebuild for a server it did not start).
+///
+/// Adoption guard: `max_length` must equal the configured one, and a device
+/// or dtype the config pinned (not `auto`/`None`) must match. When the config
+/// leaves device/dtype to the engine, the server's own launcher picked them
+/// and the embedding space is the same, so it is adopted.
+pub async fn find_adoptable(
+    serve_root: &Path,
+    model: &str,
+    kind: EngineKind,
+    max_length: usize,
+    device: Option<&str>,
+    dtype: Option<&str>,
+) -> Option<FoundInstance> {
+    inl_server::find_instances(serve_root, model, kind)
+        .await
+        .into_iter()
+        .find(|found| {
+            let health = &found.health;
+            health.is_ready()
+                && health.max_length == max_length
+                && pinned(device).is_none_or(|want| health.device == want)
+                && pinned(dtype).is_none_or(|want| health.dtype == want)
+        })
+}
+
+/// The configured value when it pins a backend, else `None` (`auto` / unset
+/// leaves the choice to the engine).
+fn pinned(value: Option<&str>) -> Option<&str> {
+    match value {
+        Some(value) if !value.eq_ignore_ascii_case("auto") => Some(value),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -195,8 +234,193 @@ mod tests {
     }
 
     #[test]
-    fn state_lives_under_the_minsync_cache() {
+    fn state_lives_under_the_im_not_llm_cache() {
         let dir = default_state_dir("inst-1");
-        assert!(dir.ends_with("minsync/serve/inst-1"), "{}", dir.display());
+        assert!(
+            dir.ends_with("im-not-llm/serve/inst-1"),
+            "{}",
+            dir.display()
+        );
+    }
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn health_json(
+        server: &MockServer,
+        instance: &str,
+        kind: &str,
+        model: &str,
+        max_length: usize,
+        device: &str,
+        dtype: &str,
+    ) -> serde_json::Value {
+        let addr = server.address();
+        serde_json::json!({
+            "status": "ok", "kind": kind, "model_id": model, "dimension": 2,
+            "dtype": dtype, "device": device, "attention": "auto", "max_length": max_length,
+            "max_inputs": 512, "instance": instance, "pid": 1,
+            "host": addr.ip().to_string(), "port": addr.port(),
+            "url": format!("http://{addr}"), "uptime_seconds": 1, "requests_total": 0,
+            "loaded": true, "build": {"version": "test", "features": []}, "version": "test",
+        })
+    }
+
+    /// A serve root with one live server published under `instance`, as
+    /// another launcher would leave it.
+    async fn published(
+        instance: &str,
+        kind: &str,
+        model: &str,
+        max_length: usize,
+        device: &str,
+        dtype: &str,
+    ) -> (MockServer, tempfile::TempDir) {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(health_json(
+                &server, instance, kind, model, max_length, device, dtype,
+            )))
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(instance);
+        std::fs::create_dir_all(&dir).unwrap();
+        let addr = server.address();
+        std::fs::write(dir.join("host"), format!("{}\n", addr.ip())).unwrap();
+        std::fs::write(dir.join("port"), format!("{}\n", addr.port())).unwrap();
+        (server, root)
+    }
+
+    /// A server another launcher started (a foreign instance key) is adopted
+    /// by `(kind, model)` alone.
+    #[tokio::test]
+    async fn a_foreign_launchers_server_is_adoptable_by_kind_and_model() {
+        let (_server, root) = published(
+            "Qwen3-metal-f16-abc",
+            "dense",
+            "org/model",
+            2048,
+            "metal",
+            "f16",
+        )
+        .await;
+        let found = find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(found.unwrap().health.instance, "Qwen3-metal-f16-abc");
+    }
+
+    /// A server whose vectors would differ (another `max_length`, or a device
+    /// or dtype the config pinned) is not adopted; `auto` is not a pin.
+    #[tokio::test]
+    async fn adoption_is_refused_when_the_workspace_would_produce_other_vectors() {
+        // max_length differs.
+        let (_s, root) = published("inst", "dense", "org/model", 512, "metal", "f16").await;
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            None,
+            None
+        )
+        .await
+        .is_none());
+
+        // A pinned device must match; an agreeing one is adopted.
+        let (_s, root) = published("inst", "dense", "org/model", 2048, "ane", "f16").await;
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            Some("metal"),
+            None
+        )
+        .await
+        .is_none());
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            Some("ane"),
+            None
+        )
+        .await
+        .is_some());
+
+        // A pinned dtype must match.
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            None,
+            Some("f32")
+        )
+        .await
+        .is_none());
+        // `auto` pins nothing.
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            Some("auto"),
+            Some("auto")
+        )
+        .await
+        .is_some());
+
+        // Another model or kind never matches.
+        assert!(find_adoptable(
+            root.path(),
+            "org/other",
+            EngineKind::Dense,
+            2048,
+            None,
+            None
+        )
+        .await
+        .is_none());
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Sparse,
+            2048,
+            None,
+            None
+        )
+        .await
+        .is_none());
+    }
+
+    /// A directory left by a crashed server (nothing listens) is skipped.
+    #[tokio::test]
+    async fn a_stale_instance_directory_with_nothing_listening_is_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dead");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("host"), "127.0.0.1\n").unwrap();
+        std::fs::write(dir.join("port"), "1\n").unwrap();
+        assert!(find_adoptable(
+            root.path(),
+            "org/model",
+            EngineKind::Dense,
+            2048,
+            None,
+            None
+        )
+        .await
+        .is_none());
     }
 }

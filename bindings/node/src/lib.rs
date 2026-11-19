@@ -93,7 +93,7 @@ pub struct EmbedderOptions {
     /// Per-forward-pass deadline; overrides `timeoutSeconds` and the CPU floor.
     pub per_batch_timeout_seconds: Option<u32>,
     /// Model cache directory. Without it `HF_HOME`, then
-    /// `FASTEMBED_CACHE_DIR`, then `~/.cache/minsync/models`, as the CLI.
+    /// `INL_CACHE_DIR`, then `~/.cache/im-not-llm/models`, as the CLI.
     pub model_cache_dir: Option<String>,
     /// Release the model after this many idle seconds; it reloads on the next
     /// call. Default: stay resident until `unload()` / `dispose()`.

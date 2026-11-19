@@ -729,23 +729,60 @@ async fn serve(
     args: ServeArgs,
 ) -> Result<i32> {
     let host = crate::serve::parse_loopback_host(&args.host)?;
-    // Dense and sparse servers differ only in the engine and the identity of
-    // the model instance; everything after that is shared.
-    let (instance, query_prefix, passage_prefix) = if args.sparse {
+    let kind = if args.sparse {
+        crate::serve::EngineKind::Sparse
+    } else {
+        crate::serve::EngineKind::Dense
+    };
+    // Dense and sparse servers differ only in the engine, the identity of the
+    // model instance and which section names the model; everything after that
+    // is shared.
+    let (instance, query_prefix, passage_prefix, model, max_length, device, dtype) = if args.sparse
+    {
         let settings = serve_sparse_settings(minsync_dir, args.embedder.clone())?;
         (
             crate::serve::sparse_instance_key(&settings)?,
-            settings.query_prefix,
-            settings.passage_prefix,
+            settings.query_prefix.clone(),
+            settings.passage_prefix.clone(),
+            crate::embedder::native::parse_native_model_id(&settings.id)?.to_string(),
+            settings
+                .max_length
+                .unwrap_or(crate::config::DEFAULT_SPARSE_MAX_LENGTH),
+            settings.device.clone(),
+            settings.dtype.clone(),
         )
     } else {
         let settings = serve_settings(minsync_dir, args.embedder.clone())?;
         (
             crate::serve::instance_key(&settings)?,
-            settings.query_prefix,
-            settings.passage_prefix,
+            settings.query_prefix.clone(),
+            settings.passage_prefix.clone(),
+            crate::embedder::native::parse_native_model_id(&settings.id)?.to_string(),
+            settings
+                .max_length
+                .unwrap_or(crate::embedder::native::DEFAULT_MAX_LENGTH),
+            settings.device.clone(),
+            settings.dtype.clone(),
         )
     };
+    // Another launcher (`inl serve`, another `minsync serve`) may already run
+    // a server for this `(kind, model)` that would produce the same vectors;
+    // adopt it instead of loading a second copy. Its instance key encodes a
+    // device/dtype this workspace did not choose, so discovery is by
+    // `(kind, model)` plus the guard in `find_adoptable`.
+    if let Some(found) = crate::serve::find_adoptable(
+        &crate::serve::serve_root(),
+        &model,
+        kind,
+        max_length,
+        device.as_deref(),
+        dtype.as_deref(),
+    )
+    .await
+    {
+        print_event(format, "adopted", &found.health, &found.state_dir)?;
+        return Ok(0);
+    }
     let options = crate::serve::ServeOptions {
         host,
         port: args.port,
@@ -762,28 +799,6 @@ async fn serve(
         passage_prefix,
     };
     let state_dir = options.state_dir.clone();
-    let print = |event: &str, health: &crate::serve::Health| -> Result<()> {
-        match format {
-            OutputFormat::Json => {
-                let mut value = serde_json::to_value(health)?;
-                value["event"] = serde_json::Value::from(event);
-                value["state_dir"] = serde_json::Value::from(state_dir.display().to_string());
-                println!("{}", serde_json::to_string(&value)?);
-            }
-            OutputFormat::Text => println!(
-                "{event}: {} on {} ({} dims, {}, {}, pid {}); state {}",
-                health.model_id,
-                health.url,
-                health.dimension,
-                health.device,
-                health.dtype,
-                health.pid,
-                state_dir.display()
-            ),
-        }
-        std::io::stdout().flush()?;
-        Ok(())
-    };
     let started = if args.sparse {
         let settings = serve_sparse_settings(minsync_dir, args.embedder)?;
         let engine = crate::sparse::native::NativeSparseEncoder::from_config(&settings)?;
@@ -795,15 +810,44 @@ async fn serve(
     };
     let server = match started {
         crate::serve::Started::Adopted(health) => {
-            print("adopted", &health)?;
+            print_event(format, "adopted", &health, &state_dir)?;
             return Ok(0);
         }
         crate::serve::Started::Serving(server) => server,
     };
-    print("serving", &server.health())?;
+    print_event(format, "serving", &server.health(), &state_dir)?;
     let reason = server.run_until(shutdown_signal()).await?;
     tracing::info!(reason = reason.as_str(), "minsync serve stopped");
     Ok(reason.exit_code())
+}
+
+/// Print a `serving` / `adopted` event in the CLI's output format.
+fn print_event(
+    format: &OutputFormat,
+    event: &str,
+    health: &crate::serve::Health,
+    state_dir: &std::path::Path,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            let mut value = serde_json::to_value(health)?;
+            value["event"] = serde_json::Value::from(event);
+            value["state_dir"] = serde_json::Value::from(state_dir.display().to_string());
+            println!("{}", serde_json::to_string(&value)?);
+        }
+        OutputFormat::Text => println!(
+            "{event}: {} on {} ({} dims, {}, {}, pid {}); state {}",
+            health.model_id,
+            health.url,
+            health.dimension,
+            health.device,
+            health.dtype,
+            health.pid,
+            state_dir.display()
+        ),
+    }
+    std::io::stdout().flush()?;
+    Ok(())
 }
 
 /// SIGTERM or Ctrl-C.

@@ -122,7 +122,7 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/minsync/models
+          path: ~/.cache/im-not-llm/models
           key: qwen3-embedding-0.6b-v1
 
       - working-directory: bindings/node

@@ -31,7 +31,7 @@ If the backend has asynchronous APIs, hide that behind a synchronous `VectorStor
 
 Current provider prefixes:
 
-- `native:` for in-process embeddings. The models live in [im-not-llm](https://github.com/NomaDamas/im-not-llm) (`inl-text`); `src/embedder/native.rs` only maps `[embedder]` settings onto its options.
+- `native:` for in-process embeddings. The models live in [im-not-llm](https://github.com/NomaDamas/im-not-llm) (`inl-text`); `src/embedder/native.rs` only maps `[embedder]` settings onto its options. Weights are cached in im-not-llm's shared root (`inl_core::device::model_cache_dir`, `~/.cache/im-not-llm/models` unless `model_cache_dir` or `INL_CACHE_DIR` override it), and a `native:` workspace prefers a running server of the same `(kind, model)` published under `inl_core::device::cache_root()/serve` — whether `minsync serve` or `inl serve` started it (`src/serve.rs::find_adoptable`); `MINSYNC_SERVER=off` opts out.
 - `openai:` for OpenAI-compatible embeddings.
 - `tei:` for Hugging Face Text Embeddings Inference.
 
