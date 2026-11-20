@@ -76,7 +76,7 @@ In-process Qwen3 (default, no API key, no TEI server):
 minsync init
 ```
 
-The default config uses `native:Qwen/Qwen3-Embedding-0.6B` with `dimension = 1024` and empty prefixes. The first embedding call downloads the model into `~/.cache/minsync/models`.
+The default config uses `native:Qwen/Qwen3-Embedding-0.6B` with `dimension = 1024` and empty prefixes. The first embedding call downloads the model into im-not-llm's shared cache, `~/.cache/im-not-llm/models` (override with `INL_CACHE_DIR`).
 
 Local TEI EmbeddingGemma:
 
@@ -119,7 +119,7 @@ MinSync also supports learned-sparse (SPLADE) retrieval, independent of the dens
 
 - `native:` runs the ModernBERT + SPLADE model in-process on candle (no Python, no ONNX runtime); the weights (299 MB) download from Hugging Face on first use and are held in memory as f32 (about 600 MB).
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse` at `base_url`.
-- A running `minsync serve --sparse` is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
+- A running sparse server — another `minsync serve --sparse` or an `inl serve --sparse` from im-not-llm, published under the shared `~/.cache/im-not-llm/serve` root — is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
 Select the mode per query:
 

@@ -24,6 +24,14 @@ pub struct ServedSparseEncoder {
     passage_prefix: Option<String>,
     batch_size: usize,
     timeout: Duration,
+    /// The model this client serves, for `(kind, model)` adoption of a server
+    /// another launcher (`inl serve --sparse`, another `minsync serve
+    /// --sparse`) started.
+    model: String,
+    max_length: usize,
+    device: Option<String>,
+    dtype: Option<String>,
+    serve_root: PathBuf,
     remote: OnceCell<Option<Remote>>,
     gone: AtomicBool,
 }
@@ -64,9 +72,36 @@ impl ServedSparseEncoder {
             passage_prefix,
             batch_size: batch_size.max(1),
             timeout,
+            model: String::new(),
+            max_length: 0,
+            device: None,
+            dtype: None,
+            serve_root: crate::serve::serve_root(),
             remote: OnceCell::new(),
             gone: AtomicBool::new(false),
         }
+    }
+
+    /// Identify the model this client serves, for `(kind, model)` adoption of
+    /// a server some other launcher started.
+    pub fn with_target(
+        mut self,
+        model: String,
+        max_length: usize,
+        device: Option<String>,
+        dtype: Option<String>,
+    ) -> Self {
+        self.model = model;
+        self.max_length = max_length;
+        self.device = device;
+        self.dtype = dtype;
+        self
+    }
+
+    /// Override the discovery root (tests use a private one).
+    pub fn with_serve_root(mut self, serve_root: PathBuf) -> Self {
+        self.serve_root = serve_root;
+        self
     }
 
     /// The in-process engine for `settings`, preferring a running server.
@@ -85,6 +120,14 @@ impl ServedSparseEncoder {
             settings.passage_prefix.clone(),
             settings.batch_size,
             Duration::from_secs(pass),
+        )
+        .with_target(
+            crate::embedder::native::parse_native_model_id(&settings.id)?.to_string(),
+            settings
+                .max_length
+                .unwrap_or(crate::config::DEFAULT_SPARSE_MAX_LENGTH),
+            settings.device.clone(),
+            settings.dtype.clone(),
         ))
     }
 
@@ -94,7 +137,13 @@ impl ServedSparseEncoder {
         }
         self.remote
             .get_or_init(|| async {
-                let health = crate::serve::probe(&self.state_dir, &self.instance).await?;
+                let health = match crate::serve::probe(&self.state_dir, &self.instance).await {
+                    Some(health) => health,
+                    // This workspace's own instance is not running; a server
+                    // another launcher started for the same `(kind, model)`
+                    // may be, and its vectors are the same.
+                    None => self.adopted_health().await?,
+                };
                 if health.kind != "sparse" {
                     return None;
                 }
@@ -108,6 +157,24 @@ impl ServedSparseEncoder {
             })
             .await
             .as_ref()
+    }
+
+    /// Health of a running sparse server some other launcher started for this
+    /// model, when one would produce the same vectors.
+    async fn adopted_health(&self) -> Option<crate::serve::Health> {
+        if self.model.is_empty() {
+            return None;
+        }
+        crate::serve::find_adoptable(
+            &self.serve_root,
+            &self.model,
+            crate::serve::EngineKind::Sparse,
+            self.max_length,
+            self.device.as_deref(),
+            self.dtype.as_deref(),
+        )
+        .await
+        .map(|found| found.health)
     }
 
     /// Encode `inputs` (already prefixed) through the server, or `None` when
@@ -440,6 +507,32 @@ mod tests {
         let encoder = served(&local, empty.path());
         assert_eq!(encoder.encode_query("x").await.unwrap().indices(), &[998]);
         assert_eq!(local.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A sparse server another launcher started (a foreign instance key) is
+    /// used: the workspace's own instance is not running, but the same model
+    /// is.
+    #[tokio::test]
+    async fn a_foreign_launchers_sparse_server_is_adopted_by_kind_and_model() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, dir) = serving("Foreign-Key-xyz", "sparse", 512).await;
+        let published = root.path().join("Foreign-Key-xyz");
+        std::fs::create_dir_all(&published).unwrap();
+        std::fs::copy(dir.path().join("host"), published.join("host")).unwrap();
+        std::fs::copy(dir.path().join("port"), published.join("port")).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/embed_sparse"))
+            .respond_with(Tei)
+            .mount(&server)
+            .await;
+
+        let local = Local::default();
+        let own = tempfile::tempdir().unwrap();
+        let encoder = served(&local, own.path())
+            .with_target("Fake/Sparse".to_string(), 2048, None, None)
+            .with_serve_root(root.path().to_path_buf());
+        assert_eq!(encoder.encode_query("q").await.unwrap().values()[0], 4.0);
+        assert_eq!(local.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

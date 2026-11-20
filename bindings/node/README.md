@@ -83,7 +83,7 @@ Inference runs on a native thread pool; the JS event loop is never blocked.
 ### Cache and environment
 
 The weights are resolved exactly as the CLI does, so both share one copy and can run side by side:
-`modelCacheDir`, else `HF_HOME`, else `FASTEMBED_CACHE_DIR`, else `~/.cache/minsync/models` (`%LOCALAPPDATA%\minsync\models`
+`modelCacheDir`, else `HF_HOME`, else `INL_CACHE_DIR`, else `~/.cache/im-not-llm/models` (`%LOCALAPPDATA%\im-not-llm\models`
 on Windows). `HF_ENDPOINT` and `HF_TOKEN` are honoured. They are read from the process environment when a load starts,
 so set them (`process.env`) before the first call.
 

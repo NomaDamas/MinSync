@@ -75,31 +75,13 @@ pub(crate) fn parse_native_model_id(id: &str) -> Result<&str> {
     Ok(model)
 }
 
-/// `~/.cache/minsync` (`%LOCALAPPDATA%\minsync` on Windows).
-pub fn minsync_cache_root() -> PathBuf {
-    #[cfg(windows)]
-    {
-        let root = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(root).join("minsync")
-    }
-    #[cfg(not(windows))]
-    {
-        let root = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(root).join(".cache").join("minsync")
-    }
-}
-
 /// Where model files are cached: the configured `model_cache_dir`, else
-/// `FASTEMBED_CACHE_DIR` (the name earlier releases documented), else
-/// `~/.cache/minsync/models`. `HF_HOME`, when set, still wins inside the hub
-/// client, as it always has.
+/// im-not-llm's `INL_CACHE_DIR`, else `<cache root>/models`
+/// (`~/.cache/im-not-llm/models`). The directory is the one `inl serve`
+/// uses, so MinSync and the daemon share a single weight cache. `HF_HOME`,
+/// when set, still wins inside the hub client, as it always has.
 pub(crate) fn model_cache_dir(configured: Option<&str>) -> PathBuf {
-    match configured {
-        Some(dir) => PathBuf::from(dir),
-        None => std::env::var_os("FASTEMBED_CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| minsync_cache_root().join("models")),
-    }
+    inl_core::device::model_cache_dir(configured.map(std::path::Path::new))
 }
 
 /// The engine options `settings` describes.
@@ -358,23 +340,24 @@ mod tests {
         assert!(NativeEmbedder::from_config(&settings).is_err());
     }
 
-    /// The cache directory is `model_cache_dir`, then `FASTEMBED_CACHE_DIR`,
-    /// then `~/.cache/minsync/models`: the order earlier releases documented.
+    /// The cache directory is `model_cache_dir`, then im-not-llm's
+    /// `INL_CACHE_DIR`, then `<inl cache root>/models`: the same precedence
+    /// `inl serve` uses, so MinSync and the daemon share one weight cache.
     #[test]
-    fn cache_dir_precedence_is_config_then_env_then_default() {
+    fn cache_dir_precedence_is_config_then_inl_env_then_default() {
         // One test owns the env var: tests in a binary share the process.
-        let saved = std::env::var_os("FASTEMBED_CACHE_DIR");
-        std::env::set_var("FASTEMBED_CACHE_DIR", "/from/env");
+        let saved = std::env::var_os(inl_core::device::CACHE_DIR_ENV);
+        std::env::set_var(inl_core::device::CACHE_DIR_ENV, "/from/env");
         assert_eq!(model_cache_dir(Some("/cfg")), PathBuf::from("/cfg"));
         assert_eq!(model_cache_dir(None), PathBuf::from("/from/env"));
-        std::env::remove_var("FASTEMBED_CACHE_DIR");
+        std::env::remove_var(inl_core::device::CACHE_DIR_ENV);
         assert_eq!(
             model_cache_dir(None),
-            minsync_cache_root().join("models"),
+            inl_core::device::cache_root().join("models"),
             "default location"
         );
         if let Some(saved) = saved {
-            std::env::set_var("FASTEMBED_CACHE_DIR", saved);
+            std::env::set_var(inl_core::device::CACHE_DIR_ENV, saved);
         }
     }
 }
