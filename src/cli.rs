@@ -139,11 +139,12 @@ pub enum Commands {
         /// addresses are rejected because the server has no authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// TCP port; 0 picks a free one (written to the `port` file).
+        /// TCP port. 0 (the default) reuses the port this instance served on last
+        /// time and otherwise picks a free one (written to the `port` file).
         #[arg(long, default_value_t = 0)]
         port: u16,
         /// Seconds without an embedding request before the server exits and
-        /// frees the model; 0 serves until stopped.
+        /// frees the model. The default, 0, serves until stopped.
         #[arg(long, default_value_t = crate::serve::DEFAULT_IDLE_TIMEOUT_SECONDS)]
         idle_timeout: u64,
         /// Most inputs accepted in one request (larger requests get 413).
@@ -202,6 +203,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `minsync serve` stays up until stopped unless `--idle-timeout` is given, like `inl serve`.
+    #[test]
+    fn serve_has_no_idle_timeout_by_default() {
+        let cli = Cli::try_parse_from(["minsync", "serve"]).expect("serve parses");
+        let Commands::Serve { idle_timeout, .. } = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(idle_timeout, 0);
+        assert_eq!(crate::serve::idle_timeout_from_seconds(idle_timeout), None);
+        let cli = Cli::try_parse_from(["minsync", "serve", "--idle-timeout", "90"]).unwrap();
+        let Commands::Serve { idle_timeout, .. } = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(
+            crate::serve::idle_timeout_from_seconds(idle_timeout),
+            Some(std::time::Duration::from_secs(90))
+        );
     }
 
     #[test]

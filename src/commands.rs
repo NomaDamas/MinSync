@@ -786,8 +786,7 @@ async fn serve(
     let options = crate::serve::ServeOptions {
         host,
         port: args.port,
-        idle_timeout: (args.idle_timeout > 0)
-            .then(|| std::time::Duration::from_secs(args.idle_timeout)),
+        idle_timeout: crate::serve::idle_timeout_from_seconds(args.idle_timeout),
         max_inputs: args.max_inputs.max(1),
         max_request_bytes: args.max_request_bytes.max(1),
         state_dir: args
