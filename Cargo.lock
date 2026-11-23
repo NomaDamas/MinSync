@@ -3464,14 +3464,15 @@ dependencies = [
 
 [[package]]
 name = "inl-server"
-version = "0.3.2"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d020c20084ac825fa1c3f0c3d6e70b3079a7d2f2b344c32385375754cea7ccf5"
+checksum = "b458514ac3fa7b14d8f90e1c9d82ac15fab2f99acbf3d63a7f7a29d66adbe56f"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "fs2",
+ "http-body-util",
  "inl-core",
  "inl-late",
  "inl-sparse",

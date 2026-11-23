@@ -14,9 +14,9 @@ use inl_server::{FoundInstance, InstanceKey};
 use std::path::{Path, PathBuf};
 
 pub use inl_server::{
-    default_state_dir, loopback_client, parse_loopback_host, probe, start, start_sparse,
-    EngineKind, Health, ServeOptions, Started, DEFAULT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_INPUTS,
-    DEFAULT_MAX_REQUEST_BYTES,
+    default_state_dir, idle_timeout_from_seconds, loopback_client, parse_loopback_host, probe,
+    start, start_sparse, EngineKind, Health, ServeOptions, Started, DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_MAX_INPUTS, DEFAULT_MAX_REQUEST_BYTES,
 };
 
 /// Identity of a served dense model: everything that changes the vectors the

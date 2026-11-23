@@ -56,7 +56,7 @@ parking_lot = "0.12"
 inl-core = "0.1.1"
 inl-text = "0.1.0"
 inl-sparse = "0.1.2"
-inl-server = { version = "0.3.1", default-features = false }
+inl-server = { version = "0.3.4", default-features = false }
 # Apple Neural Engine engines (Core ML, macOS only; the package table and
 # layout code build everywhere): the default for the SPLADE encoder on Apple
 # silicon, opt-in (`device = "ane"`) for the dense embedders.

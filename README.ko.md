@@ -684,9 +684,9 @@ minsync serve --port 8089 --idle-timeout 600
 - 같은 텍스트·device·dtype이면 in-process `native:`와 같은 vector를 돌려줍니다. 요청은 `sync`와 같은 batch planner, padded-token 상한, pass별 deadline을 거칩니다.
 - Prefix는 호출자가 붙입니다. 두 endpoint 모두 `"input_type": "query" | "passage"`를 받으면 설정된 `query_prefix` / `passage_prefix`를 붙입니다.
 - 모델 context를 넘는 입력은 `truncate: true`(TEI)가 아니면 `413`입니다. `--max-inputs`(기본 512)개 초과 입력이나 `--max-request-bytes`(기본 32 MiB) 초과 body도 `413`, 잘못된 JSON은 `400`/`422`입니다. forward pass가 deadline을 넘기면 `503`을 돌려주고 서버는 exit code 7로 종료합니다(멈춘 thread가 모델을 잡고 있기 때문).
-- 인증이 없으므로 `127.0.0.1`(또는 `::1`)에만 bind하고 다른 `--host`는 거부합니다. `--port 0`(기본)은 빈 port를 고릅니다.
+- 인증이 없으므로 `127.0.0.1`(또는 `::1`)에만 bind하고 다른 `--host`는 거부합니다. `--port 0`(기본)은 이 instance가 마지막에 쓴 port(discovery 파일 옆의 `preferred_port`에 저장되어 정상 종료나 crash 뒤에도 남습니다)로 돌아오고, 그 port가 사용 중일 때만 빈 port를 고릅니다. 다른 도구의 설정에 적어 둔 URL이 재시작 뒤에도 유지됩니다. 직접 지정한 `--port`는 비어 있어야 합니다.
 - `pid`, `host`, `port` 파일은 `<inl cache root>/serve/<instance>/` — `~/.cache/im-not-llm/serve/…`(Windows는 `%LOCALAPPDATA%\im-not-llm\serve\…`), `inl serve`와 같은 root — 에 있습니다(`--state-dir`로 변경). launcher(`minsync serve` 또는 `inl serve`)는 같은 `(kind, model)`이고 `max_length`(그리고 config가 device/dtype을 고정했다면 그것도)가 맞는 서버를 찾으면 모델을 로드하지 않고 실행 중인 서버를 출력(`--format json`이면 `"event": "adopted"`, 텍스트면 `adopted: …`)한 뒤 종료합니다.
-- `--idle-timeout`초(기본 300, `0`은 비활성) 동안 embedding 요청이 없으면 종료하고 모델을 해제합니다. `SIGTERM`/Ctrl-C도 정상 종료하며, 두 경우 모두 discovery 파일을 지웁니다.
+- 서버는 중지(`SIGTERM`/Ctrl-C, `inl stop`)할 때까지 계속 실행됩니다. `--idle-timeout` 기본값은 0이며, `--idle-timeout N`을 주면 N초 동안 embedding 요청이 없을 때 종료하고 모델을 해제합니다. 0.7.6 이전의 기본값은 300이었습니다. `SIGTERM`/Ctrl-C도 정상 종료하며, 두 경우 모두 discovery 파일을 지웁니다.
 
 `native:` workspace는 실행 중인 서버를 자동으로 사용합니다. `sync`, `query`, `check`, `verify`, `watch`는 첫 embedding 호출 때 공유 root `<inl cache root>/serve` 아래에서 같은 `(kind, model)` 서버 — `minsync serve`(`serve --sparse`) *또는* [im-not-llm](https://github.com/NomaDamas/im-not-llm)의 `inl serve` — 를 찾아 텍스트를 서버로 보냅니다(workspace prefix 적용, in-process 엔진처럼 `max_length`에서 truncate). `max_length`가 다르거나 config에 명시한 device/dtype과 다른 서버는 쓰지 않습니다. 서버가 없거나 응답을 멈추면 이전처럼 in-process로 embedding합니다. M 시리즈 Mac에서 warm 서버는 `query`를 약 2.3 s / 2.4 GB에서 약 0.22 s / 59 MB로 줄입니다. `MINSYNC_SERVER=off`면 항상 in-process로 embedding합니다. 서버가 발견되려면 기본 root에 publish해야 합니다(별도 `--state-dir`은 발견되지 않음).
 
