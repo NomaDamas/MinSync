@@ -61,15 +61,12 @@ fn init_accepts_sparse_and_language_flags() {
 }
 
 #[test]
-fn query_accepts_all_modes() {
+fn query_accepts_all_modes_and_independent_retriever_toggles() {
     for (mode, expected) in [
         ("vector", QueryMode::Vector),
         ("sparse", QueryMode::Sparse),
         ("bm25", QueryMode::Bm25),
         ("hybrid", QueryMode::Hybrid),
-        ("vector-bm25", QueryMode::VectorBm25),
-        ("sparse-bm25", QueryMode::SparseBm25),
-        ("all", QueryMode::All),
     ] {
         let cli = Cli::try_parse_from(["minsync", "query", "alpha", "--mode", mode])
             .expect("query mode should parse");
@@ -80,6 +77,43 @@ fn query_accepts_all_modes() {
             }
             _ => panic!("expected query command"),
         }
+    }
+
+    // Independent on/off toggles for all 3 retrievers.
+    let cli = Cli::try_parse_from([
+        "minsync", "query", "alpha", "--vector", "--sparse", "--bm25",
+    ])
+    .expect("all three toggles should parse");
+    match cli.command {
+        Commands::Query {
+            vector,
+            sparse,
+            bm25,
+            mode,
+            ..
+        } => {
+            assert_eq!(vector, Some(true));
+            assert_eq!(sparse, Some(true));
+            assert_eq!(bm25, Some(true));
+            assert!(mode.is_none());
+        }
+        _ => panic!("expected query command"),
+    }
+
+    let neg = Cli::try_parse_from(["minsync", "query", "alpha", "--sparse=false"])
+        .expect("negative toggle should parse");
+    match neg.command {
+        Commands::Query {
+            vector,
+            sparse,
+            bm25,
+            ..
+        } => {
+            assert_eq!(vector, None);
+            assert_eq!(sparse, Some(false));
+            assert_eq!(bm25, None);
+        }
+        _ => panic!("expected query command"),
     }
 }
 

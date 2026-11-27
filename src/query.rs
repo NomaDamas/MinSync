@@ -1,4 +1,4 @@
-use crate::cli::QueryMode;
+use crate::cli::{QueryMode, Retrievers};
 use crate::config::Config;
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
@@ -44,22 +44,9 @@ fn refuse_if_changed(
     }
 }
 
-/// Search the index.
-///
-/// Single-retriever modes:
-/// - `vector`: dense embedding search
-/// - `sparse`: learned-sparse (SPLADE) search
-/// - `bm25`: Okapi BM25 lexical search (via compressed on-disk inverted index)
-///
-/// Multi-retriever RRF fusion modes (each result also carries per-retriever
-/// `*_rank` and raw `*_score` features for downstream LTR reranking):
-/// - `hybrid`: `vector` + `sparse`
-/// - `vector-bm25`: `vector` + `bm25`
-/// - `sparse-bm25`: `sparse` + `bm25`
-/// - `all`: `vector` + `sparse` + `bm25`
-///
-/// A mode whose required retriever is missing is an error, never a silent
-/// fallback to another retriever.
+/// Search the index using a legacy [`QueryMode`] shorthand.
+/// See [`query_with_retrievers`] for arbitrary on/off combinations of
+/// `vector`, `sparse`, and `bm25`.
 #[allow(clippy::too_many_arguments)]
 pub async fn query(
     minsync_dir: &Path,
@@ -71,13 +58,52 @@ pub async fn query(
     filter_expr: Option<&str>,
     mode: QueryMode,
 ) -> Result<Vec<QueryResult>> {
+    query_with_retrievers(
+        minsync_dir,
+        text,
+        k,
+        embedder,
+        encoder,
+        store,
+        filter_expr,
+        mode.to_retrievers(),
+    )
+    .await
+}
+
+/// Search the index with any non-empty subset of `{vector, sparse, bm25}`
+/// toggled on independently.
+///
+/// - When a single retriever is active, results carry its raw score directly.
+/// - When two or more retrievers are active, results are combined via
+///   reciprocal rank fusion (RRF, k=60) and also report every active
+///   retriever's individual `*_rank` and raw `*_score` for downstream LTR
+///   reranking.
+/// - A requested retriever that is unavailable is an error, never a silent
+///   fallback to another retriever.
+#[allow(clippy::too_many_arguments)]
+pub async fn query_with_retrievers(
+    minsync_dir: &Path,
+    text: &str,
+    k: usize,
+    embedder: &dyn Embedder,
+    encoder: Option<&dyn SparseEncoder>,
+    store: &dyn VectorStore,
+    filter_expr: Option<&str>,
+    retrievers: Retrievers,
+) -> Result<Vec<QueryResult>> {
     if text.trim().is_empty() {
         return Err(MinSyncError::EmptyQuery);
+    }
+    if retrievers.count() == 0 {
+        return Err(MinSyncError::Config(
+            "at least one retriever (--vector, --sparse, or --bm25) must be enabled".into(),
+        ));
     }
 
     let config = Config::load(&minsync_dir.join("config.toml"))?;
     let index = IndexedBy::load(minsync_dir, &config)?;
-    if mode.uses_vector() {
+    if retrievers.vector {
         ensure_dense_matches_embedder(minsync_dir, &config, embedder)?;
     }
 
@@ -96,32 +122,46 @@ pub async fn query(
     let filter = Filter::And(std::mem::take(&mut filters));
     let index_state = store.index_state()?;
     let bm25_lang = config.bm25.language.as_str();
-    let candidate_k = k.saturating_mul(4).max(k);
+    let multi = retrievers.count() > 1;
+    let fetch_k = if multi { k.saturating_mul(4).max(k) } else { k };
 
-    let hits: Vec<FusedHit> = match mode {
-        QueryMode::Vector => {
-            let query_vec = embedder.embed_query(text).await?;
-            store
-                .query(&query_vec, Some(&filter), k)?
-                .into_iter()
-                .enumerate()
-                .map(|(rank, hit)| {
-                    let s = hit.score;
-                    FusedHit {
-                        hit,
-                        vector_rank: Some(rank + 1),
-                        sparse_rank: None,
-                        bm25_rank: None,
-                        vector_score: Some(s),
-                        sparse_score: None,
-                        bm25_score: None,
-                    }
-                })
-                .collect()
-        }
-        QueryMode::Sparse => sparse_hits(&index, encoder, store, text, &filter, k)
-            .await?
-            .into_iter()
+    let vector_hits = if retrievers.vector {
+        let query_vec = embedder.embed_query(text).await?;
+        Some(store.query(&query_vec, Some(&filter), fetch_k)?)
+    } else {
+        None
+    };
+    let sparse_hits = if retrievers.sparse {
+        Some(sparse_hits(&index, encoder, store, text, &filter, fetch_k).await?)
+    } else {
+        None
+    };
+    let bm25_hits = if retrievers.bm25 {
+        Some(store.query_bm25(text, bm25_lang, Some(&filter), fetch_k)?)
+    } else {
+        None
+    };
+
+    let hits: Vec<FusedHit> = if multi {
+        fuse_rankings(vector_hits, sparse_hits, bm25_hits, k)
+    } else if let Some(list) = vector_hits {
+        list.into_iter()
+            .enumerate()
+            .map(|(rank, hit)| {
+                let s = hit.score;
+                FusedHit {
+                    hit,
+                    vector_rank: Some(rank + 1),
+                    sparse_rank: None,
+                    bm25_rank: None,
+                    vector_score: Some(s),
+                    sparse_score: None,
+                    bm25_score: None,
+                }
+            })
+            .collect()
+    } else if let Some(list) = sparse_hits {
+        list.into_iter()
             .enumerate()
             .map(|(rank, hit)| {
                 let s = hit.score;
@@ -135,10 +175,9 @@ pub async fn query(
                     bm25_score: None,
                 }
             })
-            .collect(),
-        QueryMode::Bm25 => store
-            .query_bm25(text, bm25_lang, Some(&filter), k)?
-            .into_iter()
+            .collect()
+    } else if let Some(list) = bm25_hits {
+        list.into_iter()
             .enumerate()
             .map(|(rank, hit)| {
                 let s = hit.score;
@@ -152,34 +191,9 @@ pub async fn query(
                     bm25_score: Some(s),
                 }
             })
-            .collect(),
-        QueryMode::Hybrid => {
-            let query_vec = embedder.embed_query(text).await?;
-            let vector_hits = store.query(&query_vec, Some(&filter), candidate_k)?;
-            let sparse_hits =
-                sparse_hits(&index, encoder, store, text, &filter, candidate_k).await?;
-            fuse_rankings(Some(vector_hits), Some(sparse_hits), None, k)
-        }
-        QueryMode::VectorBm25 => {
-            let query_vec = embedder.embed_query(text).await?;
-            let vector_hits = store.query(&query_vec, Some(&filter), candidate_k)?;
-            let bm25_hits = store.query_bm25(text, bm25_lang, Some(&filter), candidate_k)?;
-            fuse_rankings(Some(vector_hits), None, Some(bm25_hits), k)
-        }
-        QueryMode::SparseBm25 => {
-            let sparse_hits =
-                sparse_hits(&index, encoder, store, text, &filter, candidate_k).await?;
-            let bm25_hits = store.query_bm25(text, bm25_lang, Some(&filter), candidate_k)?;
-            fuse_rankings(None, Some(sparse_hits), Some(bm25_hits), k)
-        }
-        QueryMode::All => {
-            let query_vec = embedder.embed_query(text).await?;
-            let vector_hits = store.query(&query_vec, Some(&filter), candidate_k)?;
-            let sparse_hits =
-                sparse_hits(&index, encoder, store, text, &filter, candidate_k).await?;
-            let bm25_hits = store.query_bm25(text, bm25_lang, Some(&filter), candidate_k)?;
-            fuse_rankings(Some(vector_hits), Some(sparse_hits), Some(bm25_hits), k)
-        }
+            .collect()
+    } else {
+        Vec::new()
     };
 
     Ok(hits
@@ -194,7 +208,7 @@ pub async fn query(
             score: fused.hit.score,
             content_commit: fused.hit.content_hash,
             rank: i + 1,
-            mode: mode.as_str().to_string(),
+            mode: retrievers.label().to_string(),
             vector_rank: fused.vector_rank,
             sparse_rank: fused.sparse_rank,
             bm25_rank: fused.bm25_rank,
@@ -1136,8 +1150,8 @@ mod tests {
         assert!(bm25[0].vector_rank.is_none());
         assert!(bm25[0].sparse_rank.is_none());
 
-        // 2. vector-bm25 mode: no sparse encoder needed.
-        let vb = query(
+        // 2. vector + bm25: no sparse encoder needed.
+        let vb = query_with_retrievers(
             &minsync_dir,
             "t1 t2",
             5,
@@ -1145,11 +1159,15 @@ mod tests {
             None,
             &store,
             None,
-            QueryMode::VectorBm25,
+            Retrievers {
+                vector: true,
+                sparse: false,
+                bm25: true,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(vb[0].mode, "vector-bm25");
+        assert_eq!(vb[0].mode, "vector+bm25");
         assert!(vb
             .iter()
             .all(|r| r.sparse_rank.is_none() && r.sparse_score.is_none()));
@@ -1157,8 +1175,8 @@ mod tests {
             .iter()
             .any(|r| r.vector_rank.is_some() && r.bm25_rank.is_some()));
 
-        // 3. sparse-bm25 mode: no dense embedder needed.
-        let sb = query(
+        // 3. sparse + bm25: no dense embedder needed.
+        let sb = query_with_retrievers(
             &minsync_dir,
             "t1 t2",
             5,
@@ -1166,11 +1184,15 @@ mod tests {
             Some(&encoder),
             &store,
             None,
-            QueryMode::SparseBm25,
+            Retrievers {
+                vector: false,
+                sparse: true,
+                bm25: true,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(sb[0].mode, "sparse-bm25");
+        assert_eq!(sb[0].mode, "sparse+bm25");
         assert!(sb
             .iter()
             .all(|r| r.vector_rank.is_none() && r.vector_score.is_none()));
@@ -1178,8 +1200,8 @@ mod tests {
             .iter()
             .any(|r| r.sparse_rank.is_some() && r.bm25_rank.is_some()));
 
-        // 4. all mode: vector + sparse + bm25 combined with full LTR features!
-        let all = query(
+        // 4. vector + sparse + bm25: full LTR multi-feature payload!
+        let all = query_with_retrievers(
             &minsync_dir,
             "t1 t2",
             5,
@@ -1187,11 +1209,15 @@ mod tests {
             Some(&encoder),
             &store,
             None,
-            QueryMode::All,
+            Retrievers {
+                vector: true,
+                sparse: true,
+                bm25: true,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(all[0].mode, "all");
+        assert_eq!(all[0].mode, "vector+sparse+bm25");
         let both_hit = all
             .iter()
             .find(|r| r.doc_id == "d_both")

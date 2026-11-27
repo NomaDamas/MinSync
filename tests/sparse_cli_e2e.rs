@@ -196,7 +196,7 @@ fn verify_failure_returns_nonzero_exit_code() {
     Command::cargo_bin("minsync")
         .expect("find minsync binary")
         .current_dir(root.path())
-        .args(["init"])
+        .args(["init", "--embedder", "tei:test/model"])
         .assert()
         .success();
 
@@ -230,7 +230,7 @@ fn verify_cli_reports_duplicate_vector_corruption_pairs() {
     Command::cargo_bin("minsync")
         .expect("find minsync binary")
         .current_dir(root.path())
-        .args(["init"])
+        .args(["init", "--embedder", "tei:test/model"])
         .assert()
         .success();
 
@@ -352,7 +352,7 @@ fn build_corrupt_verify_fixture_from_environment() {
     Command::cargo_bin("minsync")
         .expect("find minsync binary")
         .current_dir(&root)
-        .args(["init"])
+        .args(["init", "--embedder", "tei:test/model"])
         .assert()
         .success();
 

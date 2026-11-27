@@ -129,22 +129,22 @@ fn bm25_only_workspace_works_completely_offline_with_zero_ml_models() {
     assert!(results[0].get("sparse_rank").is_none());
     assert_eq!(results[0]["index_state"]["ann_indexed"], false);
 
-    // Modes requiring dense or SPLADE fail cleanly with guidance.
-    for mode in [
-        "vector",
-        "sparse",
-        "hybrid",
-        "vector-bm25",
-        "sparse-bm25",
-        "all",
+    // Any combination requiring dense or SPLADE fails cleanly with guidance.
+    for args in [
+        vec!["query", "mackerel", "--vector"],
+        vec!["query", "mackerel", "--sparse"],
+        vec!["query", "mackerel", "--mode", "hybrid"],
+        vec!["query", "mackerel", "--vector", "--bm25"],
+        vec!["query", "mackerel", "--sparse", "--bm25"],
+        vec!["query", "mackerel", "--vector", "--sparse", "--bm25"],
     ] {
         let out = minsync(root.path(), cache.path())
-            .args(["query", "mackerel", "--mode", mode])
+            .args(&args)
             .output()
             .expect("run rejected mode");
         assert!(
             !out.status.success(),
-            "mode {mode} must fail in BM25-only workspace"
+            "args {args:?} must fail in BM25-only workspace"
         );
     }
 
@@ -479,36 +479,44 @@ async fn all_three_retrievers_dense_splade_and_bm25_run_simultaneously_for_ltr()
     assert!(hyb_res[0]["sparse_rank"].is_number());
     assert!(hyb_res[0].get("bm25_rank").is_none());
 
-    // 5. vector-bm25
+    // 5. --vector --bm25 (or --dense --bm25)
     let vb_res = run_json(
         root.path(),
         cache.path(),
-        &["query", query, "--mode", "vector-bm25"],
+        &["query", query, "--dense", "--bm25"],
     );
-    assert_eq!(vb_res[0]["mode"], "vector-bm25");
+    assert_eq!(vb_res[0]["mode"], "vector+bm25");
     assert_eq!(vb_res[0]["path"], "alpha.md");
     assert!(vb_res[0]["vector_rank"].is_number());
     assert!(vb_res[0]["bm25_rank"].is_number());
     assert!(vb_res[0].get("sparse_rank").is_none());
 
-    // 6. sparse-bm25
+    // 6. --sparse --bm25 (and negative toggle --vector=false gives the same set!)
     let sb_res = run_json(
         root.path(),
         cache.path(),
-        &["query", query, "--mode", "sparse-bm25"],
+        &["query", query, "--sparse", "--bm25"],
     );
-    assert_eq!(sb_res[0]["mode"], "sparse-bm25");
+    assert_eq!(sb_res[0]["mode"], "sparse+bm25");
     assert!(sb_res[0]["sparse_rank"].is_number());
     assert!(sb_res[0]["bm25_rank"].is_number());
     assert!(sb_res[0].get("vector_rank").is_none());
 
-    // 7. all (vector + sparse + bm25): full multi-feature LTR payload!
+    let neg_res = run_json(
+        root.path(),
+        cache.path(),
+        &["query", query, "--vector=false"],
+    );
+    assert_eq!(neg_res[0]["mode"], "sparse+bm25");
+    assert_eq!(ranked(&neg_res), ranked(&sb_res));
+
+    // 7. --vector --sparse --bm25: full multi-feature LTR payload!
     let all_res = run_json(
         root.path(),
         cache.path(),
-        &["query", query, "--mode", "all"],
+        &["query", query, "--vector", "--sparse", "--bm25"],
     );
-    assert_eq!(all_res[0]["mode"], "all");
+    assert_eq!(all_res[0]["mode"], "vector+sparse+bm25");
     assert_eq!(all_res[0]["path"], "alpha.md");
     assert!(all_res[0]["vector_rank"].is_number());
     assert!(all_res[0]["vector_score"].is_number());
@@ -519,13 +527,102 @@ async fn all_three_retrievers_dense_splade_and_bm25_run_simultaneously_for_ltr()
     assert_eq!(all_res[0]["index_state"]["sparse_indexed"], true);
     assert_eq!(all_res[0]["index_state"]["bm25_indexed"], true);
 
-    // Even if the dense server goes down, `--mode bm25` and `--mode sparse-bm25`
+    // Even if the dense server goes down, `--bm25` and `--sparse --bm25`
     // keep answering because they never touch the dense embedder!
     drop(server);
     let still_ok = run_json(
         root.path(),
         cache.path(),
-        &["query", "exact_token_beta", "--mode", "bm25"],
+        &["query", "exact_token_beta", "--bm25"],
     );
     assert_eq!(still_ok[0]["path"], "beta.md");
+}
+
+#[test]
+fn hardware_auto_selects_safe_retriever_plan_for_low_mid_and_high_spec_machines() {
+    let gib: u64 = 1024 * 1024 * 1024;
+    let cases = [
+        (
+            "8GB Windows laptop (CPU-only)",
+            serde_json::json!({"os":"windows","arch":"x86_64","cores":4,"total_ram_bytes":8*gib,"cuda_gpus":[]}),
+            "none",
+            "none",
+        ),
+        (
+            "8GB Apple Silicon Mac",
+            serde_json::json!({"os":"macos","arch":"aarch64","cores":8,"total_ram_bytes":8*gib,"cuda_gpus":[]}),
+            "none",
+            "none",
+        ),
+        (
+            "16GB Apple Silicon Mac",
+            serde_json::json!({"os":"macos","arch":"aarch64","cores":8,"total_ram_bytes":16*gib,"cuda_gpus":[]}),
+            "none",
+            minsync::config::DEFAULT_SPARSE_ID,
+        ),
+        (
+            "16GB Windows laptop (4 cores, no CUDA)",
+            serde_json::json!({"os":"windows","arch":"x86_64","cores":4,"total_ram_bytes":16*gib,"cuda_gpus":[]}),
+            "none",
+            minsync::config::DEFAULT_SPARSE_ID,
+        ),
+        (
+            "24GB Apple Silicon Mac",
+            serde_json::json!({"os":"macos","arch":"aarch64","cores":8,"total_ram_bytes":24*gib,"cuda_gpus":[]}),
+            minsync::config::DEFAULT_EMBEDDER_ID,
+            minsync::config::DEFAULT_SPARSE_ID,
+        ),
+        (
+            "16GB Windows PC with RTX 4060 8GB",
+            serde_json::json!({"os":"windows","arch":"x86_64","cores":8,"total_ram_bytes":16*gib,"cuda_gpus":[{"name":"NVIDIA GeForce RTX 4060","vram_mib":8188}]}),
+            minsync::config::DEFAULT_EMBEDDER_ID,
+            minsync::config::DEFAULT_SPARSE_ID,
+        ),
+    ];
+
+    let cache = tempfile::tempdir().expect("empty cache");
+    for (label, hw_json, expected_embedder, expected_sparse) in cases {
+        let root = tempfile::tempdir().expect("workspace");
+        let output = minsync(root.path(), cache.path())
+            .env("MINSYNC_HARDWARE_OVERRIDE", hw_json.to_string())
+            .args(["--format", "json", "init"])
+            .output()
+            .expect("run init");
+        assert!(
+            output.status.success(),
+            "{label} init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cfg: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(
+            cfg["embedder"]["id"], expected_embedder,
+            "embedder for {label}"
+        );
+        assert_eq!(cfg["sparse"]["id"], expected_sparse, "sparse for {label}");
+        assert_eq!(cfg["bm25"]["enabled"], true, "bm25 for {label}");
+    }
+
+    // End-to-end on simulated 8GB Windows laptop: `minsync init` (no flags!) ->
+    // `minsync sync` -> `minsync query` works completely offline with zero ML!
+    let root = tempfile::tempdir().expect("8gb workspace");
+    std::fs::write(root.path().join("note.md"), "환불정책과배송안내입니다\n").unwrap();
+    let low_hw = serde_json::json!({"os":"windows","arch":"x86_64","cores":4,"total_ram_bytes":8*gib,"cuda_gpus":[]}).to_string();
+    let init_out = minsync(root.path(), cache.path())
+        .env("MINSYNC_HARDWARE_OVERRIDE", &low_hw)
+        .args(["init"])
+        .output()
+        .unwrap();
+    assert!(init_out.status.success());
+    let stdout = String::from_utf8_lossy(&init_out.stdout);
+    assert!(
+        stdout.contains("bm25-only"),
+        "expected rationale in {stdout}"
+    );
+
+    let sync_res = run_json(root.path(), cache.path(), &["sync"]);
+    assert_eq!(sync_res["embedding_api_calls"], 0);
+    assert_eq!(sync_res["sparse_encoded"], 0);
+    let hits = run_json(root.path(), cache.path(), &["query", "환불 정책"]);
+    assert_eq!(hits[0]["path"], "note.md");
+    assert_eq!(hits[0]["mode"], "bm25");
 }

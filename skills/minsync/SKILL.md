@@ -121,25 +121,25 @@ MinSync also supports learned-sparse (SPLADE) retrieval, independent of the dens
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse` at `base_url`.
 - A running sparse server — another `minsync serve --sparse` or an `inl serve --sparse` from im-not-llm, published under the shared `~/.cache/im-not-llm/serve` root — is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
-Select the mode per query (each JSON result also includes per-retriever `*_rank` and raw `*_score` features for downstream LTR reranking):
+Toggle any combination of the three retrievers per query with independent on/off flags (each JSON result also includes per-retriever `*_rank` and raw `*_score` features for downstream LTR reranking; legacy `--mode vector|sparse|bm25|hybrid` remains supported):
 
 ```bash
-minsync query "question" --mode vector       # dense ranking (default)
-minsync query "question" --mode sparse       # SPLADE ranking
-minsync query "question" --mode bm25         # multilingual Okapi BM25 ranking
-minsync query "question" --mode hybrid       # RRF fusion of vector + sparse (k=60)
-minsync query "question" --mode vector-bm25  # RRF fusion of vector + bm25
-minsync query "question" --mode sparse-bm25  # RRF fusion of sparse + bm25
-minsync query "question" --mode all          # RRF fusion of vector + sparse + bm25
+minsync query "question" --vector                  # dense only (alias: --dense)
+minsync query "question" --sparse                  # SPLADE only
+minsync query "question" --bm25                    # multilingual Okapi BM25 only
+minsync query "question" --vector --bm25           # RRF fusion of dense + bm25
+minsync query "question" --sparse --bm25           # RRF fusion of sparse + bm25
+minsync query "question" --vector --sparse --bm25  # RRF fusion of all 3 (full LTR features)
+minsync query "question" --sparse=false            # all configured retrievers except sparse
 ```
 
-For low-spec machines that cannot run even a 0.1B model, initialize a zero-ML BM25-only workspace:
+`minsync init` automatically probes RAM, CPU cores, and GPU/Apple Silicon to pick a safe local stack (`< 16 GiB RAM` → BM25 only; `16–23 GiB` or CPU-only → SPLADE + BM25; `Apple Silicon ≥ 24 GiB` or `CUDA ≥ 8 GB VRAM + ≥ 16 GiB RAM` → Dense + SPLADE + BM25). Override explicitly with `--embedder`, `--sparse`, `--no-bm25`, and `--language`:
 
 ```bash
 minsync init --embedder none --sparse none --language multilingual
 ```
 
-`[bm25]` in `.minsync/config.toml` configures `enabled` (default `true`) and `language` (`multilingual` default for EN/KO/JA/ZH/AR, or `simple`, `ko`, `ja`, `zh`, `ar`). Tokenization is pure Rust with embedded dictionaries (Korean `lindera` ko-dic, Japanese `lindera` IPADIC, Chinese `jieba-rs`, Arabic light stemmer, Latin/identifier splitting). `sync` and `optimize` build a compressed on-disk BM25 inverted index (`.minsync/store/bm25-index.inv`, reported via `index_state.bm25_indexed`) beside LanceDB, reusing the block bit-packed architecture of `sparse-index.inv`.
+`[bm25]` in `.minsync/config.toml` configures `enabled` (default `true`) and `language` (`multilingual` default for EN/KO/JA/ZH/AR, or `simple`, `ko`, `ja`, `zh`, `ar`). Tokenization is pure Rust with embedded dictionaries (Korean `lindera` ko-dic with content-POS filtering, Japanese `lindera` IPADIC, Chinese `jieba-rs`, Arabic light stemmer, Latin/identifier splitting). `sync` and `optimize` build a compressed on-disk BM25 inverted index (`.minsync/store/bm25-index.inv`, reported via `index_state.bm25_indexed`) beside LanceDB, reusing the block bit-packed architecture of `sparse-index.inv`.
 
 `minsync init --embedder none` keeps SPLADE enabled and defaults `query` to `--mode sparse` (or `--mode bm25` when `--sparse none` is also set). Run `minsync sync` once after upgrading from an older FTS-based index to migrate the table in place; no `--full` is needed and dense vectors are not recomputed.
 

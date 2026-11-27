@@ -1,7 +1,7 @@
 //! CLI command handlers. `main.rs` stays a thin binary: parse args, set up
 //! logging, dispatch here, and map errors to exit codes.
 
-use crate::cli::{Cli, Commands, OutputFormat, ProgressFormat, QueryMode};
+use crate::cli::{Cli, Commands, OutputFormat, ProgressFormat, QueryMode, Retrievers};
 use crate::error::MinSyncError;
 use crate::error::Result;
 use crate::sync::MinSync;
@@ -82,6 +82,7 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
             force,
             embedder,
             sparse,
+            no_bm25,
             language,
             chunker,
         } => init(
@@ -90,13 +91,33 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
             force,
             &embedder,
             &sparse,
+            !no_bm25,
             &language,
             &chunker,
         ),
         Commands::Sync { .. } | Commands::Serve { .. } | Commands::Stage { .. } => {
             unreachable!("handled by run")
         }
-        Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
+        Commands::Query {
+            text,
+            k,
+            vector,
+            sparse,
+            bm25,
+            mode,
+        } => {
+            query(
+                &cli.format,
+                &minsync_dir,
+                &text,
+                k,
+                mode,
+                vector,
+                sparse,
+                bm25,
+            )
+            .await
+        }
         Commands::Status => status(&cli.format, &minsync_dir).await,
         Commands::Optimize => optimize(&cli.format, &minsync_dir),
         Commands::Check => unreachable!("handled by run"),
@@ -119,17 +140,21 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn init(
     format: &OutputFormat,
     root: PathBuf,
     force: bool,
     embedder: &str,
     sparse: &str,
+    bm25_enabled: bool,
     language: &str,
     chunker: &str,
 ) -> Result<()> {
+    let used_auto = embedder.eq_ignore_ascii_case("auto") || sparse.eq_ignore_ascii_case("auto");
+    let hw = crate::hardware::Hardware::probe();
     let ms = MinSync::new(root);
-    let config = ms.init_with_options(force, embedder, sparse, language, chunker)?;
+    let config = ms.init_with_options(force, embedder, sparse, bm25_enabled, language, chunker)?;
     match format {
         OutputFormat::Text => {
             println!("Initialized MinSync in .minsync/");
@@ -148,6 +173,14 @@ fn init(
                 config.bm25.language
             );
             println!("  vectorstore: {}", config.vectorstore.id);
+            if used_auto {
+                println!("  hardware:    {}", hw.summary());
+                println!(
+                    "  auto-select: {} ({})",
+                    hw.recommend().as_str(),
+                    hw.rationale()
+                );
+            }
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&config)?);
@@ -395,12 +428,16 @@ async fn sync(
     Ok(if result.partial { EXIT_PARTIAL_SYNC } else { 0 })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query(
     format: &OutputFormat,
     minsync_dir: &std::path::Path,
     text: &str,
     k: usize,
     mode: Option<QueryMode>,
+    vector: Option<bool>,
+    sparse: Option<bool>,
+    bm25: Option<bool>,
 ) -> Result<()> {
     require_initialized(minsync_dir)?;
     // No writer lock here: querying only reads. LanceDB gives snapshot
@@ -409,16 +446,8 @@ async fn query(
     // available while a sync holds the lock. Results may lag the in-flight
     // sync; they are always consistent.
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
-    let mode = mode.unwrap_or_else(|| {
-        if config.is_bm25_only() {
-            QueryMode::Bm25
-        } else if config.is_sparse_only() {
-            QueryMode::Sparse
-        } else {
-            QueryMode::Vector
-        }
-    });
-    if mode.uses_vector() {
+    let retrievers = Retrievers::resolve(mode, vector, sparse, bm25, &config)?;
+    if retrievers.vector {
         crate::query::ensure_dense_matches(minsync_dir, &config)?;
     }
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
@@ -429,20 +458,20 @@ async fn query(
         &store_path,
         crate::embedder_identity::stored_dimension(minsync_dir, &config)?,
     )?;
-    // Each retriever is built only for the modes that use it: a bm25 query
-    // loads neither dense nor SPLADE; a sparse query never constructs dense;
-    // a vector query never loads SPLADE.
-    let embedder: Box<dyn crate::embedder::Embedder> = if mode.uses_vector() {
+    // Each retriever is built only when toggled on: a bm25 query loads neither
+    // dense nor SPLADE; a sparse query never constructs dense; a vector query
+    // never loads SPLADE.
+    let embedder: Box<dyn crate::embedder::Embedder> = if retrievers.vector {
         crate::embedder::create_embedder(&config)?
     } else {
         Box::new(crate::embedder::SparseOnlyEmbedder)
     };
-    let encoder = if mode.uses_sparse() {
+    let encoder = if retrievers.sparse {
         optional_sparse_encoder(&config)?
     } else {
         None
     };
-    let results = crate::query::query(
+    let results = crate::query::query_with_retrievers(
         minsync_dir,
         text,
         k,
@@ -450,7 +479,7 @@ async fn query(
         encoder.as_deref(),
         store.as_ref(),
         None,
-        mode,
+        retrievers,
     )
     .await?;
 

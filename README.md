@@ -69,7 +69,7 @@ minsync sync                          # chunks + sparse vectors + BM25 index; no
 minsync query "exact terms"           # --mode defaults to sparse in this workspace
 ```
 
-Zero ML models at all (for low-spec PCs that struggle even with a 0.1B model)? Disable both dense and SPLADE and run pure multilingual Okapi BM25 with an on-disk compressed inverted index (`bm25-index.inv`):
+Zero ML models at all (for low-spec PCs)? `minsync init` automatically probes your RAM, CPU cores, and GPU/Apple Silicon and picks a safe local stack without overwhelming desktop apps (`< 16 GiB RAM` → BM25 only; `16–23 GiB RAM` or no CUDA GPU → SPLADE + BM25; `Apple Silicon ≥ 24 GiB` or `NVIDIA CUDA ≥ 8 GB VRAM + ≥ 16 GiB RAM` → Dense + SPLADE + BM25). You can always override each retriever independently:
 
 ```bash
 minsync init --embedder none --sparse none --language multilingual
@@ -77,7 +77,7 @@ minsync sync                          # pure Rust, offline, zero ML inference
 minsync query "환불 정책"              # --mode defaults to bm25; EN/KO/JA/ZH/AR supported
 ```
 
-`--embedder none` stores a 1-float placeholder dense vector per chunk (the LanceDB schema requires the column) and never builds an ANN index, so the dense `--mode vector` and `--mode hybrid` modes are unavailable; `minsync check` skips the dense embedder probe (and skips the sparse probe when `--sparse none`). To add dense or sparse search later, update `.minsync/config.toml` or re-run `minsync init --force` and re-sync.
+`--embedder none` stores a 1-float placeholder dense vector per chunk (the LanceDB schema requires the column) and never builds an ANN index, so dense search (`--vector` / `--mode vector`) is unavailable; `minsync check` skips the dense embedder probe (and skips the sparse probe when `--sparse none`). To add dense or sparse search later, update `.minsync/config.toml` or re-run `minsync init --force` and re-sync.
 
 For OpenAI embeddings instead:
 
@@ -89,16 +89,16 @@ minsync init --embedder openai:text-embedding-3-small
 ## Quick Start
 
 ```bash
-minsync init                          # initialize .minsync/
+minsync init                          # initialize .minsync/ (auto-picks retrievers for this PC)
 minsync sync                          # index changed files incrementally
 minsync sync --full                   # rebuild from scratch
-minsync query "search text" --mode vector --k 5
-minsync query "exact terms" --mode sparse --k 5
-minsync query "exact terms" --mode bm25 --k 5
-minsync query "search text" --mode hybrid --k 5        # vector + sparse (RRF)
-minsync query "search text" --mode vector-bm25 --k 5   # vector + bm25 (RRF)
-minsync query "search text" --mode sparse-bm25 --k 5   # sparse + bm25 (RRF)
-minsync query "search text" --mode all --k 5           # vector + sparse + bm25 (RRF + per-retriever LTR scores/ranks)
+minsync query "search text" --vector --k 5                  # dense only (alias: --dense)
+minsync query "exact terms" --sparse --k 5                  # SPLADE only
+minsync query "exact terms" --bm25 --k 5                    # multilingual Okapi BM25 only
+minsync query "search text" --vector --bm25 --k 5           # dense + bm25 (RRF)
+minsync query "search text" --sparse --bm25 --k 5           # sparse + bm25 (RRF)
+minsync query "search text" --vector --sparse --bm25 --k 5  # all 3 (RRF + per-retriever LTR scores/ranks)
+minsync query "search text" --sparse=false --k 5            # all configured retrievers except sparse
 minsync watch                         # initial sync, then re-index on file changes
 minsync watch --watch-on-sync-error   # stay alive and retry after initial sync errors
 minsync status                        # sync state

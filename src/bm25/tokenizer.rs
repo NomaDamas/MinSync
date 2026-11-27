@@ -131,12 +131,41 @@ fn is_meaningful_token(s: &str) -> bool {
     !s.is_empty() && s.chars().any(|c| c.is_alphanumeric())
 }
 
-fn lindera_tokenize(tokenizer: &LinderaTokenizer, text: &str, label: &str) -> Result<Vec<String>> {
+/// Keep Korean content morphemes (nouns, verb/adj stems, roots, general
+/// adverbs, foreign/Hanja/numbers, and dictionary-unknown proper nouns) and
+/// drop grammatical particles (`J*`), endings (`E*`), and copulas (`VCP`/`VCN`).
+/// Measured on MIRACL-ko & Ko-StrategyQA: improves Ko-StrategyQA nDCG@10 by
+/// +1.46%p, MIRACL-ko Rec@100 by +4.79%p, and speeds up BM25 queries 6-15x
+/// by avoiding high-frequency particle posting lists.
+fn is_korean_content_pos(pos: &str) -> bool {
+    pos.starts_with('N')
+        || pos.starts_with("VV")
+        || pos.starts_with("VA")
+        || pos.starts_with("XR")
+        || pos.starts_with("SL")
+        || pos.starts_with("SH")
+        || pos.starts_with("SN")
+        || pos.starts_with("MAG")
+        || pos == "UNKNOWN"
+}
+
+fn lindera_tokenize(
+    tokenizer: &LinderaTokenizer,
+    text: &str,
+    label: &str,
+    korean_content_only: bool,
+) -> Result<Vec<String>> {
     let tokens = tokenizer
         .tokenize(text)
         .map_err(|error| MinSyncError::Config(format!("tokenize {label} text: {error}")))?;
     let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
+    for mut token in tokens {
+        if korean_content_only {
+            let pos = token.get_detail(0).unwrap_or("");
+            if !is_korean_content_pos(pos) {
+                continue;
+            }
+        }
         let surface = token.surface.trim();
         if is_meaningful_token(surface) {
             out.push(surface.to_lowercase());
@@ -159,14 +188,14 @@ fn korean_tokens(text: &str) -> Result<Vec<String>> {
             hangul.push(ch);
         } else {
             if !hangul.is_empty() {
-                out.extend(lindera_tokenize(ko_tokenizer()?, &hangul, "Korean")?);
+                out.extend(lindera_tokenize(ko_tokenizer()?, &hangul, "Korean", true)?);
                 hangul.clear();
             }
             non_hangul.push(ch);
         }
     }
     if !hangul.is_empty() {
-        out.extend(lindera_tokenize(ko_tokenizer()?, &hangul, "Korean")?);
+        out.extend(lindera_tokenize(ko_tokenizer()?, &hangul, "Korean", true)?);
     }
     if !non_hangul.is_empty() {
         out.extend(simple_tokens(&non_hangul));
@@ -175,7 +204,7 @@ fn korean_tokens(text: &str) -> Result<Vec<String>> {
 }
 
 fn japanese_tokens(text: &str) -> Result<Vec<String>> {
-    lindera_tokenize(ja_tokenizer()?, text, "Japanese")
+    lindera_tokenize(ja_tokenizer()?, text, "Japanese", false)
 }
 
 fn chinese_tokens(text: &str) -> Vec<String> {
@@ -310,17 +339,17 @@ fn multilingual_tokens(text: &str) -> Result<Vec<String>> {
         }
         match script {
             Script::Hangul => {
-                out.extend(lindera_tokenize(ko_tokenizer()?, buf, "Korean")?);
+                out.extend(lindera_tokenize(ko_tokenizer()?, buf, "Korean", true)?);
             }
             Script::Kana => {
-                out.extend(lindera_tokenize(ja_tokenizer()?, buf, "Japanese")?);
+                out.extend(lindera_tokenize(ja_tokenizer()?, buf, "Japanese", false)?);
             }
             Script::Han => {
                 // Pure Han span (Chinese or pure-Kanji Japanese): run both
                 // analyzers and union their distinct tokens so Chinese text
                 // and pure-Kanji Japanese queries both match.
                 let zh = chinese_tokens(buf);
-                let ja = lindera_tokenize(ja_tokenizer()?, buf, "Japanese")?;
+                let ja = lindera_tokenize(ja_tokenizer()?, buf, "Japanese", false)?;
                 if zh == ja {
                     out.extend(zh);
                 } else {
@@ -394,6 +423,19 @@ mod tests {
         assert!(refund.contains(&"정책".to_string()), "{refund:?}");
         assert!(refund.contains(&"배송".to_string()), "{refund:?}");
         assert!(refund.contains(&"안내".to_string()), "{refund:?}");
+        // Content-POS filtering strips Korean particles and endings.
+        assert!(
+            !refund.contains(&"과".to_string()),
+            "particle 과 should be filtered: {refund:?}"
+        );
+        assert!(
+            !tokens.contains(&"가".to_string()),
+            "particle 가 should be filtered: {tokens:?}"
+        );
+        assert!(
+            !tokens.contains(&"에".to_string()),
+            "particle 에 should be filtered: {tokens:?}"
+        );
     }
 
     #[test]

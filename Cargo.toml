@@ -74,6 +74,9 @@ inl-ane = "0.1.1"
 # macOS); without it candle's pure-Rust gemm runs SPLADE ~40x slower than Metal.
 inl-core = { version = "0.1.1", features = ["accelerate"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 # Opt-in native backends for non-macOS builds; macOS gets Metal + Accelerate.
 # `--features mkl`: Intel MKL BLAS for x86_64 CPU encoders.
 # `--features cuda`: NVIDIA GPU (needs the CUDA toolkit at build time).
