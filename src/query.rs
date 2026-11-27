@@ -1,4 +1,4 @@
-use crate::cli::QueryMode;
+use crate::cli::{QueryMode, Retrievers};
 use crate::config::Config;
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
@@ -44,11 +44,9 @@ fn refuse_if_changed(
     }
 }
 
-/// Search the index.
-///
-/// `vector` needs the dense `embedder`; `sparse` needs the sparse `encoder`;
-/// `hybrid` needs both and fuses the two rankings. A mode whose half is
-/// missing is an error, never a silent fallback to the other.
+/// Search the index using a legacy [`QueryMode`] shorthand.
+/// See [`query_with_retrievers`] for arbitrary on/off combinations of
+/// `vector`, `sparse`, and `bm25`.
 #[allow(clippy::too_many_arguments)]
 pub async fn query(
     minsync_dir: &Path,
@@ -60,13 +58,52 @@ pub async fn query(
     filter_expr: Option<&str>,
     mode: QueryMode,
 ) -> Result<Vec<QueryResult>> {
+    query_with_retrievers(
+        minsync_dir,
+        text,
+        k,
+        embedder,
+        encoder,
+        store,
+        filter_expr,
+        mode.to_retrievers(),
+    )
+    .await
+}
+
+/// Search the index with any non-empty subset of `{vector, sparse, bm25}`
+/// toggled on independently.
+///
+/// - When a single retriever is active, results carry its raw score directly.
+/// - When two or more retrievers are active, results are combined via
+///   reciprocal rank fusion (RRF, k=60) and also report every active
+///   retriever's individual `*_rank` and raw `*_score` for downstream LTR
+///   reranking.
+/// - A requested retriever that is unavailable is an error, never a silent
+///   fallback to another retriever.
+#[allow(clippy::too_many_arguments)]
+pub async fn query_with_retrievers(
+    minsync_dir: &Path,
+    text: &str,
+    k: usize,
+    embedder: &dyn Embedder,
+    encoder: Option<&dyn SparseEncoder>,
+    store: &dyn VectorStore,
+    filter_expr: Option<&str>,
+    retrievers: Retrievers,
+) -> Result<Vec<QueryResult>> {
     if text.trim().is_empty() {
         return Err(MinSyncError::EmptyQuery);
+    }
+    if retrievers.count() == 0 {
+        return Err(MinSyncError::Config(
+            "at least one retriever (--vector, --sparse, or --bm25) must be enabled".into(),
+        ));
     }
 
     let config = Config::load(&minsync_dir.join("config.toml"))?;
     let index = IndexedBy::load(minsync_dir, &config)?;
-    if matches!(mode, QueryMode::Vector | QueryMode::Hybrid) {
+    if retrievers.vector {
         ensure_dense_matches_embedder(minsync_dir, &config, embedder)?;
     }
 
@@ -84,47 +121,100 @@ pub async fn query(
 
     let filter = Filter::And(std::mem::take(&mut filters));
     let index_state = store.index_state()?;
-    let hits = match mode {
-        QueryMode::Vector => {
-            let query_vec = embedder.embed_query(text).await?;
-            store
-                .query(&query_vec, Some(&filter), k)?
-                .into_iter()
-                .enumerate()
-                .map(|(rank, hit)| (hit, Some(rank + 1), None))
-                .collect()
-        }
-        QueryMode::Sparse => sparse_hits(&index, encoder, store, text, &filter, k)
-            .await?
-            .into_iter()
+    let bm25_lang = config.bm25.language.as_str();
+    let multi = retrievers.count() > 1;
+    let fetch_k = if multi { k.saturating_mul(4).max(k) } else { k };
+
+    let vector_hits = if retrievers.vector {
+        let query_vec = embedder.embed_query(text).await?;
+        Some(store.query(&query_vec, Some(&filter), fetch_k)?)
+    } else {
+        None
+    };
+    let sparse_hits = if retrievers.sparse {
+        Some(sparse_hits(&index, encoder, store, text, &filter, fetch_k).await?)
+    } else {
+        None
+    };
+    let bm25_hits = if retrievers.bm25 {
+        Some(store.query_bm25(text, bm25_lang, Some(&filter), fetch_k)?)
+    } else {
+        None
+    };
+
+    let hits: Vec<FusedHit> = if multi {
+        fuse_rankings(vector_hits, sparse_hits, bm25_hits, k)
+    } else if let Some(list) = vector_hits {
+        list.into_iter()
             .enumerate()
-            .map(|(rank, hit)| (hit, None, Some(rank + 1)))
-            .collect(),
-        QueryMode::Hybrid => {
-            let query_vec = embedder.embed_query(text).await?;
-            let candidate_k = k.saturating_mul(4).max(k);
-            let vector_hits = store.query(&query_vec, Some(&filter), candidate_k)?;
-            let sparse_hits =
-                sparse_hits(&index, encoder, store, text, &filter, candidate_k).await?;
-            reciprocal_rank_fusion(vector_hits, sparse_hits, k)
-        }
+            .map(|(rank, hit)| {
+                let s = hit.score;
+                FusedHit {
+                    hit,
+                    vector_rank: Some(rank + 1),
+                    sparse_rank: None,
+                    bm25_rank: None,
+                    vector_score: Some(s),
+                    sparse_score: None,
+                    bm25_score: None,
+                }
+            })
+            .collect()
+    } else if let Some(list) = sparse_hits {
+        list.into_iter()
+            .enumerate()
+            .map(|(rank, hit)| {
+                let s = hit.score;
+                FusedHit {
+                    hit,
+                    vector_rank: None,
+                    sparse_rank: Some(rank + 1),
+                    bm25_rank: None,
+                    vector_score: None,
+                    sparse_score: Some(s),
+                    bm25_score: None,
+                }
+            })
+            .collect()
+    } else if let Some(list) = bm25_hits {
+        list.into_iter()
+            .enumerate()
+            .map(|(rank, hit)| {
+                let s = hit.score;
+                FusedHit {
+                    hit,
+                    vector_rank: None,
+                    sparse_rank: None,
+                    bm25_rank: Some(rank + 1),
+                    vector_score: None,
+                    sparse_score: None,
+                    bm25_score: Some(s),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
 
     Ok(hits
         .into_iter()
         .enumerate()
-        .map(|(i, (hit, vector_rank, sparse_rank))| QueryResult {
-            doc_id: hit.doc_id,
-            path: hit.path,
-            heading_path: hit.heading_path,
-            chunk_type: hit.chunk_type,
-            text: hit.text,
-            score: hit.score,
-            content_commit: hit.content_hash,
+        .map(|(i, fused)| QueryResult {
+            doc_id: fused.hit.doc_id,
+            path: fused.hit.path,
+            heading_path: fused.hit.heading_path,
+            chunk_type: fused.hit.chunk_type,
+            text: fused.hit.text,
+            score: fused.hit.score,
+            content_commit: fused.hit.content_hash,
             rank: i + 1,
-            mode: mode.as_str().to_string(),
-            vector_rank,
-            sparse_rank,
+            mode: retrievers.label().to_string(),
+            vector_rank: fused.vector_rank,
+            sparse_rank: fused.sparse_rank,
+            bm25_rank: fused.bm25_rank,
+            vector_score: fused.vector_score,
+            sparse_score: fused.sparse_score,
+            bm25_score: fused.bm25_score,
             index_state: index_state.clone(),
         })
         .collect())
@@ -133,7 +223,7 @@ pub async fn query(
 /// Which run the stored rows can be trusted from.
 enum IndexedBy {
     /// A sync completed; its cursor says what every row was built with.
-    Sync(Cursor),
+    Sync(Box<Cursor>),
     /// The first sync is running or was interrupted. Every batch it commits
     /// (dense rows and their sparse vectors) is final, so the rows stored so
     /// far answer queries; files not reached yet are simply not found.
@@ -144,7 +234,7 @@ impl IndexedBy {
     fn load(minsync_dir: &Path, config: &Config) -> Result<Self> {
         let cursor_path = minsync_dir.join("cursor.json");
         if cursor_path.exists() {
-            return Ok(Self::Sync(Cursor::load(&cursor_path)?));
+            return Ok(Self::Sync(Box::new(Cursor::load(&cursor_path)?)));
         }
         let txn_path = minsync_dir.join("txn.json");
         if txn_path.exists() && Transaction::load(&txn_path)?.source_id == config.source_id {
@@ -179,7 +269,11 @@ async fn sparse_hits(
     k: usize,
 ) -> Result<Vec<QueryHit>> {
     let encoder = encoder.ok_or_else(|| {
-        MinSyncError::Config("sparse search needs a sparse encoder, but none is configured".into())
+        MinSyncError::Config(
+            "sparse search needs a sparse encoder, but none is configured (`sparse.id = \"none\"`); \
+             use `--mode bm25` or `--mode vector-bm25`, or configure `[sparse]`"
+                .into(),
+        )
     })?;
     let indexed = match index {
         IndexedBy::Sync(cursor) => cursor.sparse_id.as_deref(),
@@ -203,32 +297,73 @@ async fn sparse_hits(
     store.query_sparse(encoder.id(), &vector, Some(filter), k)
 }
 
-fn reciprocal_rank_fusion(
-    vector_hits: Vec<QueryHit>,
-    sparse_hits: Vec<QueryHit>,
+struct FusedHit {
+    hit: QueryHit,
+    vector_rank: Option<usize>,
+    sparse_rank: Option<usize>,
+    bm25_rank: Option<usize>,
+    vector_score: Option<f32>,
+    sparse_score: Option<f32>,
+    bm25_score: Option<f32>,
+}
+
+#[derive(Clone, Copy)]
+enum Channel {
+    Vector,
+    Sparse,
+    Bm25,
+}
+
+fn fuse_rankings(
+    vector_hits: Option<Vec<QueryHit>>,
+    sparse_hits: Option<Vec<QueryHit>>,
+    bm25_hits: Option<Vec<QueryHit>>,
     topk: usize,
-) -> Vec<(QueryHit, Option<usize>, Option<usize>)> {
+) -> Vec<FusedHit> {
     use std::collections::HashMap;
 
     const RRF_K: f32 = 60.0;
-    let mut fused: HashMap<String, (QueryHit, Option<usize>, Option<usize>)> = HashMap::new();
-    for (is_vector, hits) in [(true, vector_hits), (false, sparse_hits)] {
-        for (rank, mut hit) in hits.into_iter().enumerate() {
-            let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            let rank = rank + 1;
+    let mut fused: HashMap<String, FusedHit> = HashMap::new();
+    for (channel, hits) in [
+        (Channel::Vector, vector_hits),
+        (Channel::Sparse, sparse_hits),
+        (Channel::Bm25, bm25_hits),
+    ] {
+        let Some(hits) = hits else { continue };
+        for (rank_idx, mut hit) in hits.into_iter().enumerate() {
+            let raw_score = hit.score;
+            let contribution = 1.0 / (RRF_K + rank_idx as f32 + 1.0);
+            let rank = rank_idx + 1;
             match fused.get_mut(&hit.doc_id) {
                 Some(existing) => {
-                    existing.0.score += contribution;
-                    if is_vector {
-                        existing.1 = Some(rank);
-                    } else {
-                        existing.2 = Some(rank);
+                    existing.hit.score += contribution;
+                    match channel {
+                        Channel::Vector => {
+                            existing.vector_rank = Some(rank);
+                            existing.vector_score = Some(raw_score);
+                        }
+                        Channel::Sparse => {
+                            existing.sparse_rank = Some(rank);
+                            existing.sparse_score = Some(raw_score);
+                        }
+                        Channel::Bm25 => {
+                            existing.bm25_rank = Some(rank);
+                            existing.bm25_score = Some(raw_score);
+                        }
                     }
                 }
                 None => {
                     hit.score = contribution;
-                    let entry = (hit, is_vector.then_some(rank), (!is_vector).then_some(rank));
-                    fused.insert(entry.0.doc_id.clone(), entry);
+                    let entry = FusedHit {
+                        vector_rank: matches!(channel, Channel::Vector).then_some(rank),
+                        sparse_rank: matches!(channel, Channel::Sparse).then_some(rank),
+                        bm25_rank: matches!(channel, Channel::Bm25).then_some(rank),
+                        vector_score: matches!(channel, Channel::Vector).then_some(raw_score),
+                        sparse_score: matches!(channel, Channel::Sparse).then_some(raw_score),
+                        bm25_score: matches!(channel, Channel::Bm25).then_some(raw_score),
+                        hit,
+                    };
+                    fused.insert(entry.hit.doc_id.clone(), entry);
                 }
             }
         }
@@ -236,11 +371,11 @@ fn reciprocal_rank_fusion(
     let mut hits: Vec<_> = fused.into_values().collect();
     hits.sort_by(|left, right| {
         right
-            .0
+            .hit
             .score
-            .partial_cmp(&left.0.score)
+            .partial_cmp(&left.hit.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.doc_id.cmp(&right.0.doc_id))
+            .then_with(|| left.hit.doc_id.cmp(&right.hit.doc_id))
     });
     hits.truncate(topk);
     hits
@@ -323,6 +458,7 @@ mod tests {
             embedder: Some(identity),
             collection_path: "store".to_string(),
             sparse_id: Some("fake/sparse".to_string()),
+            bm25_language: Some("multilingual".to_string()),
         }
         .save(&minsync_dir.join("cursor.json"))
         .expect("save cursor");
@@ -949,5 +1085,153 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, "mine");
+    }
+
+    #[tokio::test]
+    async fn bm25_and_multi_retriever_fusion_modes_emit_per_retriever_ltr_features() {
+        let dir = tempfile::tempdir().unwrap();
+        write_query_state(&dir, "source-1");
+        let minsync_dir = dir.path().join(".minsync");
+
+        let mut store = InMemoryStore::new();
+        let make_doc = |id: &str, text: &str, emb: Vec<f32>| Document {
+            id: id.to_string(),
+            embedding: emb,
+            text: text.to_string(),
+            source_id: "source-1".to_string(),
+            path: format!("{id}.md"),
+            chunk_schema_id: "schema-1".to_string(),
+            chunk_type: "text".to_string(),
+            heading_path: String::new(),
+            content_hash: format!("h-{id}"),
+            seen_token: "t".to_string(),
+        };
+        store
+            .upsert(&[
+                make_doc("d_vec", "t1 semantic match", vec![0.0, 1.0, 0.0, 0.0]),
+                make_doc("d_both", "t1 t2 t1 t2 bm25", vec![0.7, 0.7, 0.0, 0.0]),
+                make_doc(
+                    "d_bm25",
+                    "t1 t2 exact lexical hit",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ),
+            ])
+            .unwrap();
+        store
+            .set_sparse(
+                "fake/sparse",
+                &[
+                    ("d_vec".to_string(), term_vector("t1").unwrap()),
+                    ("d_both".to_string(), term_vector("t1 t2").unwrap()),
+                    ("d_bm25".to_string(), term_vector("t9").unwrap()),
+                ],
+            )
+            .unwrap();
+
+        let encoder = FakeSparse("fake/sparse");
+
+        // 1. Pure BM25 mode: no dense or sparse needed.
+        let bm25 = query(
+            &minsync_dir,
+            "t1 t2",
+            5,
+            &crate::embedder::SparseOnlyEmbedder,
+            None,
+            &store,
+            None,
+            QueryMode::Bm25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bm25.len(), 3);
+        assert_eq!(bm25[0].mode, "bm25");
+        assert_eq!(bm25[0].bm25_rank, Some(1));
+        assert!(bm25[0].bm25_score.unwrap() > 0.0);
+        assert!(bm25[0].vector_rank.is_none());
+        assert!(bm25[0].sparse_rank.is_none());
+
+        // 2. vector + bm25: no sparse encoder needed.
+        let vb = query_with_retrievers(
+            &minsync_dir,
+            "t1 t2",
+            5,
+            &MockEmbedder,
+            None,
+            &store,
+            None,
+            Retrievers {
+                vector: true,
+                sparse: false,
+                bm25: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(vb[0].mode, "vector+bm25");
+        assert!(vb
+            .iter()
+            .all(|r| r.sparse_rank.is_none() && r.sparse_score.is_none()));
+        assert!(vb
+            .iter()
+            .any(|r| r.vector_rank.is_some() && r.bm25_rank.is_some()));
+
+        // 3. sparse + bm25: no dense embedder needed.
+        let sb = query_with_retrievers(
+            &minsync_dir,
+            "t1 t2",
+            5,
+            &crate::embedder::SparseOnlyEmbedder,
+            Some(&encoder),
+            &store,
+            None,
+            Retrievers {
+                vector: false,
+                sparse: true,
+                bm25: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sb[0].mode, "sparse+bm25");
+        assert!(sb
+            .iter()
+            .all(|r| r.vector_rank.is_none() && r.vector_score.is_none()));
+        assert!(sb
+            .iter()
+            .any(|r| r.sparse_rank.is_some() && r.bm25_rank.is_some()));
+
+        // 4. vector + sparse + bm25: full LTR multi-feature payload!
+        let all = query_with_retrievers(
+            &minsync_dir,
+            "t1 t2",
+            5,
+            &MockEmbedder,
+            Some(&encoder),
+            &store,
+            None,
+            Retrievers {
+                vector: true,
+                sparse: true,
+                bm25: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(all[0].mode, "vector+sparse+bm25");
+        let both_hit = all
+            .iter()
+            .find(|r| r.doc_id == "d_both")
+            .expect("d_both present");
+        assert!(both_hit.vector_rank.is_some());
+        assert!(both_hit.sparse_rank.is_some());
+        assert!(both_hit.bm25_rank.is_some());
+        assert!(both_hit.vector_score.is_some());
+        assert!(both_hit.sparse_score.is_some());
+        assert!(both_hit.bm25_score.is_some());
+        // RRF score equals sum of 1/(60+rank) across the three channels.
+        let expected_rrf = 1.0 / (60.0 + both_hit.vector_rank.unwrap() as f32)
+            + 1.0 / (60.0 + both_hit.sparse_rank.unwrap() as f32)
+            + 1.0 / (60.0 + both_hit.bm25_rank.unwrap() as f32);
+        assert!((both_hit.score - expected_rrf).abs() < 1e-6);
     }
 }

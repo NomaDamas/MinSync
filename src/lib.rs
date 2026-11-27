@@ -1,3 +1,4 @@
+pub mod bm25;
 pub mod chunker;
 pub mod cli;
 pub mod commands;
@@ -6,6 +7,7 @@ pub mod embedder;
 pub mod embedder_identity;
 pub mod error;
 pub(crate) mod file_size;
+pub mod hardware;
 pub mod id;
 pub mod incremental;
 pub mod manifest;

@@ -383,3 +383,112 @@ fn a_reader_opened_beside_a_writer_never_returns_a_newer_or_older_answer() {
     let newest = fresh.query_sparse("m", &query, None, 10).expect("fresh");
     assert_eq!(newest[0].doc_id, "d00001");
 }
+
+#[test]
+fn bm25_inverted_index_coexists_with_sparse_and_matches_scan_bit_for_bit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut store = LanceDbStore::open_with_indexing(
+        dir.path(),
+        4,
+        IndexingConfig {
+            sparse_index_min_rows: 1,
+            sparse_index_memory_postings: 32,
+            bm25_index_min_rows: 1,
+            bm25_language: "multilingual".to_string(),
+            ..IndexingConfig::default()
+        },
+    )
+    .expect("open store");
+
+    let samples = [
+        (
+            "doc-en",
+            "Rust systems programming and BM25 inverted index ERR_404",
+        ),
+        ("doc-ko", "환불정책과배송안내입니다 서울맛집추천 빠른 배송"),
+        ("doc-ja", "関西国際空港限定トートバッグの販売情報"),
+        ("doc-zh", "我们中出了一个叛徒 分布式全文检索系统"),
+        ("doc-ar", "والكتاب في المدرسة العربية للبحث"),
+        ("doc-mix", "Rust BM25 환불 関西国際空港 叛徒 ERR_404"),
+    ];
+    let mut docs = Vec::new();
+    for i in 0..80 {
+        let (tag, body) = samples[i % samples.len()];
+        docs.push(Document {
+            id: format!("bm-{i:04}"),
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            text: format!("{tag} item-{i} {body}"),
+            source_id: "source-1".to_string(),
+            path: format!("{tag}-{i}.md"),
+            chunk_schema_id: "schema-1".to_string(),
+            chunk_type: "text".to_string(),
+            heading_path: String::new(),
+            content_hash: format!("h-{i}"),
+            seen_token: "t".to_string(),
+        });
+    }
+    store.upsert(&docs).expect("upsert");
+    let sparse_rows: Vec<(String, SparseVector)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.id.clone(), sv(&[((i % 10 + 1) as u32, 1.5)])))
+        .collect();
+    store.set_sparse("m", &sparse_rows).expect("set sparse");
+    store.flush().expect("flush builds both sidecars");
+
+    assert!(store.sparse_index_ready().expect("sparse ready"));
+    assert!(store.bm25_index_ready().expect("bm25 ready"));
+    assert!(dir.path().join("sparse-index.inv").exists());
+    assert!(dir.path().join("bm25-index.inv").exists());
+
+    let state = store.index_state().expect("index state");
+    assert!(state.sparse_indexed);
+    assert!(state.bm25_indexed);
+
+    // Compare indexed BM25 results against a scan-only handle bit for bit.
+    let scan_store = LanceDbStore::open_with_indexing(
+        dir.path(),
+        4,
+        IndexingConfig {
+            bm25_inverted_index: false,
+            bm25_language: "multilingual".to_string(),
+            ..IndexingConfig::default()
+        },
+    )
+    .expect("open scan store");
+    assert!(!scan_store.bm25_index_ready().expect("scan has no index"));
+
+    let src_filter = Filter::Eq("source_id".into(), "source-1".into());
+    for query_text in [
+        "Rust BM25",
+        "환불 정책",
+        "関西国際空港",
+        "叛徒",
+        "كتاب",
+        "ERR_404",
+        "item-42",
+    ] {
+        let indexed = store
+            .query_bm25(query_text, "multilingual", Some(&src_filter), 10)
+            .expect("indexed bm25");
+        let scanned = scan_store
+            .query_bm25(query_text, "multilingual", Some(&src_filter), 10)
+            .expect("scan bm25");
+        assert!(!indexed.is_empty(), "expected hits for {query_text:?}");
+        assert_eq!(
+            ranked(&indexed),
+            ranked(&scanned),
+            "bm25 index vs scan mismatch for {query_text:?}"
+        );
+    }
+
+    // Corrupting bm25-index.inv falls back seamlessly to scan, and optimize repairs it.
+    std::fs::write(dir.path().join("bm25-index.inv"), b"corrupt!").expect("corrupt sidecar");
+    assert!(!store.bm25_index_ready().expect("corrupt not ready"));
+    let fallback = store
+        .query_bm25("환불 정책", "multilingual", Some(&src_filter), 5)
+        .expect("fallback scan");
+    assert!(!fallback.is_empty());
+    store.optimize().expect("optimize repairs bm25 sidecar");
+    assert!(store.bm25_index_ready().expect("repaired"));
+}

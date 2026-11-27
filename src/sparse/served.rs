@@ -306,6 +306,18 @@ impl SparseEncoder for ServedSparseEncoder {
 
 /// Construct a [`SparseEncoder`] from the sparse id in `settings`:
 /// `native:` (in-process, or a running `serve --sparse`) or `tei:` (remote).
+/// Returns `Ok(None)` when `settings.id == "none"` (SPLADE disabled).
+pub fn create_optional_sparse_encoder(
+    settings: &crate::config::SparseConfig,
+) -> Result<Option<Box<dyn SparseEncoder>>> {
+    if settings.id == crate::config::NONE_SPARSE_ID {
+        return Ok(None);
+    }
+    create_sparse_encoder(settings).map(Some)
+}
+
+/// Construct a [`SparseEncoder`] from the sparse id in `settings`:
+/// `native:` (in-process, or a running `serve --sparse`) or `tei:` (remote).
 pub fn create_sparse_encoder(
     settings: &crate::config::SparseConfig,
 ) -> Result<Box<dyn SparseEncoder>> {

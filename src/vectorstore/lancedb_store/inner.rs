@@ -1,5 +1,6 @@
 //! Async LanceDB operations executed on the worker thread.
 
+use super::bm25_index::{self, Scope as Bm25Scope};
 use super::filters::{
     column_in_filter, filter_to_sql, has_sparse_filter, id_in_filter, missing_sparse_filter,
 };
@@ -17,6 +18,9 @@ use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, SPARSE_INDICES_COLUMN,
     SPARSE_MODEL_COLUMN, SPARSE_VALUES_COLUMN, TABLE_NAME, VECTOR_COLUMN,
 };
+use crate::bm25::inverted::Bm25IndexBuilder;
+use crate::bm25::score_bm25_scan;
+use crate::bm25::tokenizer::tokenize as bm25_tokenize;
 use crate::error::{MinSyncError, Result};
 use crate::sparse::inverted::IndexBuilder;
 use crate::sparse::{SparseVector, TopK};
@@ -594,6 +598,205 @@ impl LanceDbInner {
             .collect())
     }
 
+    /// Exact top-`topk` by Okapi BM25 over stored chunk `text`. Answers from
+    /// the compressed on-disk BM25 inverted index (`bm25-index.inv`) when it
+    /// matches this table version and language, falling back to a streaming
+    /// table scan otherwise. Only the winning `topk` rows' full metadata is
+    /// fetched from LanceDB.
+    pub(super) async fn query_bm25(
+        &self,
+        query: String,
+        language: String,
+        filter: Option<Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        if topk == 0 {
+            return Ok(Vec::new());
+        }
+        let query_tokens = bm25_tokenize(&query, &language)?;
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranked = match self
+            .bm25_ranked_from_index(&language, &query_tokens, filter.as_ref(), topk)
+            .await?
+        {
+            Some(ranked) => ranked,
+            None => {
+                self.bm25_ranked_by_scan(&language, &query_tokens, filter.as_ref(), topk)
+                    .await?
+            }
+        };
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scored: HashMap<String, f32> = ranked
+            .iter()
+            .map(|(score, id)| (id.clone(), *score))
+            .collect();
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(id_in_filter(ranked.iter().map(|(_, id)| id.as_str())))
+            .select(Select::columns(&[
+                "id",
+                "path",
+                "heading_path",
+                "chunk_type",
+                "text",
+                "content_hash",
+            ]))
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut by_id: HashMap<String, QueryHit> = HashMap::new();
+        for batch in &batches {
+            for hit in batch_to_scored_hits(batch, &scored)? {
+                by_id.insert(hit.doc_id.clone(), hit);
+            }
+        }
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(_, id)| by_id.remove(&id))
+            .collect())
+    }
+
+    async fn bm25_ranked_from_index(
+        &self,
+        language: &str,
+        query_tokens: &[String],
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Option<Vec<(f32, String)>>> {
+        if !self.indexing.bm25_inverted_index {
+            return Ok(None);
+        }
+        let Some(file) = bm25_index::open(&self.store_dir) else {
+            return Ok(None);
+        };
+        let (version, timestamp) = self.table_identity().await?;
+        if !bm25_index::describes(file.meta(), language, version, timestamp) {
+            return Ok(None);
+        }
+        match bm25_index::scope(filter, file.meta()) {
+            Bm25Scope::Unknown => Ok(None),
+            Bm25Scope::Nothing => Ok(Some(Vec::new())),
+            Bm25Scope::Everything => match file.search(query_tokens, topk) {
+                Ok(ranked) => Ok(Some(ranked)),
+                Err(error) => {
+                    tracing::warn!("bm25 inverted index failed, scanning instead: {error}");
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    async fn bm25_ranked_by_scan(
+        &self,
+        language: &str,
+        query_tokens: &[String],
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<(f32, String)>> {
+        let mut query = self.table.query().select(Select::columns(&["id", "text"]));
+        if let Some(filter) = filter {
+            query = query.only_if(filter_to_sql(filter)?);
+        }
+        let mut stream = query.execute().await.map_err(to_store_error)?;
+        let mut docs: Vec<(String, Vec<String>)> = Vec::new();
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            let ids = string_col(&batch, "id")?;
+            let texts = string_col(&batch, "text")?;
+            for row in 0..batch.num_rows() {
+                let tokens = bm25_tokenize(texts.value(row), language)?;
+                docs.push((ids.value(row).to_string(), tokens));
+            }
+        }
+        Ok(score_bm25_scan(query_tokens, &docs, topk))
+    }
+
+    async fn bm25_single_source(&self) -> Result<Option<String>> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&["source_id"]))
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        let mut found: Option<String> = None;
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            let sources = string_col(&batch, "source_id")?;
+            for row in 0..batch.num_rows() {
+                let src = sources.value(row);
+                match &found {
+                    None => found = Some(src.to_string()),
+                    Some(first) if first != src => return Ok(None),
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn build_bm25_index(&self) -> Result<bool> {
+        let rows = self.table.count_rows(None).await.map_err(to_store_error)?;
+        if rows < self.indexing.bm25_index_min_rows {
+            bm25_index::remove(&self.store_dir)?;
+            return Ok(false);
+        }
+        let Some(source_id) = self.bm25_single_source().await? else {
+            bm25_index::remove(&self.store_dir)?;
+            return Ok(false);
+        };
+        let language = self.indexing.bm25_language.as_str();
+        crate::bm25::tokenizer::validate_language(language)?;
+        let (version, timestamp) = self.table_identity().await?;
+        if let Some(file) = bm25_index::open(&self.store_dir) {
+            if bm25_index::describes(file.meta(), language, version, timestamp)
+                && file.meta().source_id == source_id
+            {
+                return Ok(true);
+            }
+        }
+        let mut builder = Bm25IndexBuilder::new(
+            &bm25_index::index_path(&self.store_dir),
+            language,
+            version,
+            timestamp,
+        )?;
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&["id", "source_id", "text"]))
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        while let Some(batch) = stream.try_next().await.map_err(to_store_error)? {
+            let ids = string_col(&batch, "id")?;
+            let sources = string_col(&batch, "source_id")?;
+            let texts = string_col(&batch, "text")?;
+            for row in 0..batch.num_rows() {
+                let tokens = bm25_tokenize(texts.value(row), language)?;
+                builder.add_row(ids.value(row), sources.value(row), &tokens)?;
+            }
+        }
+        Ok(builder.finish()?.is_some())
+    }
+
+    async fn maintain_bm25_index(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        bm25_index::cleanup_interrupted_builds(&self.store_dir)?;
+        if !self.indexing.bm25_inverted_index {
+            return bm25_index::remove(&self.store_dir);
+        }
+        self.build_bm25_index().await.map(|_| ())
+    }
+
     /// The scan: the sparse columns of every matching row are streamed batch
     /// by batch into a bounded heap, so the table is never materialized.
     async fn ranked_by_scan(
@@ -856,7 +1059,8 @@ impl LanceDbInner {
         maintain_scalar_indexes(&self.table).await?;
         maintain_index(&self.table, &self.indexing).await?;
         self.prune().await?;
-        self.maintain_sparse_index().await
+        self.maintain_sparse_index().await?;
+        self.maintain_bm25_index().await
     }
 
     /// Full maintenance for `minsync optimize`: compact every fragment under
@@ -872,7 +1076,8 @@ impl LanceDbInner {
         maintain_scalar_indexes(&self.table).await?;
         maintain_index(&self.table, &self.indexing).await?;
         self.prune().await?;
-        self.maintain_sparse_index().await
+        self.maintain_sparse_index().await?;
+        self.maintain_bm25_index().await
     }
 
     /// Leave the inverted index describing the table as it is now (or no
@@ -952,6 +1157,7 @@ impl LanceDbInner {
             ann_indexed: ann.is_some(),
             unindexed_rows,
             sparse_indexed: self.sparse_index_ready().await?,
+            bm25_indexed: self.bm25_index_ready().await?,
         })
     }
 
@@ -965,6 +1171,23 @@ impl LanceDbInner {
         };
         let (version, timestamp) = self.table_identity().await?;
         Ok(sparse_index::matches_table(file.meta(), version, timestamp))
+    }
+
+    /// Whether a BM25 inverted index describes the table as this handle reads it.
+    pub(super) async fn bm25_index_ready(&self) -> Result<bool> {
+        if !self.indexing.bm25_inverted_index {
+            return Ok(false);
+        }
+        let Some(file) = bm25_index::open(&self.store_dir) else {
+            return Ok(false);
+        };
+        let (version, timestamp) = self.table_identity().await?;
+        Ok(bm25_index::describes(
+            file.meta(),
+            &self.indexing.bm25_language,
+            version,
+            timestamp,
+        ))
     }
 
     pub(super) async fn doc_count(&self) -> Result<usize> {

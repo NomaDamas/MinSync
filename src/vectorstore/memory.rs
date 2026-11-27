@@ -252,6 +252,46 @@ impl VectorStore for InMemoryStore {
             .collect())
     }
 
+    fn query_bm25(
+        &self,
+        query: &str,
+        language: &str,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        if topk == 0 {
+            return Ok(Vec::new());
+        }
+        let query_tokens = crate::bm25::tokenizer::tokenize(query, language)?;
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut docs: Vec<(String, Vec<String>)> = Vec::new();
+        for doc in self.docs.values() {
+            if !filter.is_none_or(|active| matches_filter(doc, active)) {
+                continue;
+            }
+            let tokens = crate::bm25::tokenizer::tokenize(&doc.text, language)?;
+            docs.push((doc.id.clone(), tokens));
+        }
+        let ranked = crate::bm25::score_bm25_scan(&query_tokens, &docs, topk);
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(score, id)| {
+                let doc = self.docs.get(&id)?;
+                Some(QueryHit {
+                    doc_id: doc.id.clone(),
+                    path: doc.path.clone(),
+                    heading_path: doc.heading_path.clone(),
+                    chunk_type: doc.chunk_type.clone(),
+                    text: doc.text.clone(),
+                    score,
+                    content_hash: doc.content_hash.clone(),
+                })
+            })
+            .collect())
+    }
+
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }

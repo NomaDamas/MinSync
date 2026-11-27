@@ -29,10 +29,14 @@ pub enum ProgressFormat {
     Jsonl,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+/// Legacy shorthand for `--mode`. Prefer the independent `--vector` (alias
+/// `--dense`), `--sparse`, and `--bm25` on/off flags to select any combination
+/// of retrievers without a combinatorial mode list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum QueryMode {
     Vector,
     Sparse,
+    Bm25,
     Hybrid,
 }
 
@@ -41,8 +45,108 @@ impl QueryMode {
         match self {
             Self::Vector => "vector",
             Self::Sparse => "sparse",
+            Self::Bm25 => "bm25",
             Self::Hybrid => "hybrid",
         }
+    }
+
+    pub fn to_retrievers(self) -> Retrievers {
+        match self {
+            Self::Vector => Retrievers {
+                vector: true,
+                sparse: false,
+                bm25: false,
+            },
+            Self::Sparse => Retrievers {
+                vector: false,
+                sparse: true,
+                bm25: false,
+            },
+            Self::Bm25 => Retrievers {
+                vector: false,
+                sparse: false,
+                bm25: true,
+            },
+            Self::Hybrid => Retrievers {
+                vector: true,
+                sparse: true,
+                bm25: false,
+            },
+        }
+    }
+}
+
+/// Independent on/off switches for MinSync's three retrievers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retrievers {
+    pub vector: bool,
+    pub sparse: bool,
+    pub bm25: bool,
+}
+
+impl Retrievers {
+    pub fn count(self) -> usize {
+        usize::from(self.vector) + usize::from(self.sparse) + usize::from(self.bm25)
+    }
+
+    /// Stable label written to `QueryResult.mode`. Keeps `"vector"`, `"sparse"`,
+    /// `"bm25"`, and `"hybrid"` (vector+sparse) backwards-compatible.
+    pub fn label(self) -> &'static str {
+        match (self.vector, self.sparse, self.bm25) {
+            (true, false, false) => "vector",
+            (false, true, false) => "sparse",
+            (false, false, true) => "bm25",
+            (true, true, false) => "hybrid",
+            (true, false, true) => "vector+bm25",
+            (false, true, true) => "sparse+bm25",
+            (true, true, true) => "vector+sparse+bm25",
+            (false, false, false) => "none",
+        }
+    }
+
+    /// Resolve the active retriever set from CLI flags and workspace config:
+    /// - Explicit `--mode` maps directly to its shorthand set.
+    /// - If any of `--vector`, `--sparse`, `--bm25` is turned ON (`Some(true)`),
+    ///   run ONLY the flags turned ON (omitted flags default to off).
+    /// - If only negative toggles are passed (e.g. `--sparse=false`), start from
+    ///   every retriever configured in `config` and turn off the requested ones.
+    /// - If nothing was passed, keep the single-retriever workspace default
+    ///   (`bm25` for BM25-only, `sparse` for sparse-only, `vector` otherwise).
+    pub fn resolve(
+        mode: Option<QueryMode>,
+        vector: Option<bool>,
+        sparse: Option<bool>,
+        bm25: Option<bool>,
+        config: &crate::config::Config,
+    ) -> crate::error::Result<Self> {
+        let selected = if let Some(mode) = mode {
+            mode.to_retrievers()
+        } else if vector == Some(true) || sparse == Some(true) || bm25 == Some(true) {
+            Self {
+                vector: vector.unwrap_or(false),
+                sparse: sparse.unwrap_or(false),
+                bm25: bm25.unwrap_or(false),
+            }
+        } else if vector.is_some() || sparse.is_some() || bm25.is_some() {
+            Self {
+                vector: vector.unwrap_or(!config.is_sparse_only()),
+                sparse: sparse.unwrap_or(!config.is_sparse_disabled()),
+                bm25: bm25.unwrap_or(config.bm25.enabled),
+            }
+        } else if config.is_bm25_only() {
+            QueryMode::Bm25.to_retrievers()
+        } else if config.is_sparse_only() {
+            QueryMode::Sparse.to_retrievers()
+        } else {
+            QueryMode::Vector.to_retrievers()
+        };
+
+        if selected.count() == 0 {
+            return Err(crate::error::MinSyncError::Config(
+                "at least one retriever (--vector, --sparse, or --bm25) must be enabled".into(),
+            ));
+        }
+        Ok(selected)
     }
 }
 
@@ -52,10 +156,21 @@ pub enum Commands {
     Init {
         #[arg(long)]
         force: bool,
-        /// Dense embedder id (`native:`, `tei:`, `openai:`), or `none` for a
-        /// sparse-only index that needs no dense model or API key.
-        #[arg(long, default_value = crate::config::DEFAULT_EMBEDDER_ID)]
+        /// Dense embedder id (`native:`, `tei:`, `openai:`), `none` to disable,
+        /// or `auto` (default) to decide from detected RAM & GPU headroom.
+        #[arg(long, default_value = "auto")]
         embedder: String,
+        /// Sparse (SPLADE) encoder id (`native:`, `tei:`), `none` to disable,
+        /// or `auto` (default) to decide from detected RAM & CPU cores.
+        #[arg(long, default_value = "auto")]
+        sparse: String,
+        /// Disable BM25 lexical indexing (enabled by default).
+        #[arg(long)]
+        no_bm25: bool,
+        /// BM25 tokenizer language preset (`multilingual`, `simple`, `ko`,
+        /// `ja`, `zh`, `ar`).
+        #[arg(long, default_value = crate::bm25::tokenizer::DEFAULT_LANGUAGE)]
+        language: String,
         #[arg(long, default_value = crate::config::DEFAULT_CHUNKER_ID)]
         chunker: String,
     },
@@ -100,8 +215,37 @@ pub enum Commands {
         text: String,
         #[arg(long, short, default_value = "10")]
         k: usize,
-        /// Retrieval mode. Defaults to `vector`, or to `sparse` in a workspace
-        /// initialised with `--embedder none`.
+        /// Toggle dense vector search (`--vector` / `--dense`, or `--vector=false`).
+        #[arg(
+            long,
+            visible_alias = "dense",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            conflicts_with = "mode"
+        )]
+        vector: Option<bool>,
+        /// Toggle SPLADE sparse search (`--sparse`, or `--sparse=false`).
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            conflicts_with = "mode"
+        )]
+        sparse: Option<bool>,
+        /// Toggle BM25 lexical search (`--bm25`, or `--bm25=false`).
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            conflicts_with = "mode"
+        )]
+        bm25: Option<bool>,
+        /// Shorthand retrieval mode (`vector`, `sparse`, `bm25`, `hybrid`).
+        /// For arbitrary combinations (e.g. dense+bm25 or all three), use
+        /// `--vector`, `--sparse`, `--bm25` on/off flags directly.
         #[arg(long, value_enum)]
         mode: Option<QueryMode>,
     },
@@ -240,20 +384,82 @@ mod tests {
     }
 
     #[test]
-    fn query_modes_are_vector_sparse_and_hybrid_only() {
-        for mode in ["vector", "sparse", "hybrid"] {
+    fn query_accepts_independent_retriever_toggles_and_legacy_modes() {
+        for mode in ["vector", "sparse", "bm25", "hybrid"] {
             assert!(
                 Cli::try_parse_from(["minsync", "query", "q", "--mode", mode]).is_ok(),
                 "{mode} must parse"
             );
         }
-        let bm25 = Cli::try_parse_from(["minsync", "query", "q", "--mode", "bm25"]);
-        assert!(bm25.is_err(), "bm25 search no longer exists");
+        assert!(Cli::try_parse_from(["minsync", "query", "q", "--mode", "nope"]).is_err());
+
+        // Independent retriever toggles (both before and after the query text).
+        let cli = Cli::try_parse_from(["minsync", "query", "--dense", "--bm25", "hello"])
+            .expect("toggles before query parse cleanly");
+        assert!(matches!(
+            cli.command,
+            Commands::Query {
+                ref text,
+                vector: Some(true),
+                sparse: None,
+                bm25: Some(true),
+                mode: None,
+                ..
+            } if text == "hello"
+        ));
+
+        let off = Cli::try_parse_from(["minsync", "query", "hello", "--sparse=false"])
+            .expect("explicit false toggle parses");
+        assert!(matches!(
+            off.command,
+            Commands::Query {
+                vector: None,
+                sparse: Some(false),
+                bm25: None,
+                ..
+            }
+        ));
+
+        // Mixing --mode with retriever toggles is rejected.
+        assert!(
+            Cli::try_parse_from(["minsync", "query", "q", "--mode", "bm25", "--vector"]).is_err()
+        );
     }
 
     #[test]
-    fn init_has_no_language_flag() {
-        assert!(Cli::try_parse_from(["minsync", "init", "--language", "ko"]).is_err());
-        assert!(Cli::try_parse_from(["minsync", "init"]).is_ok());
+    fn init_defaults_to_auto_and_accepts_retriever_flags() {
+        let auto = Cli::try_parse_from(["minsync", "init"]).expect("init parses");
+        assert!(matches!(
+            auto.command,
+            Commands::Init {
+                ref embedder,
+                ref sparse,
+                no_bm25: false,
+                ..
+            } if embedder == "auto" && sparse == "auto"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "minsync",
+            "init",
+            "--embedder",
+            "none",
+            "--sparse",
+            "none",
+            "--no-bm25",
+            "--language",
+            "ko",
+        ])
+        .expect("init flags parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Init {
+                ref embedder,
+                ref sparse,
+                no_bm25: true,
+                ref language,
+                ..
+            } if embedder == "none" && sparse == "none" && language == "ko"
+        ));
     }
 }

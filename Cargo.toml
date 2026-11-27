@@ -52,6 +52,13 @@ futures = "0.3"
 notify-debouncer-full = { version = "0.8.0-rc.2", features = ["tokio"] }
 libc = "0.2"
 parking_lot = "0.12"
+# Multilingual BM25 tokenization: pure Rust with embedded dictionaries (zero
+# runtime native-library setup, works identically on macOS, Linux, Windows).
+# `lancedb` already pins `jieba-rs` 0.10 and `lindera` 3.0.7 via
+# `lance-tokenizer`; we reuse those exact versions and enable the embedded
+# IPADIC (Japanese) and ko-dic (Korean) dictionaries.
+jieba-rs = "0.10"
+lindera = { version = "3.0.7", features = ["embed-ipadic", "embed-ko-dic"] }
 # All model inference lives in im-not-llm; MinSync only adapts its engines.
 inl-core = "0.1.1"
 inl-text = "0.1.0"
@@ -66,6 +73,9 @@ inl-ane = "0.1.1"
 # `accelerate` routes CPU matmuls to Accelerate.framework (always present on
 # macOS); without it candle's pure-Rust gemm runs SPLADE ~40x slower than Metal.
 inl-core = { version = "0.1.1", features = ["accelerate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 # Opt-in native backends for non-macOS builds; macOS gets Metal + Accelerate.
 # `--features mkl`: Intel MKL BLAS for x86_64 CPU encoders.

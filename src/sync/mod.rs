@@ -81,6 +81,35 @@ impl MinSync {
 
     /// Initialize `.minsync/` with a default config and baseline manifest.
     pub fn init(&self, force: bool, embedder_id: &str, chunker_id: &str) -> Result<Config> {
+        self.init_with_options(
+            force,
+            embedder_id,
+            crate::config::DEFAULT_SPARSE_ID,
+            true,
+            crate::bm25::tokenizer::DEFAULT_LANGUAGE,
+            chunker_id,
+        )
+    }
+
+    /// Initialize `.minsync/` with independent retriever toggles:
+    /// `embedder_id` / `sparse_id` accept `"auto"` (hardware-probed), `"none"`
+    /// (disabled), or an explicit model id; `bm25_enabled` toggles BM25.
+    pub fn init_with_options(
+        &self,
+        force: bool,
+        embedder_id: &str,
+        sparse_id: &str,
+        bm25_enabled: bool,
+        bm25_language: &str,
+        chunker_id: &str,
+    ) -> Result<Config> {
+        crate::bm25::tokenizer::validate_language(bm25_language)?;
+        let hw = crate::hardware::Hardware::probe();
+        let (resolved_embedder, resolved_sparse) =
+            crate::hardware::resolve_auto_retrievers(embedder_id, sparse_id, &hw);
+        let embedder_id = resolved_embedder.as_str();
+        let sparse_id = resolved_sparse.as_str();
+
         if self.minsync_dir.exists() && !force {
             return Err(MinSyncError::AlreadyInitialized);
         }
@@ -100,6 +129,9 @@ impl MinSync {
         let source_id = uuid::Uuid::new_v4().to_string();
         let mut config = Config::default_for(&source_id);
         config.embedder.id = embedder_id.to_string();
+        config.sparse.id = sparse_id.to_string();
+        config.bm25.enabled = bm25_enabled;
+        config.bm25.language = bm25_language.to_string();
         config.chunker.id = chunker_id.to_string();
         if crate::config::uses_embeddinggemma_prompts(embedder_id) {
             config.embedder.query_prefix =
@@ -542,7 +574,12 @@ impl MinSync {
             Some(encoder) if !dry_run => store.count_missing_sparse(encoder.id())? > 0,
             _ => false,
         };
-        if changes.is_empty() && !full && !sparse_pending {
+        let desired_bm25_language = config.bm25.enabled.then_some(config.bm25.language.as_str());
+        let bm25_pending = !dry_run
+            && stored_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.bm25_language.as_deref() != desired_bm25_language);
+        if changes.is_empty() && !full && !sparse_pending && !bm25_pending {
             if let Some(progress) = &self.progress {
                 progress.start(RunStart {
                     started: start,
@@ -925,6 +962,7 @@ impl MinSync {
                     .as_ref()
                     .and_then(|cursor| cursor.sparse_id.clone()),
             },
+            bm25_language: config.bm25.enabled.then(|| config.bm25.language.clone()),
         }
         .save(&cursor_path)?;
         Journal::remove(&progress_path)?;
@@ -2229,6 +2267,7 @@ mod tests {
             embedder: None,
             collection_path: config.collection.path.clone(),
             sparse_id: None,
+            bm25_language: None,
         }
         .save(&sync.minsync_dir.join("cursor.json"))
         .expect("write cursor from interrupted state commit");
