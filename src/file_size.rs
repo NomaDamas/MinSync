@@ -18,10 +18,9 @@ pub(crate) fn size_guard_error(size: u64, limit: u64) -> Option<String> {
     (limit > 0 && size > limit).then(|| size_guard_message(size, limit))
 }
 
-/// Read UTF-8 text without allocating more than `limit + 1` bytes when a
-/// limit is configured. The extra byte distinguishes an exact-limit file
-/// from a file that grew after its metadata was read.
-pub(crate) fn read_text_file(path: &Path, limit: u64) -> Result<String, ReadTextError> {
+/// Read raw bytes without allocating more than `limit + 1` bytes when a limit
+/// is configured. Used for both UTF-8 text reads and direct image indexing.
+pub(crate) fn read_bytes_file(path: &Path, limit: u64) -> Result<Vec<u8>, ReadTextError> {
     let file = File::open(path).map_err(ReadTextError::Io)?;
     let size = file.metadata().map_err(ReadTextError::Io)?.len();
     if size_guard_error(size, limit).is_some() {
@@ -29,7 +28,7 @@ pub(crate) fn read_text_file(path: &Path, limit: u64) -> Result<String, ReadText
     }
 
     if limit == 0 {
-        return std::fs::read_to_string(path).map_err(ReadTextError::Io);
+        return std::fs::read(path).map_err(ReadTextError::Io);
     }
 
     let mut reader = file.take(limit.saturating_add(1));
@@ -46,8 +45,39 @@ pub(crate) fn read_text_file(path: &Path, limit: u64) -> Result<String, ReadText
         return Err(ReadTextError::TooLarge { size, limit });
     }
 
+    Ok(bytes)
+}
+
+/// Read UTF-8 text without allocating more than `limit + 1` bytes when a
+/// limit is configured. The extra byte distinguishes an exact-limit file
+/// from a file that grew after its metadata was read.
+pub(crate) fn read_text_file(path: &Path, limit: u64) -> Result<String, ReadTextError> {
+    let bytes = read_bytes_file(path, limit)?;
     String::from_utf8(bytes)
         .map_err(|error| ReadTextError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
+}
+
+/// MIME type for image extensions MinSync can embed directly when the active
+/// embedder supports images (`inl-vision`: PNG, JPEG, WebP).
+pub(crate) fn image_mime_for_path(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Compute a hex SHA-256 content hash over arbitrary raw bytes (for image rows).
+pub(crate) fn bytes_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

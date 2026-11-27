@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 pub use inl_server::{
     default_state_dir, idle_timeout_from_seconds, loopback_client, parse_loopback_host, probe,
-    start, start_sparse, EngineKind, Health, ServeOptions, Started, DEFAULT_IDLE_TIMEOUT_SECONDS,
-    DEFAULT_MAX_INPUTS, DEFAULT_MAX_REQUEST_BYTES,
+    start, start_multimodal, start_sparse, EngineKind, Health, ServeOptions, Started,
+    DEFAULT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_INPUTS, DEFAULT_MAX_REQUEST_BYTES,
 };
 
 /// Identity of a served dense model: everything that changes the vectors the
@@ -40,6 +40,38 @@ pub fn instance_key(settings: &EmbedderConfig) -> Result<String> {
         attention: settings.attention.clone(),
         max_length: Some(settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH)),
         kind: EngineKind::Dense,
+    })?)
+}
+
+/// Identity of a served multimodal model. The `-multimodal-` infix keeps its
+/// state directory apart from dense and sparse instances of the same model.
+pub fn multimodal_instance_key(settings: &EmbedderConfig) -> Result<String> {
+    let model = settings
+        .id
+        .strip_prefix("native-multimodal:")
+        .or_else(|| settings.id.strip_prefix("native:"))
+        .ok_or_else(|| {
+            MinSyncError::Config(format!(
+                "minsync serve --multimodal only serves native/native-multimodal embedders, got '{}'",
+                settings.id
+            ))
+        })?;
+    if model.is_empty() {
+        return Err(MinSyncError::Config(
+            "multimodal embedder id is missing a model name".to_string(),
+        ));
+    }
+    Ok(inl_server::instance_key(&InstanceKey {
+        model: model.to_string(),
+        device: settings.device.clone(),
+        dtype: settings.dtype.clone(),
+        attention: settings.attention.clone(),
+        max_length: Some(
+            settings
+                .max_length
+                .unwrap_or(crate::embedder::multimodal::DEFAULT_MULTIMODAL_MAX_LENGTH),
+        ),
+        kind: EngineKind::Multimodal,
     })?)
 }
 
@@ -179,6 +211,20 @@ mod tests {
         .unwrap();
         assert!(sparse.starts_with("org-model-sparse-"), "{sparse}");
         assert_ne!(sparse, instance_key(&dense("native:org/model")).unwrap());
+    }
+
+    #[test]
+    fn a_multimodal_instance_never_collides_with_dense_or_sparse() {
+        let multimodal =
+            multimodal_instance_key(&dense("native-multimodal:google/embeddinggemma-2")).unwrap();
+        assert!(
+            multimodal.starts_with("google-embeddinggemma-2-multimodal-"),
+            "{multimodal}"
+        );
+        assert_ne!(
+            multimodal,
+            instance_key(&dense("native:google/embeddinggemma-2")).unwrap()
+        );
     }
 
     #[test]

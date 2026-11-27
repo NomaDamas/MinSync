@@ -325,13 +325,39 @@ pub const EMBEDDINGGEMMA_PASSAGE_PREFIX: &str = "title: none | text: ";
 
 /// In-process EmbeddingGemma 2 (candle). Same retrieval prompts and 768
 /// dimensions as EmbeddingGemma 1; runs on its own text tower, see
-/// [`crate::embedder::native`].
+/// [`crate::embedder::native`]. `native-multimodal:` runs the full
+/// multimodal engine (text + image towers) through [`crate::embedder::multimodal`].
 pub const EMBEDDINGGEMMA2_ID: &str = "native:google/embeddinggemma-2";
+
+/// Multimodal (text + image) EmbeddingGemma 2: images embed through the
+/// vision tower into the same 768-dimension space as text. Same retrieval
+/// prompts as [`EMBEDDINGGEMMA2_ID`].
+pub const EMBEDDINGGEMMA2_MULTIMODAL_ID: &str = "native-multimodal:google/embeddinggemma-2";
+
+/// True when the embedder id names any EmbeddingGemma checkpoint (the
+/// retrieval prompts of [`EMBEDDINGGEMMA_QUERY_PREFIX`] /
+/// [`EMBEDDINGGEMMA_PASSAGE_PREFIX`] apply).
+pub fn is_embeddinggemma_id(embedder_id: &str) -> bool {
+    embedder_id == EMBEDDINGGEMMA_ID
+        || embedder_id == EMBEDDINGGEMMA2_ID
+        || embedder_id == EMBEDDINGGEMMA2_MULTIMODAL_ID
+}
+
+/// The model id an embedder id names, with every provider prefix stripped
+/// (`native:`, `native-multimodal:`, `tei:`, `openai:`).
+pub fn model_of_embedder_id(embedder_id: &str) -> &str {
+    for prefix in ["native-multimodal:", "native:", "tei:", "openai:"] {
+        if let Some(model) = embedder_id.strip_prefix(prefix) {
+            return model;
+        }
+    }
+    embedder_id
+}
 
 /// True for the embedder ids trained with the EmbeddingGemma retrieval prompts
 /// ([`EMBEDDINGGEMMA_QUERY_PREFIX`], [`EMBEDDINGGEMMA_PASSAGE_PREFIX`]).
 pub fn uses_embeddinggemma_prompts(embedder_id: &str) -> bool {
-    embedder_id == EMBEDDINGGEMMA_ID || embedder_id == EMBEDDINGGEMMA2_ID
+    is_embeddinggemma_id(embedder_id)
 }
 
 /// Known embedding output dimension for embedder ids MinSync recognizes.
@@ -341,7 +367,9 @@ pub fn known_embedding_dimension(embedder_id: &str) -> Option<usize> {
     match embedder_id {
         NONE_EMBEDDER_ID => Some(SPARSE_ONLY_DIMENSION),
         "native:Qwen/Qwen3-Embedding-0.6B" => Some(1024),
-        "tei:google/embeddinggemma-300m" | EMBEDDINGGEMMA2_ID => Some(768),
+        "tei:google/embeddinggemma-300m" | EMBEDDINGGEMMA2_ID | EMBEDDINGGEMMA2_MULTIMODAL_ID => {
+            Some(768)
+        }
         "openai:text-embedding-3-small" | "openai:text-embedding-ada-002" => Some(1536),
         "openai:text-embedding-3-large" => Some(3072),
         "tei:intfloat/multilingual-e5-small" => Some(384),

@@ -56,6 +56,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         state_dir,
         embedder,
         sparse,
+        multimodal,
     } = cli.command
     {
         let options = ServeArgs {
@@ -67,6 +68,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
             state_dir,
             embedder,
             sparse,
+            multimodal,
         };
         return serve(&cli.format, &minsync_dir, options).await;
     }
@@ -676,6 +678,7 @@ struct ServeArgs {
     state_dir: Option<PathBuf>,
     embedder: Option<String>,
     sparse: bool,
+    multimodal: bool,
 }
 
 /// Sparse encoder settings `serve --sparse` runs with: the workspace's
@@ -723,20 +726,63 @@ fn serve_settings(
     Ok(settings)
 }
 
+fn serve_multimodal_settings(
+    minsync_dir: &std::path::Path,
+    embedder: Option<String>,
+) -> Result<crate::config::EmbedderConfig> {
+    let config_path = minsync_dir.join("config.toml");
+    let mut settings = if config_path.exists() {
+        crate::config::Config::load(&config_path)?.embedder
+    } else {
+        let mut defaults = crate::config::Config::default_for("serve").embedder;
+        defaults.id = crate::config::EMBEDDINGGEMMA2_MULTIMODAL_ID.to_string();
+        defaults.query_prefix = Some(crate::config::EMBEDDINGGEMMA_QUERY_PREFIX.to_string());
+        defaults.passage_prefix = Some(crate::config::EMBEDDINGGEMMA_PASSAGE_PREFIX.to_string());
+        defaults
+    };
+    if let Some(id) = embedder {
+        settings.id = if id.contains(':') {
+            id
+        } else {
+            format!("native-multimodal:{id}")
+        };
+    } else if !settings.id.starts_with("native-multimodal:")
+        && !settings.id.starts_with("native:")
+    {
+        settings.id = crate::config::EMBEDDINGGEMMA2_MULTIMODAL_ID.to_string();
+    }
+    Ok(settings)
+}
+
 async fn serve(
     format: &OutputFormat,
     minsync_dir: &std::path::Path,
     args: ServeArgs,
 ) -> Result<i32> {
     let host = crate::serve::parse_loopback_host(&args.host)?;
+    let auto_multimodal = !args.sparse
+        && !args.multimodal
+        && args.embedder.as_deref().map_or_else(
+            || {
+                let config_path = minsync_dir.join("config.toml");
+                config_path.exists()
+                    && crate::config::Config::load(&config_path)
+                        .map(|c| c.embedder.id.starts_with("native-multimodal:"))
+                        .unwrap_or(false)
+            },
+            |id| id.starts_with("native-multimodal:"),
+        );
+    let multimodal = args.multimodal || auto_multimodal;
     let kind = if args.sparse {
         crate::serve::EngineKind::Sparse
+    } else if multimodal {
+        crate::serve::EngineKind::Multimodal
     } else {
         crate::serve::EngineKind::Dense
     };
-    // Dense and sparse servers differ only in the engine, the identity of the
-    // model instance and which section names the model; everything after that
-    // is shared.
+    // Dense, sparse and multimodal servers differ only in the engine, the
+    // identity of the model instance and which section names the model;
+    // everything after that is shared.
     let (instance, query_prefix, passage_prefix, model, max_length, device, dtype) = if args.sparse
     {
         let settings = serve_sparse_settings(minsync_dir, args.embedder.clone())?;
@@ -748,6 +794,19 @@ async fn serve(
             settings
                 .max_length
                 .unwrap_or(crate::config::DEFAULT_SPARSE_MAX_LENGTH),
+            settings.device.clone(),
+            settings.dtype.clone(),
+        )
+    } else if multimodal {
+        let settings = serve_multimodal_settings(minsync_dir, args.embedder.clone())?;
+        (
+            crate::serve::multimodal_instance_key(&settings)?,
+            settings.query_prefix.clone(),
+            settings.passage_prefix.clone(),
+            crate::embedder::multimodal::parse_multimodal_model_id(&settings.id)?.to_string(),
+            settings
+                .max_length
+                .unwrap_or(crate::embedder::multimodal::DEFAULT_MULTIMODAL_MAX_LENGTH),
             settings.device.clone(),
             settings.dtype.clone(),
         )
@@ -802,6 +861,10 @@ async fn serve(
         let settings = serve_sparse_settings(minsync_dir, args.embedder)?;
         let engine = crate::sparse::native::NativeSparseEncoder::from_config(&settings)?;
         crate::serve::start_sparse(engine.into_engine(), options).await?
+    } else if multimodal {
+        let settings = serve_multimodal_settings(minsync_dir, args.embedder)?;
+        let engine = crate::embedder::multimodal::NativeMultimodalEmbedder::from_config(&settings)?;
+        crate::serve::start_multimodal(engine.into_engine(), options).await?
     } else {
         let settings = serve_settings(minsync_dir, args.embedder)?;
         let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;

@@ -30,6 +30,7 @@ chunk = "0.10"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ignore = "0.4"
@@ -55,6 +56,7 @@ parking_lot = "0.12"
 # All model inference lives in im-not-llm; MinSync only adapts its engines.
 inl-core = "0.1.1"
 inl-text = "0.1.0"
+inl-vision = "0.1.1"
 inl-sparse = "0.1.2"
 inl-server = { version = "0.3.4", default-features = false }
 # Apple Neural Engine engines (Core ML, macOS only; the package table and
@@ -72,8 +74,8 @@ inl-core = { version = "0.1.1", features = ["accelerate"] }
 # `--features cuda`: NVIDIA GPU (needs the CUDA toolkit at build time).
 [features]
 default = []
-mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-server/mkl"]
-cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-server/cuda"]
+mkl = ["inl-core/mkl", "inl-text/mkl", "inl-vision/mkl", "inl-sparse/mkl", "inl-server/mkl"]
+cuda = ["inl-core/cuda", "inl-text/cuda", "inl-vision/cuda", "inl-sparse/cuda", "inl-server/cuda"]
 
 [target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2.1"

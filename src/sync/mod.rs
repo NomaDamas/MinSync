@@ -20,6 +20,7 @@ use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
 use indexer::{index_batch, sweep_stale_rows, BatchItem, BatchKind, SyncFileContext};
+pub(crate) use indexer::IMAGE_CHUNK_TYPE;
 use result::{change_path, empty_sync_result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;

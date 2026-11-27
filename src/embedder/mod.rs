@@ -1,4 +1,5 @@
 pub mod context_limit;
+pub mod multimodal;
 pub mod native;
 pub mod openai;
 pub mod retry;
@@ -9,11 +10,34 @@ use crate::config::Config;
 use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
 
+/// Raw encoded bytes of one image file (PNG, JPEG, WebP) handed to a multimodal
+/// embedder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInput {
+    pub bytes: Vec<u8>,
+    pub mime: Option<String>,
+}
+
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn id(&self) -> &str;
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// True when this embedder maps raw image bytes directly into the same
+    /// dense vector space as text (e.g. `native-multimodal:google/embeddinggemma-2`).
+    fn supports_images(&self) -> bool {
+        false
+    }
+
+    /// Embed raw encoded images (PNG, JPEG, WebP) into the shared dense vector
+    /// space. Default rejects calls when [`Embedder::supports_images`] is false.
+    async fn embed_images(&self, _images: &[ImageInput]) -> Result<Vec<Vec<f32>>> {
+        Err(MinSyncError::Embedding(format!(
+            "embedder `{}` does not support direct image embeddings",
+            self.id()
+        )))
+    }
 
     async fn count_truncated(&self, _texts: &[String]) -> Result<usize> {
         Ok(0)
@@ -101,14 +125,23 @@ impl Embedder for DeferredEmbedder {
 
     fn is_deterministic(&self) -> bool {
         self.config.embedder.id.starts_with("native:")
+            || self.config.embedder.id.starts_with("native-multimodal:")
     }
 
     fn is_sparse_only(&self) -> bool {
         self.config.is_sparse_only()
     }
 
+    fn supports_images(&self) -> bool {
+        self.config.embedder.id.starts_with("native-multimodal:")
+    }
+
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         create_embedder(&self.config)?.embed(texts).await
+    }
+
+    async fn embed_images(&self, images: &[ImageInput]) -> Result<Vec<Vec<f32>>> {
+        create_embedder(&self.config)?.embed_images(images).await
     }
 }
 
@@ -120,6 +153,12 @@ pub fn dense_max_length(config: &Config) -> Option<usize> {
     let id = settings.id.as_str();
     if config.is_sparse_only() {
         None
+    } else if id.starts_with("native-multimodal:") {
+        Some(
+            settings
+                .max_length
+                .unwrap_or(multimodal::DEFAULT_MULTIMODAL_MAX_LENGTH),
+        )
     } else if id.starts_with("native:") {
         Some(settings.max_length.unwrap_or(native::DEFAULT_MAX_LENGTH))
     } else if id.starts_with("openai:") || id.starts_with("tei:") {
@@ -163,6 +202,16 @@ pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
             .with_truncate(settings.truncate)
             .with_max_length(settings.max_length);
         Ok(Box::new(embedder))
+    } else if id.starts_with("native-multimodal:") {
+        if served::server_disabled() {
+            Ok(Box::new(multimodal::NativeMultimodalEmbedder::from_config(
+                settings,
+            )?))
+        } else {
+            Ok(Box::new(multimodal::ServedMultimodalEmbedder::from_config(
+                settings,
+            )?))
+        }
     } else if id.starts_with("native:") {
         if served::server_disabled() {
             Ok(Box::new(native::NativeEmbedder::from_config(settings)?))
