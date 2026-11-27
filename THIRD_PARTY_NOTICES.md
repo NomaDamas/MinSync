@@ -36,3 +36,10 @@ downloads them from Hugging Face on first use, and a `tei:` endpoint or
 
 - Model: `nlpai-lab/KURE-Sparse-nano` (0.1B parameters)
 - License: Apache License, Version 2.0 (<http://www.apache.org/licenses/LICENSE-2.0>)
+
+## Multilingual BM25 tokenizers (`lindera`, `jieba-rs`)
+
+BM25 tokenization uses pure-Rust crates with embedded dictionaries (no external native shared libraries required at runtime):
+
+- [`lindera`](https://github.com/lindera/lindera) 3.0.7 (`embed-ipadic`, `embed-ko-dic`): MIT License. Embedded IPADIC (Japanese) and mecab-ko-dic (Korean) dictionaries carry their respective open-source dictionary licenses (IPADIC / Apache-2.0).
+- [`jieba-rs`](https://github.com/messense/jieba-rs) 0.10.x (Chinese word segmentation): MIT License.

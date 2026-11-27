@@ -134,6 +134,14 @@ pub struct QueryResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparse_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_state: Option<IndexState>,
 }
 
@@ -145,6 +153,9 @@ pub struct IndexState {
     /// may still scan for unsupported filters or broad candidate sets.
     #[serde(default)]
     pub sparse_indexed: bool,
+    /// An on-disk BM25 inverted index describes the current table version.
+    #[serde(default)]
+    pub bm25_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

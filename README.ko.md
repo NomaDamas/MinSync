@@ -58,6 +58,14 @@ minsync query "정확한 단어"           # 이 workspace에서는 --mode 기�
 
 `--embedder none`은 chunk마다 1차원 placeholder dense 벡터를 저장하고(LanceDB 스키마에 벡터 컬럼이 필요) ANN 인덱스는 만들지 않으므로 dense `--mode vector`와 `--mode hybrid`는 사용할 수 없습니다. `minsync check`는 dense embedder probe는 건너뛰지만 sparse encoder는 계속 확인합니다. 나중에 dense 벡터 검색을 추가하려면 `minsync init --force --embedder <id>` 후 다시 sync하세요.
 
+0.1B 모델 추론도 부담스러운 저사양 PC라면 dense와 SPLADE를 모두 끄고 다국어(영/한/중/일/아랍어) Okapi BM25와 압축 역색인(`bm25-index.inv`)만 사용할 수 있습니다:
+
+```bash
+minsync init --embedder none --sparse none --language multilingual
+minsync sync                          # 순수 Rust, 오프라인, ML 모델 추론 없음
+minsync query "환불 정책"              # --mode 기본값이 bm25로 동작
+```
+
 OpenAI embedding을 사용할 경우:
 
 ```bash
@@ -73,7 +81,11 @@ minsync sync                          # 변경된 파일을 증분 index
 minsync sync --full                   # 처음부터 다시 빌드
 minsync query "검색어" --mode vector --k 5
 minsync query "정확한 단어" --mode sparse --k 5
-minsync query "검색어" --mode hybrid --k 5
+minsync query "정확한 단어" --mode bm25 --k 5
+minsync query "검색어" --mode hybrid --k 5        # vector + sparse (RRF)
+minsync query "검색어" --mode vector-bm25 --k 5   # vector + bm25 (RRF)
+minsync query "검색어" --mode sparse-bm25 --k 5   # sparse + bm25 (RRF)
+minsync query "검색어" --mode all --k 5           # vector + sparse + bm25 (RRF + LTR용 개별 점수/순위)
 minsync watch                         # 초기 sync 후 파일 변경 감시 및 re-index
 minsync watch --watch-on-sync-error   # 초기 sync 오류 후에도 유지하며 재시도
 minsync status                        # sync 상태

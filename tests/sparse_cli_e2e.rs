@@ -34,6 +34,7 @@ fn sparse_cli_queries_live_lancedb_without_embedder_credentials() {
         embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: Some(model.clone()),
+        bm25_language: Some("multilingual".to_string()),
     }
     .save(&minsync_dir.join("cursor.json"))
     .expect("save cursor");
@@ -122,6 +123,7 @@ fn sparse_query_on_an_index_from_another_model_fails_naming_the_fix() {
             embedder: None,
             collection_path: config.collection.path.clone(),
             sparse_id,
+            bm25_language: None,
         }
         .save(&minsync_dir.join("cursor.json"))
         .expect("save cursor");
@@ -250,6 +252,7 @@ fn verify_cli_reports_duplicate_vector_corruption_pairs() {
         embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: None,
+        bm25_language: None,
     }
     .save(&minsync_dir.join("cursor.json"))
     .expect("save cursor");
@@ -371,6 +374,7 @@ fn build_corrupt_verify_fixture_from_environment() {
         embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: None,
+        bm25_language: None,
     }
     .save(&minsync_dir.join("cursor.json"))
     .expect("save cursor");

@@ -19,8 +19,13 @@ pub async fn check(
     encoder: Option<&dyn SparseEncoder>,
     store: &dyn VectorStore,
 ) -> Result<CheckResult> {
-    if !minsync_dir.join("config.toml").exists() {
+    let config_path = minsync_dir.join("config.toml");
+    if !config_path.exists() {
         return Err(MinSyncError::NotInitialized);
+    }
+    let config = crate::config::Config::load(&config_path)?;
+    if config.bm25.enabled {
+        crate::bm25::tokenizer::validate_language(&config.bm25.language)?;
     }
 
     let mut errors = Vec::new();

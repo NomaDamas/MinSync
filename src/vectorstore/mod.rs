@@ -142,6 +142,20 @@ pub trait VectorStore: Send + Sync {
         filter: Option<&Filter>,
         topk: usize,
     ) -> Result<Vec<QueryHit>>;
+    /// Exact top-`topk` by Okapi BM25 over stored chunk `text`, tokenized with
+    /// `language` (`multilingual`, `simple`, `ko`, `ja`, `zh`, `ar`). Uses the
+    /// on-disk BM25 inverted index (`bm25-index.inv`) when current, falling
+    /// back to an exact scan otherwise.
+    fn query_bm25(
+        &self,
+        query: &str,
+        language: &str,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        let _ = (query, language, filter, topk);
+        Ok(Vec::new())
+    }
     /// End-of-sync maintenance: fold new rows into the search indexes and
     /// prune old versions. It compacts only once fragments pile up, so a
     /// sync that adds a few files stays an append.
@@ -202,6 +216,8 @@ pub fn create_vectorstore_readonly_with_dimension(
         "lancedb" => {
             let mut indexing =
                 lancedb_store::IndexingConfig::from_options(Some(&config.vectorstore.options))?;
+            indexing.bm25_inverted_index = indexing.bm25_inverted_index && config.bm25.enabled;
+            indexing.bm25_language = config.bm25.language.clone();
             if dimension == crate::config::SPARSE_ONLY_DIMENSION {
                 indexing.build_ann_index = false;
             }
@@ -224,6 +240,8 @@ fn create_vectorstore_with_mode(
         "lancedb" => {
             let options = Some(&config.vectorstore.options);
             let mut indexing = lancedb_store::IndexingConfig::from_options(options)?;
+            indexing.bm25_inverted_index = indexing.bm25_inverted_index && config.bm25.enabled;
+            indexing.bm25_language = config.bm25.language.clone();
             let dimension = if config.is_sparse_only() {
                 // Vectors are placeholders: pin the width so a stale
                 // `dimension` option cannot reject them, and skip ANN.

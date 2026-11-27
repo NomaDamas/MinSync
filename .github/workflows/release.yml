@@ -57,7 +57,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $help -notmatch "Usage:") { throw "top-level help failed" }
           $init = (& $exe init --help 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0 -or $init -notmatch "--embedder") { throw "init help failed" }
-          foreach ($mode in @("vector", "sparse", "hybrid")) {
+          foreach ($mode in @("vector", "sparse", "bm25", "hybrid", "vector-bm25", "sparse-bm25", "all")) {
             $query = (& $exe query alpha --mode $mode --help 2>&1 | Out-String)
             if ($LASTEXITCODE -ne 0 -or $query -notmatch "--mode") { throw "query mode $mode failed" }
           }

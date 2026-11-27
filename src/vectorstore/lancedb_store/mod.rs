@@ -9,6 +9,7 @@
 //! - [`sparse_index`]: the on-disk inverted index beside the table
 //! - this file: the synchronous public store facade
 
+mod bm25_index;
 mod filters;
 mod index;
 mod inner;
@@ -161,6 +162,12 @@ impl LanceDbStore {
         self.request(Command::SparseIndexReady)
     }
 
+    /// Whether BM25 queries are answered by an inverted index that
+    /// describes the table as it is now.
+    pub fn bm25_index_ready(&self) -> Result<bool> {
+        self.request(Command::Bm25IndexReady)
+    }
+
     fn request<T>(&self, make: impl FnOnce(Resp<T>) -> Command) -> Result<T> {
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(make(resp_tx)).map_err(to_store_error)?;
@@ -274,6 +281,22 @@ impl VectorStore for LanceDbStore {
         self.request(|resp| Command::QuerySparse {
             model: model.to_string(),
             vector: vector.clone(),
+            filter: filter.cloned(),
+            topk,
+            resp,
+        })
+    }
+
+    fn query_bm25(
+        &self,
+        query: &str,
+        language: &str,
+        filter: Option<&Filter>,
+        topk: usize,
+    ) -> Result<Vec<QueryHit>> {
+        self.request(|resp| Command::QueryBm25 {
+            query: query.to_string(),
+            language: language.to_string(),
             filter: filter.cloned(),
             topk,
             resp,

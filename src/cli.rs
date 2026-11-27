@@ -29,11 +29,17 @@ pub enum ProgressFormat {
     Jsonl,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum QueryMode {
     Vector,
     Sparse,
+    Bm25,
     Hybrid,
+    #[value(name = "vector-bm25")]
+    VectorBm25,
+    #[value(name = "sparse-bm25")]
+    SparseBm25,
+    All,
 }
 
 impl QueryMode {
@@ -41,8 +47,33 @@ impl QueryMode {
         match self {
             Self::Vector => "vector",
             Self::Sparse => "sparse",
+            Self::Bm25 => "bm25",
             Self::Hybrid => "hybrid",
+            Self::VectorBm25 => "vector-bm25",
+            Self::SparseBm25 => "sparse-bm25",
+            Self::All => "all",
         }
+    }
+
+    pub fn uses_vector(self) -> bool {
+        matches!(
+            self,
+            Self::Vector | Self::Hybrid | Self::VectorBm25 | Self::All
+        )
+    }
+
+    pub fn uses_sparse(self) -> bool {
+        matches!(
+            self,
+            Self::Sparse | Self::Hybrid | Self::SparseBm25 | Self::All
+        )
+    }
+
+    pub fn uses_bm25(self) -> bool {
+        matches!(
+            self,
+            Self::Bm25 | Self::VectorBm25 | Self::SparseBm25 | Self::All
+        )
     }
 }
 
@@ -52,10 +83,18 @@ pub enum Commands {
     Init {
         #[arg(long)]
         force: bool,
-        /// Dense embedder id (`native:`, `tei:`, `openai:`), or `none` for a
-        /// sparse-only index that needs no dense model or API key.
+        /// Dense embedder id (`native:`, `tei:`, `openai:`), or `none` for an
+        /// index with no dense model or API key.
         #[arg(long, default_value = crate::config::DEFAULT_EMBEDDER_ID)]
         embedder: String,
+        /// Sparse (SPLADE) encoder id (`native:`, `tei:`), or `none` to skip
+        /// SPLADE (e.g. BM25-only on low-spec machines).
+        #[arg(long, default_value = crate::config::DEFAULT_SPARSE_ID)]
+        sparse: String,
+        /// BM25 tokenizer language preset (`multilingual`, `simple`, `ko`,
+        /// `ja`, `zh`, `ar`).
+        #[arg(long, default_value = crate::bm25::tokenizer::DEFAULT_LANGUAGE)]
+        language: String,
         #[arg(long, default_value = crate::config::DEFAULT_CHUNKER_ID)]
         chunker: String,
     },
@@ -100,8 +139,10 @@ pub enum Commands {
         text: String,
         #[arg(long, short, default_value = "10")]
         k: usize,
-        /// Retrieval mode. Defaults to `vector`, or to `sparse` in a workspace
-        /// initialised with `--embedder none`.
+        /// Retrieval mode. Defaults to `vector`, or `sparse` when `--embedder
+        /// none`, or `bm25` when both `--embedder none` and `--sparse none`.
+        /// Combine retrievers with `hybrid` (vector+sparse), `vector-bm25`,
+        /// `sparse-bm25`, or `all` (vector+sparse+bm25).
         #[arg(long, value_enum)]
         mode: Option<QueryMode>,
     },
@@ -240,20 +281,46 @@ mod tests {
     }
 
     #[test]
-    fn query_modes_are_vector_sparse_and_hybrid_only() {
-        for mode in ["vector", "sparse", "hybrid"] {
+    fn query_modes_cover_all_retriever_combinations() {
+        for mode in [
+            "vector",
+            "sparse",
+            "bm25",
+            "hybrid",
+            "vector-bm25",
+            "sparse-bm25",
+            "all",
+        ] {
             assert!(
                 Cli::try_parse_from(["minsync", "query", "q", "--mode", mode]).is_ok(),
                 "{mode} must parse"
             );
         }
-        let bm25 = Cli::try_parse_from(["minsync", "query", "q", "--mode", "bm25"]);
-        assert!(bm25.is_err(), "bm25 search no longer exists");
+        assert!(Cli::try_parse_from(["minsync", "query", "q", "--mode", "nope"]).is_err());
     }
 
     #[test]
-    fn init_has_no_language_flag() {
-        assert!(Cli::try_parse_from(["minsync", "init", "--language", "ko"]).is_err());
+    fn init_accepts_sparse_and_language_flags() {
+        let cli = Cli::try_parse_from([
+            "minsync",
+            "init",
+            "--embedder",
+            "none",
+            "--sparse",
+            "none",
+            "--language",
+            "ko",
+        ])
+        .expect("init flags parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Init {
+                ref embedder,
+                ref sparse,
+                ref language,
+                ..
+            } if embedder == "none" && sparse == "none" && language == "ko"
+        ));
         assert!(Cli::try_parse_from(["minsync", "init"]).is_ok());
     }
 }

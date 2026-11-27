@@ -81,8 +81,18 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
         Commands::Init {
             force,
             embedder,
+            sparse,
+            language,
             chunker,
-        } => init(&cli.format, root, force, &embedder, &chunker),
+        } => init(
+            &cli.format,
+            root,
+            force,
+            &embedder,
+            &sparse,
+            &language,
+            &chunker,
+        ),
         Commands::Sync { .. } | Commands::Serve { .. } | Commands::Stage { .. } => {
             unreachable!("handled by run")
         }
@@ -114,10 +124,12 @@ fn init(
     root: PathBuf,
     force: bool,
     embedder: &str,
+    sparse: &str,
+    language: &str,
     chunker: &str,
 ) -> Result<()> {
     let ms = MinSync::new(root);
-    let config = ms.init(force, embedder, chunker)?;
+    let config = ms.init_with_options(force, embedder, sparse, language, chunker)?;
     match format {
         OutputFormat::Text => {
             println!("Initialized MinSync in .minsync/");
@@ -126,6 +138,15 @@ fn init(
             println!("  chunker:     {}", config.chunker.id);
             println!("  embedder:    {}", config.embedder.id);
             println!("  sparse:      {}", config.sparse.id);
+            println!(
+                "  bm25:        {} (language: {})",
+                if config.bm25.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                config.bm25.language
+            );
             println!("  vectorstore: {}", config.vectorstore.id);
         }
         OutputFormat::Json => {
@@ -135,15 +156,17 @@ fn init(
     Ok(())
 }
 
-/// The sparse (SPLADE) encoder the workspace's `[sparse]` section describes.
+/// The sparse (SPLADE) encoder the workspace's `[sparse]` section describes,
+/// or `None` when `[sparse] id = "none"`.
 /// Construction is cheap: the native model loads on first use, so a command
 /// that never encodes (an up-to-date sync, `status`) never loads it.
-pub(crate) fn sparse_encoder(
+pub(crate) fn optional_sparse_encoder(
     config: &crate::config::Config,
-) -> Result<std::sync::Arc<dyn crate::sparse::SparseEncoder>> {
-    Ok(std::sync::Arc::from(
-        crate::sparse::served::create_sparse_encoder(&config.sparse)?,
-    ))
+) -> Result<Option<std::sync::Arc<dyn crate::sparse::SparseEncoder>>> {
+    Ok(
+        crate::sparse::served::create_optional_sparse_encoder(&config.sparse)?
+            .map(std::sync::Arc::from),
+    )
 }
 
 /// Where `minsync sync` sends its machine-readable progress stream.
@@ -242,7 +265,10 @@ async fn sync(
     if let Some(bs) = batch_size {
         config.embedder.batch_size = bs;
     }
-    let ms = ms.with_sparse_encoder(sparse_encoder(&config)?);
+    let mut ms = ms;
+    if let Some(encoder) = optional_sparse_encoder(&config)? {
+        ms = ms.with_sparse_encoder(encoder);
+    }
     let chunker = crate::chunker::create_chunker(&config)?;
     let embedder = crate::embedder::create_embedder(&config)?;
     let result = if reembed {
@@ -383,32 +409,38 @@ async fn query(
     // available while a sync holds the lock. Results may lag the in-flight
     // sync; they are always consistent.
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
-    let mode = mode.unwrap_or(if config.is_sparse_only() {
-        QueryMode::Sparse
-    } else {
-        QueryMode::Vector
+    let mode = mode.unwrap_or_else(|| {
+        if config.is_bm25_only() {
+            QueryMode::Bm25
+        } else if config.is_sparse_only() {
+            QueryMode::Sparse
+        } else {
+            QueryMode::Vector
+        }
     });
-    if matches!(mode, QueryMode::Vector | QueryMode::Hybrid) {
+    if mode.uses_vector() {
         crate::query::ensure_dense_matches(minsync_dir, &config)?;
     }
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     // Dense modes were just checked against the cursor, so the configured and
-    // the stored width agree; a sparse query must not care that they do not.
+    // the stored width agree; sparse/bm25 queries must not care that they do not.
     let store = crate::vectorstore::create_vectorstore_readonly_with_dimension(
         &config,
         &store_path,
         crate::embedder_identity::stored_dimension(minsync_dir, &config)?,
     )?;
-    // Each side is built only for the modes that use it: a sparse query never
-    // constructs the dense embedder (so it needs none of its credentials), a
-    // vector query never loads SPLADE.
-    let embedder: Box<dyn crate::embedder::Embedder> = match mode {
-        QueryMode::Sparse => Box::new(crate::embedder::SparseOnlyEmbedder),
-        QueryMode::Vector | QueryMode::Hybrid => crate::embedder::create_embedder(&config)?,
+    // Each retriever is built only for the modes that use it: a bm25 query
+    // loads neither dense nor SPLADE; a sparse query never constructs dense;
+    // a vector query never loads SPLADE.
+    let embedder: Box<dyn crate::embedder::Embedder> = if mode.uses_vector() {
+        crate::embedder::create_embedder(&config)?
+    } else {
+        Box::new(crate::embedder::SparseOnlyEmbedder)
     };
-    let encoder = match mode {
-        QueryMode::Vector => None,
-        QueryMode::Sparse | QueryMode::Hybrid => Some(sparse_encoder(&config)?),
+    let encoder = if mode.uses_sparse() {
+        optional_sparse_encoder(&config)?
+    } else {
+        None
     };
     let results = crate::query::query(
         minsync_dir,
@@ -511,7 +543,7 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), false)?;
     let config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     let embedder = crate::embedder::create_embedder(&config)?;
-    let encoder = sparse_encoder(&config)?;
+    let encoder = optional_sparse_encoder(&config)?;
     crate::query::ensure_dense_matches(minsync_dir, &config)?;
     let store_path = crate::sync::collection_store_path(minsync_dir, &config.collection.path)?;
     let store = crate::vectorstore::create_vectorstore(&config, &store_path)?;
@@ -519,7 +551,7 @@ async fn check(format: &OutputFormat, minsync_dir: &std::path::Path) -> Result<i
     let result = crate::verify::check(
         minsync_dir,
         embedder.as_ref(),
-        Some(encoder.as_ref()),
+        encoder.as_deref(),
         store.as_ref(),
     )
     .await?;
@@ -654,7 +686,7 @@ async fn watch(
         root,
         chunker.as_ref(),
         embedder.as_ref(),
-        Some(sparse_encoder(&config)?),
+        optional_sparse_encoder(&config)?,
         store.as_mut(),
         debounce_ms,
         if watch_on_sync_error {

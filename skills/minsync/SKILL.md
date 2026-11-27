@@ -121,15 +121,27 @@ MinSync also supports learned-sparse (SPLADE) retrieval, independent of the dens
 - `tei:` calls a Text Embeddings Inference server's `POST /embed_sparse` at `base_url`.
 - A running sparse server — another `minsync serve --sparse` or an `inl serve --sparse` from im-not-llm, published under the shared `~/.cache/im-not-llm/serve` root — is adopted automatically by `native:` (`MINSYNC_SERVER=off` disables it); `minsync serve --sparse` serves TEI-compatible `POST /embed_sparse` and `GET /health` (kind `sparse`).
 
-Select the mode per query:
+Select the mode per query (each JSON result also includes per-retriever `*_rank` and raw `*_score` features for downstream LTR reranking):
 
 ```bash
-minsync query "question" --mode vector   # dense ranking (default)
-minsync query "question" --mode sparse   # sparse ranking
-minsync query "question" --mode hybrid   # RRF fusion of both (k=60)
+minsync query "question" --mode vector       # dense ranking (default)
+minsync query "question" --mode sparse       # SPLADE ranking
+minsync query "question" --mode bm25         # multilingual Okapi BM25 ranking
+minsync query "question" --mode hybrid       # RRF fusion of vector + sparse (k=60)
+minsync query "question" --mode vector-bm25  # RRF fusion of vector + bm25
+minsync query "question" --mode sparse-bm25  # RRF fusion of sparse + bm25
+minsync query "question" --mode all          # RRF fusion of vector + sparse + bm25
 ```
 
-There is no `--language` flag on `minsync init` and no `[lexical]` config table. `minsync init --embedder none` builds a sparse-only workspace where `query` defaults to `--mode sparse`. Run `minsync sync` once after upgrading from a BM25-era index to drop the old FTS index and `lexical_text` column and encode sparse vectors for existing chunks; no `--full` is needed and dense vectors are not recomputed.
+For low-spec machines that cannot run even a 0.1B model, initialize a zero-ML BM25-only workspace:
+
+```bash
+minsync init --embedder none --sparse none --language multilingual
+```
+
+`[bm25]` in `.minsync/config.toml` configures `enabled` (default `true`) and `language` (`multilingual` default for EN/KO/JA/ZH/AR, or `simple`, `ko`, `ja`, `zh`, `ar`). Tokenization is pure Rust with embedded dictionaries (Korean `lindera` ko-dic, Japanese `lindera` IPADIC, Chinese `jieba-rs`, Arabic light stemmer, Latin/identifier splitting). `sync` and `optimize` build a compressed on-disk BM25 inverted index (`.minsync/store/bm25-index.inv`, reported via `index_state.bm25_indexed`) beside LanceDB, reusing the block bit-packed architecture of `sparse-index.inv`.
+
+`minsync init --embedder none` keeps SPLADE enabled and defaults `query` to `--mode sparse` (or `--mode bm25` when `--sparse none` is also set). Run `minsync sync` once after upgrading from an older FTS-based index to migrate the table in place; no `--full` is needed and dense vectors are not recomputed.
 
 Sparse search is exact. For tables of 2,000+ chunks `sync` and `optimize` leave an inverted index (`.minsync/store/sparse-index.inv`) that answers the same ranking about 35-80x faster: it names a few candidate chunks that provably contain the top-k and the exact vectors of those are scored. `index_state.sparse_indexed` in a result says whether it was used. It is a derived file: it is rebuilt whole after any change, is bypassed when stale, damaged or written by an older release (run `minsync optimize` once after upgrading), and `[vectorstore.options] sparse_inverted_index = false` turns it off.
 
