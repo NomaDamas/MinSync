@@ -106,8 +106,9 @@ impl Embedder for SparseOnlyEmbedder {
     async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Err(MinSyncError::Embedding(
             "this workspace has no dense embedder (`embedder.id = \"none\"`), so it only \
-             supports sparse search: use `--mode sparse`, or re-run `minsync init --force \
-             --embedder <id>` to enable vector search"
+             supports sparse or BM25 search: use `--mode sparse`, `--mode bm25`, or \
+             `--mode sparse-bm25`, or re-run `minsync init --force --embedder <id>` to \
+             enable vector search"
                 .to_string(),
         ))
     }

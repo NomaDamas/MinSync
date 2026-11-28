@@ -13,6 +13,8 @@ pub struct Config {
     #[serde(default)]
     pub sparse: SparseConfig,
     #[serde(default)]
+    pub bm25: Bm25Config,
+    #[serde(default)]
     pub normalize: NormalizeConfig,
     #[serde(default)]
     pub sync: SyncConfig,
@@ -194,6 +196,36 @@ pub struct EmbedderConfig {
 
 /// Default sparse (SPLADE) encoder: in-process KURE-Sparse-nano on candle.
 pub const DEFAULT_SPARSE_ID: &str = "native:nlpai-lab/KURE-Sparse-nano";
+
+/// Reserved sparse id that disables SPLADE encoding (zero ML inference when
+/// combined with `--embedder none` — pure BM25 mode for low-spec PCs).
+pub const NONE_SPARSE_ID: &str = "none";
+
+/// BM25 lexical index settings. Built as an on-disk compressed inverted index
+/// (`bm25-index.inv`) alongside LanceDB with zero ML model dependencies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Bm25Config {
+    /// Whether the on-disk BM25 inverted index is built during `sync` / `optimize`.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Tokenizer preset: `multilingual` (default: EN/KO/JA/ZH/AR), `simple`,
+    /// `ko`, `ja`, `zh`, or `ar`.
+    #[serde(default = "default_bm25_language")]
+    pub language: String,
+}
+
+fn default_bm25_language() -> String {
+    crate::bm25::tokenizer::DEFAULT_LANGUAGE.to_string()
+}
+
+impl Default for Bm25Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            language: default_bm25_language(),
+        }
+    }
+}
 
 /// The model's query / document markers (`[Q] ` / `[D] `): the checkpoint was
 /// trained with them as dedicated tokens and masks them out of the output.
@@ -426,9 +458,20 @@ impl Default for NormalizeConfig {
 
 impl Config {
     /// True when this workspace has no dense embedder (`embedder.id =
-    /// "none"`): it indexes and searches with the sparse encoder only.
+    /// "none"`): it indexes and searches with sparse and/or BM25 only.
     pub fn is_sparse_only(&self) -> bool {
         self.embedder.id == NONE_EMBEDDER_ID
+    }
+
+    /// True when the workspace has disabled SPLADE (`sparse.id = "none"`).
+    pub fn is_sparse_disabled(&self) -> bool {
+        self.sparse.id == NONE_SPARSE_ID
+    }
+
+    /// True when the workspace has neither a dense embedder nor a SPLADE
+    /// encoder (`embedder.id = "none"` and `sparse.id = "none"`): pure BM25.
+    pub fn is_bm25_only(&self) -> bool {
+        self.is_sparse_only() && self.is_sparse_disabled()
     }
 
     pub fn default_for(source_id: &str) -> Self {
@@ -475,6 +518,7 @@ impl Config {
                 options: default_lancedb_options(),
             },
             sparse: SparseConfig::default(),
+            bm25: Bm25Config::default(),
             normalize: NormalizeConfig::default(),
             sync: SyncConfig::default(),
         }

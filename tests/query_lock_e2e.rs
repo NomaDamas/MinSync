@@ -47,6 +47,7 @@ async fn synced_workspace() -> tempfile::TempDir {
         embedder: None,
         collection_path: config.collection.path.clone(),
         sparse_id: Some(model.clone()),
+        bm25_language: Some("multilingual".to_string()),
     }
     .save(&minsync_dir.join("cursor.json"))
     .expect("save cursor");

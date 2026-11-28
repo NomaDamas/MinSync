@@ -65,7 +65,16 @@ fn workspace() -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 fn init_sparse_only(root: &Path, cache: &Path) -> serde_json::Value {
-    let init = run_json(&mut minsync(root, cache), &["init", "--embedder", "none"]);
+    let init = run_json(
+        &mut minsync(root, cache),
+        &[
+            "init",
+            "--embedder",
+            "none",
+            "--sparse",
+            minsync::config::DEFAULT_SPARSE_ID,
+        ],
+    );
     common::use_tiny_sparse_in(root);
     init
 }

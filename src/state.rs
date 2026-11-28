@@ -28,6 +28,11 @@ pub struct Cursor {
     /// sparse and hybrid queries refuse such an index.
     #[serde(default)]
     pub sparse_id: Option<String>,
+    /// The BM25 tokenizer language preset active when the last sync built the
+    /// on-disk BM25 inverted index. When `[bm25].language` changes, the next
+    /// sync notices the mismatch and rebuilds `bm25-index.inv`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -181,6 +186,7 @@ mod tests {
             embedder: None,
             collection_path: ".minsync/collection".to_string(),
             sparse_id: Some("nlpai-lab/KURE-Sparse-nano".to_string()),
+            bm25_language: Some("multilingual".to_string()),
         }
     }
 

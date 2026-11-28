@@ -32,7 +32,7 @@ const SCALAR_INDEX_COLUMNS: &[&str] = &["id", "path"];
 /// `index_build_threshold` triggers the one-time `create_index` (compared
 /// against TOTAL rows), while `index_optimize_delta_threshold` triggers the
 /// recurring incremental `optimize` (compared against UNINDEXED-delta rows).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IndexingConfig {
     /// Build the ANN index once the table's TOTAL row count reaches this value.
     /// Below it, an exact flat scan is fast enough and IVF lacks the data to
@@ -65,6 +65,14 @@ pub struct IndexingConfig {
     pub sparse_index_min_rows: usize,
     /// Postings held in memory while the index is written (8 bytes each).
     pub sparse_index_memory_postings: usize,
+    /// Answer BM25 queries from an on-disk compressed inverted index
+    /// (`bm25-index.inv`, built at the end of a sync or `optimize`) instead of
+    /// scanning every row.
+    pub bm25_inverted_index: bool,
+    /// Fewest rows that get a BM25 inverted index on disk.
+    pub bm25_index_min_rows: usize,
+    /// Tokenizer preset used when building the BM25 inverted index.
+    pub bm25_language: String,
 }
 
 impl Default for IndexingConfig {
@@ -78,6 +86,9 @@ impl Default for IndexingConfig {
             sparse_inverted_index: true,
             sparse_index_min_rows: super::sparse_index::DEFAULT_MIN_ROWS,
             sparse_index_memory_postings: super::sparse_index::DEFAULT_MEMORY_POSTINGS,
+            bm25_inverted_index: true,
+            bm25_index_min_rows: super::bm25_index::DEFAULT_MIN_ROWS,
+            bm25_language: crate::bm25::tokenizer::DEFAULT_LANGUAGE.to_string(),
         }
     }
 }
@@ -118,6 +129,16 @@ impl IndexingConfig {
         if let Some(value) = options.get("sparse_index_memory_postings") {
             config.sparse_index_memory_postings =
                 parse_positive_usize(value, "sparse_index_memory_postings")?;
+        }
+        if let Some(value) = options.get("bm25_inverted_index") {
+            config.bm25_inverted_index = value.as_bool().ok_or_else(|| {
+                MinSyncError::Config(
+                    "vectorstore.options.bm25_inverted_index must be a boolean".into(),
+                )
+            })?;
+        }
+        if let Some(value) = options.get("bm25_index_min_rows") {
+            config.bm25_index_min_rows = parse_positive_usize(value, "bm25_index_min_rows")?;
         }
         Ok(config)
     }

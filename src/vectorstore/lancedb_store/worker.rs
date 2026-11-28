@@ -53,6 +53,13 @@ pub(super) enum Command {
         topk: usize,
         resp: Resp<Vec<QueryHit>>,
     },
+    QueryBm25 {
+        query: String,
+        language: String,
+        filter: Option<Filter>,
+        topk: usize,
+        resp: Resp<Vec<QueryHit>>,
+    },
     Flush(Resp<()>),
     Optimize(Resp<()>),
     Checkpoint(Resp<()>),
@@ -62,6 +69,7 @@ pub(super) enum Command {
     IndexNames(Resp<Vec<String>>),
     IndexState(Resp<IndexState>),
     SparseIndexReady(Resp<bool>),
+    Bm25IndexReady(Resp<bool>),
     Shutdown,
 }
 
@@ -160,6 +168,16 @@ pub(super) fn run_worker(
                 resp,
                 rt.block_on(inner.query_sparse(model, vector, filter, topk)),
             ),
+            Command::QueryBm25 {
+                query,
+                language,
+                filter,
+                topk,
+                resp,
+            } => send_response(
+                resp,
+                rt.block_on(inner.query_bm25(query, language, filter, topk)),
+            ),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
             Command::Optimize(resp) => send_response(resp, rt.block_on(inner.optimize())),
             Command::Checkpoint(resp) => send_response(resp, rt.block_on(inner.checkpoint())),
@@ -172,6 +190,9 @@ pub(super) fn run_worker(
             Command::IndexState(resp) => send_response(resp, rt.block_on(inner.index_state())),
             Command::SparseIndexReady(resp) => {
                 send_response(resp, rt.block_on(inner.sparse_index_ready()))
+            }
+            Command::Bm25IndexReady(resp) => {
+                send_response(resp, rt.block_on(inner.bm25_index_ready()))
             }
             Command::Shutdown => break,
         }
