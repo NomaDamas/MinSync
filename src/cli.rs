@@ -309,8 +309,13 @@ pub enum Commands {
         /// Serve the learned-sparse (SPLADE) encoder instead of the dense
         /// embedder: TEI's `POST /embed_sparse` and `GET /health`. A separate
         /// server (and state directory) from the dense one.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "multimodal")]
         sparse: bool,
+        /// Serve a multimodal (text + image) embedder such as
+        /// `google/embeddinggemma-2`: `POST /embed_multimodal`, `POST /embed`,
+        /// `POST /v1/embeddings`, and `GET /health`.
+        #[arg(long, conflicts_with = "sparse")]
+        multimodal: bool,
     },
     /// Run one materialization-stage session: JSONL requests on stdin,
     /// responses on stdout. Tracks which source items an external host

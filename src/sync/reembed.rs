@@ -18,9 +18,10 @@
 //! continuing into vectors of another model.
 
 use crate::config::Config;
-use crate::embedder::Embedder;
+use crate::embedder::{Embedder, ImageInput};
 use crate::embedder_identity::EmbedderIdentity;
 use crate::error::{MinSyncError, Result};
+use crate::file_size::{image_mime_for_path, read_bytes_file, ReadTextError};
 use crate::vectorstore::{Document, StoredChunk, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -164,7 +165,8 @@ pub(crate) async fn rebuild(
             break;
         }
         after = page.last().map(|chunk| chunk.doc.id.clone());
-        let embedded = embed_page(embedder, &page, &mut outcome).await?;
+        let root = minsync_dir.parent().unwrap_or(minsync_dir);
+        let embedded = embed_page(root, config, embedder, &page, &mut outcome).await?;
         let docs: Vec<Document> = page
             .iter()
             .zip(embedded)
@@ -246,8 +248,10 @@ fn last_id(store: &dyn VectorStore) -> Result<Option<String>> {
     }
 }
 
-/// One embedding per chunk of `page`; identical texts are embedded once.
+/// One embedding per chunk of `page`; identical texts/images are embedded once.
 async fn embed_page(
+    root: &Path,
+    config: &Config,
     embedder: &dyn Embedder,
     page: &[StoredChunk],
     outcome: &mut Reembedded,
@@ -259,32 +263,87 @@ async fn embed_page(
             .map(|_| vec![0.0; crate::config::SPARSE_ONLY_DIMENSION])
             .collect());
     }
-    let mut index_of: HashMap<&str, usize> = HashMap::new();
-    let mut texts: Vec<String> = Vec::new();
-    let slots: Vec<usize> = page
-        .iter()
-        .map(|chunk| {
-            *index_of
-                .entry(chunk.doc.content_hash.as_str())
-                .or_insert_with(|| {
-                    texts.push(chunk.doc.text.clone());
-                    texts.len() - 1
-                })
-        })
-        .collect();
-    let vectors = embedder.embed(&texts).await?;
-    if vectors.len() != texts.len() {
-        return Err(MinSyncError::Embedding(format!(
-            "expected {} embeddings, got {}",
-            texts.len(),
-            vectors.len()
-        )));
+    enum Slot {
+        Text(usize),
+        Image(usize),
     }
-    outcome.texts += texts.len();
-    outcome.api_calls += 1;
+    let mut text_index_of: HashMap<&str, usize> = HashMap::new();
+    let mut image_index_of: HashMap<&str, usize> = HashMap::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut images: Vec<ImageInput> = Vec::new();
+    let mut slots: Vec<Slot> = Vec::with_capacity(page.len());
+    for chunk in page {
+        if embedder.supports_images()
+            && chunk.doc.chunk_type == crate::sync::IMAGE_CHUNK_TYPE
+        {
+            if let Some(&idx) = image_index_of.get(chunk.doc.content_hash.as_str()) {
+                slots.push(Slot::Image(idx));
+                continue;
+            }
+            if let Ok(bytes) =
+                read_bytes_file(&root.join(&chunk.doc.path), config.sync.max_file_bytes)
+            {
+                let idx = images.len();
+                images.push(ImageInput {
+                    bytes,
+                    mime: image_mime_for_path(&chunk.doc.path).map(str::to_string),
+                });
+                image_index_of.insert(chunk.doc.content_hash.as_str(), idx);
+                slots.push(Slot::Image(idx));
+                continue;
+            } else if let Err(ReadTextError::TooLarge { .. }) =
+                read_bytes_file(&root.join(&chunk.doc.path), config.sync.max_file_bytes)
+            {
+                // Fall back to text embedding of path when image is oversized.
+            }
+        }
+        let idx = *text_index_of
+            .entry(chunk.doc.content_hash.as_str())
+            .or_insert_with(|| {
+                texts.push(chunk.doc.text.clone());
+                texts.len() - 1
+            });
+        slots.push(Slot::Text(idx));
+    }
+
+    let text_vectors = if texts.is_empty() {
+        Vec::new()
+    } else {
+        let vectors = embedder.embed(&texts).await?;
+        if vectors.len() != texts.len() {
+            return Err(MinSyncError::Embedding(format!(
+                "expected {} embeddings, got {}",
+                texts.len(),
+                vectors.len()
+            )));
+        }
+        outcome.texts += texts.len();
+        outcome.api_calls += 1;
+        vectors
+    };
+
+    let image_vectors = if images.is_empty() {
+        Vec::new()
+    } else {
+        let vectors = embedder.embed_images(&images).await?;
+        if vectors.len() != images.len() {
+            return Err(MinSyncError::Embedding(format!(
+                "expected {} image embeddings, got {}",
+                images.len(),
+                vectors.len()
+            )));
+        }
+        outcome.texts += images.len();
+        outcome.api_calls += 1;
+        vectors
+    };
+
     Ok(slots
         .into_iter()
-        .map(|slot| vectors[slot].clone())
+        .map(|slot| match slot {
+            Slot::Text(idx) => text_vectors[idx].clone(),
+            Slot::Image(idx) => image_vectors[idx].clone(),
+        })
         .collect())
 }
 

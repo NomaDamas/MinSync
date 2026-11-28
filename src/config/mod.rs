@@ -88,7 +88,12 @@ mod tests {
             Some(768)
         );
         assert_eq!(known_embedding_dimension(EMBEDDINGGEMMA2_ID), Some(768));
+        assert_eq!(
+            known_embedding_dimension(EMBEDDINGGEMMA2_MULTIMODAL_ID),
+            Some(768)
+        );
         assert!(uses_embeddinggemma_prompts(EMBEDDINGGEMMA2_ID));
+        assert!(uses_embeddinggemma_prompts(EMBEDDINGGEMMA2_MULTIMODAL_ID));
         assert!(uses_embeddinggemma_prompts(EMBEDDINGGEMMA_ID));
         assert!(!uses_embeddinggemma_prompts(DEFAULT_EMBEDDER_ID));
         assert_eq!(

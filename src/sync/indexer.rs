@@ -21,15 +21,22 @@
 
 use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
-use crate::embedder::Embedder;
+use crate::embedder::{Embedder, ImageInput};
 use crate::error::{MinSyncError, Result};
-use crate::file_size::{read_text_file, size_guard_message, ReadTextError};
-use crate::id::doc_ids_for_chunks;
+use crate::file_size::{
+    bytes_content_hash, image_mime_for_path, read_bytes_file, read_text_file, size_guard_message,
+    ReadTextError,
+};
+use crate::id::{compute_doc_id, doc_ids_for_chunks};
 use crate::normalize::normalize_text;
 use crate::types::{Chunk, FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Document, DocumentUpdate, Filter, VectorStore};
 use std::collections::HashSet;
 use std::path::Path;
+
+/// Chunk type stored for a standalone image file embedded directly via a
+/// multimodal embedder (e.g. `native-multimodal:google/embeddinggemma-2`).
+pub(crate) const IMAGE_CHUNK_TYPE: &str = "image";
 
 pub(super) struct SyncFileContext<'a> {
     pub config: &'a Config,
@@ -56,9 +63,16 @@ pub(super) struct BatchItem {
     pub purge_first: bool,
 }
 
+struct PreparedChunk {
+    chunk: Chunk,
+    doc_id: String,
+    content_hash: String,
+    image: Option<ImageInput>,
+}
+
 struct PreparedFile<'a> {
     item: &'a BatchItem,
-    chunks: Vec<(Chunk, String, String)>,
+    chunks: Vec<PreparedChunk>,
     truncated: usize,
 }
 
@@ -277,13 +291,159 @@ fn record_failure(
     Ok(())
 }
 
+/// Embed raw `images`, narrowing a failing call down to the offending image
+/// (same halving / systemic-streak contract as [`embed_isolating`]).
+async fn embed_images_isolating(
+    embedder: &dyn Embedder,
+    images: &[ImageInput],
+    attempt_limit: usize,
+    isolation: &mut Isolation<'_>,
+    located: &[(&Document, usize)],
+) -> std::result::Result<Vec<Vec<f32>>, IsolatedFailure> {
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; images.len()];
+    let mut first_failure: Option<MinSyncError> = None;
+    let mut known = isolation.known_failure.take();
+    let mut stack = Vec::with_capacity(images.len().max(1));
+    stack.push(0..images.len());
+    while let Some(range) = stack.pop() {
+        let whole = range.start == 0 && range.end == images.len();
+        let outcome = match (whole, known.take()) {
+            (true, Some(error)) => Err(error),
+            _ => embedder.embed_images(&images[range.clone()]).await,
+        };
+        let error = match outcome {
+            Ok(embedded) if embedded.len() == range.len() => {
+                *isolation.streak = 0;
+                for (slot, vector) in vectors[range.clone()].iter_mut().zip(embedded) {
+                    *slot = Some(vector);
+                }
+                continue;
+            }
+            Ok(embedded) => {
+                return Err(IsolatedFailure::Abort(MinSyncError::Embedding(format!(
+                    "expected {} image embeddings, got {}",
+                    range.len(),
+                    embedded.len()
+                ))));
+            }
+            Err(error @ MinSyncError::Timeout(_)) => return Err(IsolatedFailure::Abort(error)),
+            Err(error) => error,
+        };
+        if range.len() > 1 {
+            let middle = range.start + range.len() / 2;
+            stack.push(middle..range.end);
+            stack.push(range.start..middle);
+            continue;
+        }
+        let index = range.start;
+        let mut last = error;
+        let mut recovered = false;
+        for _ in 1..attempt_limit {
+            match embedder.embed_images(&images[range.clone()]).await {
+                Ok(embedded) if embedded.len() == 1 => {
+                    vectors[index] = embedded.into_iter().next();
+                    recovered = true;
+                    break;
+                }
+                Ok(_) => {
+                    last = MinSyncError::Embedding(
+                        "expected 1 image embedding, got another count".into(),
+                    );
+                }
+                Err(error @ MinSyncError::Timeout(_)) => {
+                    return Err(IsolatedFailure::Abort(error));
+                }
+                Err(error) => last = error,
+            }
+        }
+        if recovered {
+            *isolation.streak = 0;
+            continue;
+        }
+        *isolation.streak += 1;
+        let failure = with_chunk(last, located[index].1);
+        if *isolation.streak >= isolation.limit {
+            return Err(IsolatedFailure::Abort(failure));
+        }
+        if first_failure.is_none() {
+            first_failure = Some(failure);
+        }
+    }
+    if let Some(failure) = first_failure {
+        return Err(IsolatedFailure::Chunk(failure));
+    }
+    Ok(vectors.into_iter().flatten().collect())
+}
+
 /// Read, normalize, chunk, count truncation and derive ids for one file.
+///
+/// When the configured embedder supports direct image embeddings (e.g.
+/// `native-multimodal:google/embeddinggemma-2`), supported image files
+/// (`.png`, `.jpg`, `.jpeg`, `.webp`) produce one `"image"` chunk backed by
+/// raw encoded bytes instead of failing the UTF-8 text read.
 async fn prepare_file<'a>(
     root: &Path,
     item: &'a BatchItem,
     context: &SyncFileContext<'_>,
 ) -> std::result::Result<Prepared<'a>, StageError> {
     let file_path = root.join(&item.path);
+    if context.embedder.supports_images() {
+        if let Some(mime) = image_mime_for_path(&item.path) {
+            let bytes = match read_bytes_file(&file_path, context.config.sync.max_file_bytes) {
+                Ok(bytes) => bytes,
+                Err(ReadTextError::TooLarge { size, limit }) => {
+                    return Err(at(FileStage::SizeGuard)(MinSyncError::Manifest(
+                        size_guard_message(size, limit),
+                    )))
+                }
+                Err(ReadTextError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Prepared::Gone)
+                }
+                Err(ReadTextError::Io(error)) => {
+                    return Err(at(FileStage::Read)(MinSyncError::Io(error)))
+                }
+            };
+            if bytes.is_empty() {
+                return Ok(Prepared::File(PreparedFile {
+                    item,
+                    chunks: Vec::new(),
+                    truncated: 0,
+                }));
+            }
+            let content_hash = bytes_content_hash(&bytes);
+            let doc_id = compute_doc_id(
+                context.config.source_id.as_str(),
+                &item.path,
+                context.chunker.schema_id(),
+                IMAGE_CHUNK_TYPE,
+                &content_hash,
+                0,
+            );
+            let chunk = Chunk {
+                // Image rows carry visual vectors only; leave `text` empty so
+                // SPLADE stores an empty sparse vector and filename/folder
+                // tokens never distort hybrid RRF rankings against real visual
+                // similarity or OCR/VLM text mirrors.
+                text: String::new(),
+                chunk_type: IMAGE_CHUNK_TYPE.to_string(),
+                heading_path: item.path.clone(),
+            };
+            return Ok(Prepared::File(PreparedFile {
+                item,
+                chunks: vec![PreparedChunk {
+                    chunk,
+                    doc_id,
+                    content_hash,
+                    image: Some(ImageInput {
+                        bytes,
+                        mime: Some(mime.to_string()),
+                    }),
+                }],
+                truncated: 0,
+            }));
+        }
+    }
+
     let raw_text = match read_text_file(&file_path, context.config.sync.max_file_bytes) {
         Ok(text) => text,
         Err(ReadTextError::TooLarge { size, limit }) => {
@@ -334,7 +494,12 @@ async fn prepare_file<'a>(
         chunks: chunks
             .into_iter()
             .zip(ids)
-            .map(|(chunk, (doc_id, content_hash))| (chunk, doc_id, content_hash))
+            .map(|(chunk, (doc_id, content_hash))| PreparedChunk {
+                chunk,
+                doc_id,
+                content_hash,
+                image: None,
+            })
             .collect(),
         truncated,
     }))
@@ -525,18 +690,25 @@ async fn commit(
     let all_ids: Vec<String> = files
         .iter()
         .filter(|file| !file.item.purge_first)
-        .flat_map(|file| file.chunks.iter().map(|(_, doc_id, _)| doc_id.clone()))
+        .flat_map(|file| file.chunks.iter().map(|prepared| prepared.doc_id.clone()))
         .collect();
     let existing: HashSet<String> = context.store.existing_ids(&all_ids).map_err(&store_stage)?;
 
     let mut reused: Vec<DocumentUpdate> = Vec::new();
     let mut docs_to_embed: Vec<Document> = Vec::new();
+    let mut images_to_embed: Vec<Option<ImageInput>> = Vec::new();
     // Position of each new chunk within its own file, for error messages.
     let mut chunk_in_file: Vec<usize> = Vec::new();
     for file in files {
         let path = file.item.path.as_str();
         let mut new_in_file = 0;
-        for (chunk, doc_id, content_hash) in file.chunks {
+        for prepared_chunk in file.chunks {
+            let PreparedChunk {
+                chunk,
+                doc_id,
+                content_hash,
+                image,
+            } = prepared_chunk;
             if existing.contains(&doc_id) {
                 reused.push(DocumentUpdate {
                     id: doc_id,
@@ -557,6 +729,7 @@ async fn commit(
                     content_hash,
                     seen_token: context.sync_token.to_string(),
                 });
+                images_to_embed.push(image);
                 chunk_in_file.push(new_in_file);
                 new_in_file += 1;
             }
@@ -566,9 +739,10 @@ async fn commit(
     // Embed first: the slow, fallible step runs before any write, so a
     // failure leaves the store untouched by this batch.
     //
-    // Identical chunk text (same content hash) embeds once, and vectors the
-    // store already holds for that hash are reused. The rest go to the
-    // embedder longest first so consecutive batches pad far less.
+    // Identical chunk text or image bytes (same content hash) embeds once, and
+    // vectors the store already holds for that hash are reused. Text chunks go
+    // to the embedder longest first so consecutive batches pad far less; raw
+    // image chunks go through `embed_images` into the same vector space.
     if context.embedder.is_sparse_only() {
         // Sparse-only workspace: the vector column is a required placeholder.
         for doc in &mut docs_to_embed {
@@ -591,22 +765,32 @@ async fn commit(
             .fetch_embeddings_by_content_hash(&hashes)
             .map_err(&store_stage)?;
 
-        let mut to_embed: Vec<usize> = unique
-            .into_iter()
-            .filter(|&index| !vectors.contains_key(&docs_to_embed[index].content_hash))
-            .collect();
-        to_embed.sort_by_key(|&index| std::cmp::Reverse(docs_to_embed[index].text.len()));
+        let mut text_to_embed: Vec<usize> = Vec::new();
+        let mut image_to_embed: Vec<usize> = Vec::new();
+        for index in unique {
+            if vectors.contains_key(&docs_to_embed[index].content_hash) {
+                continue;
+            }
+            if images_to_embed[index].is_some() {
+                image_to_embed.push(index);
+            } else {
+                text_to_embed.push(index);
+            }
+        }
+        text_to_embed.sort_by_key(|&index| std::cmp::Reverse(docs_to_embed[index].text.len()));
+        let total_newly_embedded = text_to_embed.len() + image_to_embed.len();
 
-        if !to_embed.is_empty() {
-            let texts: Vec<String> = to_embed
+        let mut isolation = isolation;
+        if !text_to_embed.is_empty() {
+            let texts: Vec<String> = text_to_embed
                 .iter()
                 .map(|&index| docs_to_embed[index].text.clone())
                 .collect();
-            let located: Vec<(&Document, usize)> = to_embed
+            let located: Vec<(&Document, usize)> = text_to_embed
                 .iter()
                 .map(|&index| (&docs_to_embed[index], chunk_in_file[index]))
                 .collect();
-            let mut embeddings = match isolation {
+            let mut embeddings = match isolation.as_deref_mut() {
                 Some(isolation) => {
                     let attempts = if context.embedder.is_deterministic() {
                         1
@@ -655,12 +839,78 @@ async fn commit(
                 .iter()
                 .map(|text| estimate_tokens(text))
                 .sum::<usize>();
-            for (&index, embedding) in to_embed.iter().zip(embeddings) {
+            for (&index, embedding) in text_to_embed.iter().zip(embeddings) {
                 vectors.insert(docs_to_embed[index].content_hash.clone(), embedding);
             }
         }
 
-        result.embeddings_reused += docs_to_embed.len() - to_embed.len();
+        if !image_to_embed.is_empty() {
+            let images: Vec<ImageInput> = image_to_embed
+                .iter()
+                .map(|&index| {
+                    images_to_embed[index]
+                        .clone()
+                        .expect("image_to_embed only holds image chunks")
+                })
+                .collect();
+            let located: Vec<(&Document, usize)> = image_to_embed
+                .iter()
+                .map(|&index| (&docs_to_embed[index], chunk_in_file[index]))
+                .collect();
+            let mut embeddings = match isolation.as_deref_mut() {
+                Some(isolation) => {
+                    let attempts = if context.embedder.is_deterministic() {
+                        1
+                    } else {
+                        context.config.embedder.max_retries.max(1)
+                    };
+                    embed_images_isolating(context.embedder, &images, attempts, isolation, &located)
+                        .await
+                        .map_err(|failure| match failure {
+                            IsolatedFailure::Abort(error) => StageError {
+                                stage: FileStage::Embed,
+                                error,
+                                counted: true,
+                                abort: true,
+                            },
+                            IsolatedFailure::Chunk(error) => StageError {
+                                stage: FileStage::Embed,
+                                error,
+                                counted: true,
+                                abort: false,
+                            },
+                        })?
+                }
+                None => context
+                    .embedder
+                    .embed_images(&images)
+                    .await
+                    .map_err(&embed_stage)?,
+            };
+            if embeddings.len() != images.len() {
+                return Err(embed_stage(MinSyncError::Embedding(format!(
+                    "expected {} image embeddings, got {}",
+                    images.len(),
+                    embeddings.len()
+                ))));
+            }
+            for (slot, embedding) in embeddings.iter_mut().enumerate() {
+                if !is_finite_embedding(embedding) {
+                    let (doc, chunk) = located[slot];
+                    return Err(embed_stage(MinSyncError::Embedding(format!(
+                        "image embedding for {} (chunk {}, document {}) contains non-finite values",
+                        doc.path, chunk, doc.id
+                    ))));
+                }
+            }
+            result.embedding_api_calls += 1;
+            result.embedded_texts += images.len();
+            for (&index, embedding) in image_to_embed.iter().zip(embeddings) {
+                vectors.insert(docs_to_embed[index].content_hash.clone(), embedding);
+            }
+        }
+
+        result.embeddings_reused += docs_to_embed.len() - total_newly_embedded;
         for (index, doc) in docs_to_embed.iter_mut().enumerate() {
             doc.embedding = vectors.get(&doc.content_hash).cloned().ok_or_else(|| {
                 embed_stage(MinSyncError::Embedding(format!(

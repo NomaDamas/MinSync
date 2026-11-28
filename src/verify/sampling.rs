@@ -4,8 +4,11 @@
 use crate::chunker::Chunker;
 use crate::config::Config;
 use crate::error::{MinSyncError, Result};
-use crate::file_size::{read_text_file, size_guard_message, ReadTextError};
-use crate::id::doc_ids_for_chunks;
+use crate::file_size::{
+    bytes_content_hash, image_mime_for_path, read_bytes_file, read_text_file, size_guard_message,
+    ReadTextError,
+};
+use crate::id::{compute_doc_id, doc_ids_for_chunks};
 use crate::manifest::Manifest;
 use crate::normalize::normalize_text;
 use std::io::ErrorKind;
@@ -26,6 +29,27 @@ pub(super) fn expected_doc_ids(
     config: &Config,
     chunker: &dyn Chunker,
 ) -> Result<Vec<String>> {
+    if config.embedder.id.starts_with("native-multimodal:") && image_mime_for_path(path).is_some() {
+        let bytes = match read_bytes_file(&root.join(path), config.sync.max_file_bytes) {
+            Ok(bytes) => bytes,
+            Err(ReadTextError::TooLarge { size, limit }) => {
+                return Err(MinSyncError::Manifest(size_guard_message(size, limit)))
+            }
+            Err(ReadTextError::Io(error)) => return Err(MinSyncError::Io(error)),
+        };
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let content_hash = bytes_content_hash(&bytes);
+        return Ok(vec![compute_doc_id(
+            &config.source_id,
+            path,
+            chunker.schema_id(),
+            crate::sync::IMAGE_CHUNK_TYPE,
+            &content_hash,
+            0,
+        )]);
+    }
     let raw_text = match read_text_file(&root.join(path), config.sync.max_file_bytes) {
         Ok(text) => text,
         Err(ReadTextError::TooLarge { size, limit }) => {

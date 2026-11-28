@@ -30,11 +30,7 @@ impl EmbedderIdentity {
     /// The identity the configuration asks for, without building the
     /// embedder (so a query can be checked before any model is loaded).
     pub fn from_config(config: &Config) -> Result<Self> {
-        let id = config.embedder.id.as_str();
-        let model = ["native:", "tei:", "openai:"]
-            .iter()
-            .find_map(|provider| id.strip_prefix(provider))
-            .unwrap_or(id);
+        let model = crate::config::model_of_embedder_id(&config.embedder.id);
         Self::with_model(config, model.to_string())
     }
 
