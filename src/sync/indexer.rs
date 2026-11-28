@@ -420,7 +420,11 @@ async fn prepare_file<'a>(
                 0,
             );
             let chunk = Chunk {
-                text: item.path.clone(),
+                // Image rows carry visual vectors only; leave `text` empty so
+                // SPLADE stores an empty sparse vector and filename/folder
+                // tokens never distort hybrid RRF rankings against real visual
+                // similarity or OCR/VLM text mirrors.
+                text: String::new(),
                 chunk_type: IMAGE_CHUNK_TYPE.to_string(),
                 heading_path: item.path.clone(),
             };

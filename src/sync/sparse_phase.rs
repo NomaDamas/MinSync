@@ -122,10 +122,20 @@ impl CatchUp {
             .into_iter()
             .map(|(hash, vector)| (hash, Ok(vector)))
             .collect();
-        let to_encode: Vec<&SparseTarget> = unique
-            .into_iter()
-            .filter(|row| !vectors.contains_key(&row.content_hash))
-            .collect();
+        let mut to_encode: Vec<&SparseTarget> = Vec::new();
+        for row in unique {
+            if vectors.contains_key(&row.content_hash) {
+                continue;
+            }
+            // Rows with no text (e.g. direct multimodal image embeddings) have
+            // no lexical terms: record an empty sparse vector so they are marked
+            // done without generating noisy SPLADE scores.
+            if row.text.trim().is_empty() {
+                vectors.insert(row.content_hash.clone(), Ok(SparseVector::default()));
+            } else {
+                to_encode.push(row);
+            }
+        }
 
         if !to_encode.is_empty() {
             let texts: Vec<String> = to_encode.iter().map(|row| row.text.clone()).collect();
